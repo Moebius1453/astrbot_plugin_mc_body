@@ -114,6 +114,7 @@ class ReflexGuard:
         owner_name: str = "",
         flee_toward: str = RETREAT_SAFE,
         notify=None,
+        journal=None,
     ) -> None:
         self.bridge = bridge
         self.interval = max(0.5, float(interval))
@@ -125,6 +126,14 @@ class ReflexGuard:
         self.owner_name = str(owner_name or "").strip()
         self.flee_toward = flee_toward if flee_toward in (RETREAT_SAFE, RETREAT_OWNER) else RETREAT_SAFE
         self._notify = notify  # 可选：async callable(str)
+
+        # 状态日志（见 mcb/journal.py）—— 反射事件要**让白自己看得见**，
+        # 不能只躺在服务器日志里（否则用户问"刚才怎么了"她答不上来）。
+        self._journal = journal
+
+        # 任务层（`bind_tasks` 注入）—— 保命要能**抢占**它。
+        # ⚠️ 是**挂起**不是停：危险过去她会自己接着做（用户 2026-10-09 拍板的分层）。
+        self._tasks = None
 
         self._task: asyncio.Task | None = None
 
@@ -147,6 +156,18 @@ class ReflexGuard:
         self._restore_wait = 0
 
     # ---- 生命周期 -------------------------------------------------------
+
+    def bind_tasks(self, runner) -> None:
+        """接上任务层 —— 之后挨打/濒死会**挂起**她的任务，而不是让它继续跑。"""
+        self._tasks = runner
+
+    def _suspend_tasks(self, reason: str) -> None:
+        if self._tasks is not None:
+            self._tasks.suspend(reason)
+
+    def _resume_tasks(self) -> None:
+        if self._tasks is not None:
+            self._tasks.resume()
 
     def start(self) -> None:
         if self._task is not None:
@@ -258,6 +279,9 @@ class ReflexGuard:
                 # ⚠️ **只写日志，不发 QQ** —— 战斗是自动跑的，用户不需要在聊天里看到它。
                 #    只有"白主动要告诉用户的事"才走 _notify（比如"我饿了但没吃的"）。
                 logger.warning(f"[mc_body] ⚔ 进入战斗（{why}）")
+                self._log(f"进入战斗（{why}）")
+                # 保命优先 —— 把她的任务**挂起**（不是取消），危险过去会自己接着做
+                self._suspend_tasks("战斗中")
                 if hurt:
                     await self._cmd("mcb stop")   # 别再顺着原路线撞进去
         else:
@@ -270,6 +294,8 @@ class ReflexGuard:
                     self._in_combat = False
                     self._fleeing = False
                     logger.info("[mc_body] ⚔ 脱战：怪已经拉开或没了")
+                    self._log("脱离战斗")
+                    self._resume_tasks()
             else:
                 self._no_threat_ticks = 0
                 # 只有 hunt 姿态才**追出去**；defend 姿态够不着就站着等它过来。
@@ -278,6 +304,7 @@ class ReflexGuard:
         # 挨打通知（只在掉血时，不刷屏）
         if hurt:
             logger.warning(f"[mc_body] ⚠ 白挨打了：血量 {was_hp:g} → {hp:g}")
+            self._log(f"挨打了，血量 {was_hp:g} → {hp:g}")
 
         # 卡住判定
         await self._check_stuck(data)
@@ -333,6 +360,7 @@ class ReflexGuard:
         self._no_food_warned = False
         self._eat_cool = EAT_COOLDOWN_TICKS
         logger.info(f"[mc_body] 🍖 饿了（{level:g}）→ 吃 {name}（第 {slot} 格，营养 {nutrition}）")
+        self._log(f"饿了（{level:g}），吃了 {name}")
 
         # 换到手上 → 吃。
         # ⚠️ **换回原来那格必须等吃完** —— 立刻换回去等于把吃了一半的东西扔掉。
@@ -423,6 +451,7 @@ class ReflexGuard:
         # 濒死优先撤（**自动**脱战，选的方向由配置定）
         if hp is not None and hp <= self.hp_critical:
             if not self._fleeing:
+                self._log(f"血量危急（{hp:g}），撤")
                 await self._retreat(data, nearest, self.flee_toward)
             return
         self._fleeing = False
@@ -626,10 +655,20 @@ class ReflexGuard:
             logger.warning(
                 f"[mc_body] ⚠ 白卡住了：{elapsed:.0f} 秒只挪了 {moved:.1f} 格，已让她停下"
             )
+            self._log(f"卡住了：{elapsed:.0f} 秒只挪了 {moved:.1f} 格，停下来了")
             await self._cmd("mcb stop")
             # ⚠️ 只写日志，**不发 QQ**（同上：自动反射不占聊天正文）
 
     # ---- 小工具 ---------------------------------------------------------
+
+    def _log(self, text: str) -> None:
+        """反射事件写进**状态日志**（白自己看得见）。
+
+        ⚠️ 只写日志、**不发 QQ** —— 用户 2026-10-09 明确要求：
+        自动反射的状态翻转"这种东西日志里面出现就好了"，不许占聊天正文。
+        """
+        if self._journal is not None:
+            self._journal.add("reflex", text)
 
     async def _cmd(self, command: str) -> None:
         try:

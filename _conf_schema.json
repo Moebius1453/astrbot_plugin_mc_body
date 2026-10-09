@@ -132,5 +132,17 @@
     "description": "允许白自己合成东西",
     "hint": "关掉后 mc_craft 会拒绝执行。开着的时候白能自己规划并执行多步合成（含自己去找工作台）。",
     "default": true
+  },
+  "enable_mc_task": {
+    "type": "bool",
+    "description": "允许白派自己去做多步任务",
+    "hint": "关掉后 mc_task 会拒绝执行。开着的时候白能把多步行为串成一件事（比如沿途插火把），程序一步步做完，她自己知道进度，也能被叫停。",
+    "default": true
+  },
+  "journal_capacity": {
+    "type": "int",
+    "description": "状态日志最多攒多少条",
+    "hint": "白「记得自己刚才干了什么」的那本账。**只存内存** —— 插件重载就清空。攒太多会占上下文 token，400 条够用。",
+    "default": 400
   }
 }

@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import math
 import re
 import time
@@ -27,8 +28,13 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
 
 from .mcb.rcon import BridgeError, RconBridge
+from .mcb import containers as mcb_containers
+from .mcb.containers import ContainerIO
 from .mcb.craft import CraftRunner, Crafter
+from .mcb.journal import Journal
 from .mcb.reflex import ReflexGuard
+from .mcb.smelt import Smelter
+from .mcb.tasks import TaskRunner
 from .mcb.uplink import ChatUplink
 from .mcb import render
 
@@ -66,6 +72,14 @@ class McBodyPlugin(Star):
             ambient_limit=int(self._cfg("ambient_context_lines", 20)),
             self_name=str(self._cfg("character_name", "Nanako")),
         )
+        # 状态日志 —— 白「记得自己刚才干了什么」的那本账（见 mcb/journal.py）。
+        # ⚠️ **存内存**（用户 2026-10-09 拍板）：插件热重载会丢，任务本身也一样。
+        self.journal = Journal(capacity=int(self._cfg("journal_capacity", 400)))
+
+        # 任务层 —— 把多步行为串成一个目标（见 mcb/tasks.py）
+        self.io = ContainerIO(self.bridge)
+        self.tasks = TaskRunner(self.bridge, self.journal, io=self.io)
+
         self.reflex = ReflexGuard(
             self.bridge,
             interval=float(self._cfg("reflex_interval_seconds", 1)),
@@ -77,7 +91,10 @@ class McBodyPlugin(Star):
             owner_name=str(self._cfg("owner_player_name", "")),
             flee_toward=str(self._cfg("retreat_toward", "safe")),
             notify=self._notify,
+            journal=self.journal,
         )
+        # 反射要能**抢占**任务（保命 > 干活）。挂起不是停止 —— 事完会自己接着做。
+        self.reflex.bind_tasks(self.tasks)
         # 通知去重（见 _notify）
         self._last_notify_text = ""
         self._last_notify_at = 0.0
@@ -139,6 +156,9 @@ class McBodyPlugin(Star):
         )
 
     async def terminate(self) -> None:
+        # ⚠️ **先停任务再停反射** —— 反过来的话任务可能正在等反射放开它，
+        #    会卡在这个 await 上。停任务顺带把她的寻路也取消掉。
+        await self.tasks.stop(quiet=True)
         await self.reflex.stop()
         await self.uplink.stop()
         await self.bridge.close()
@@ -237,27 +257,24 @@ class McBodyPlugin(Star):
 
     @filter.llm_tool(name="mc_state")
     async def mc_state(self, event: AstrMessageEvent):
-        """查询你在 Minecraft 里的状态：是否在线、坐标、血量、维度、正在做什么。
+        """查自己在 MC 里的状态：在线/坐标/血量/饥饿/维度/**正在做的事**/最近发生了什么。
 
-        当你想知道自己现在在哪、还活着没有、在哪个维度、或者**刚才的动作有没有生效**时，
-        用这个工具。它读的是服务端的即时数据，不依赖你的游戏客户端。
-
-        如果返回"不在线"，说明 Nanako 的角色没连进服务器，任何动作都做不了。
-        动作类工具（走路、跟随）下发之后，**必须**隔一会儿用它来确认结果。
+        返回里有「正在做的事」（你自己的任务进度）和「寻路」（Baritone 走路状态），别搞混。
+        **动作类工具下发后，隔一会儿用它确认结果** —— 那些工具只能报告"已下发"。
+        "不在线"= 角色没连进服务器，什么动作都做不了。
         """
         if (deny := self._guard(event)):
             return deny
         data, err = await self._call("mcb state")
         if err:
             return f"查不到 Nanako 的状态：{err}"
-        return render.describe_state(data, self.reflex.stance)
+        return render.describe_state(
+            data, self.reflex.stance, self.tasks.status(), self.journal
+        )
 
     @filter.llm_tool(name="mc_say")
     async def mc_say(self, event: AstrMessageEvent, text: str):
-        """在 Minecraft 里说话 —— 用 Nanako 的身体把这句文本发到游戏聊天里。
-
-        当你想对游戏里的人（包括你自己在游戏里的样子）说点什么时用这个。
-        注意这是**游戏内聊天**，不是回复 QQ 消息；要在 QQ 里回话直接正常输出就行。
+        """用 Nanako 的身体在**游戏公屏**说话。这是游戏内聊天，不是回 QQ。
 
         Args:
             text(string): 要说的话。会发到游戏公屏，所有人都看得见。
@@ -274,10 +291,7 @@ class McBodyPlugin(Star):
 
     @filter.llm_tool(name="mc_goto")
     async def mc_goto(self, event: AstrMessageEvent, x: float, z: float):
-        """让 Nanako 走到指定坐标（她自己寻路过去）。
-
-        当你想移动到某个地点时用这个。**这是异步的** —— 命令下发后她会自己走，
-        不会立刻到。想确认到没到，过一会儿调 mc_state 看坐标。
+        """走到坐标 (x, z)。**异步** —— 下发后她自己走，过会儿用 mc_state 看坐标确认。
 
         Args:
             x(number): 目标 X 坐标
@@ -299,12 +313,9 @@ class McBodyPlugin(Star):
 
     @filter.llm_tool(name="mc_follow")
     async def mc_follow(self, event: AstrMessageEvent, player: str):
-        """让 Nanako 跟着某个玩家走。
+        """跟着某个玩家走。
 
-        当你想让她跟在你身边时用这个。
-
-        ⚠️ 这是「跟到几格以内」，**不是贴身**。目标就站在旁边时她**不会动**，
-        那是正常行为，不是坏了。
+        ⚠️ 是「跟到几格以内」**不是贴身** —— 目标就在旁边时她不动是正常的。
 
         Args:
             player(string): 要跟随的玩家名（游戏 ID，只允许字母数字下划线）。
@@ -324,27 +335,27 @@ class McBodyPlugin(Star):
 
     @filter.llm_tool(name="mc_stop")
     async def mc_stop(self, event: AstrMessageEvent):
-        """让 Nanako 立刻停下：取消当前所有寻路、行走、跟随、使用动作。
+        """急停：**取消当前任务**，并停掉所有寻路/行走/跟随/使用动作。
 
-        当你想让她别动了、或者发现她卡住/走错方向时用这个。
-        这是最安全的"急停"。
+        ⚠️ 任务会被**丢掉**（取消，不是暂停）。想让她"先去忙别的、回头接着做"，
+        直接给她新指令就行 —— 反射抢占才是挂起。
         """
         if (deny := self._guard(event)):
             return deny
+        stopped = await self.tasks.stop()
         _, err = await self._call("mcb stop")
         # 顺手松开"使用键" —— 万一吃东西时出了岔子，按键卡住会让她一直重复动作
         await self._call("mcb release")
         if err:
             return f"没能让她停下：{err}"
-        return "已下发停止指令，她应该会停下来（惯性可能还会滑一小段）。"
+        return f"已下发停止指令，她应该会停下来（惯性可能还会滑一小段）。{stopped}"
 
     @filter.llm_tool(name="mc_baritone_raw")
     async def mc_baritone_raw(self, event: AstrMessageEvent, command: str):
-        """应急口：直接给 Baritone 下一条原始命令。
+        """应急口：直接给 Baritone 下原始命令。固定工具做不到时才用。
 
-        只有在上面那些固定工具**做不到**你要的事时才用它。常见的：
-        `goto 100 64 -200`（带 Y 坐标的 goto）、`mine diamond_ore`（挖矿）、
-        `explore`（探索）、`farm`、`come`、`thisway 100`。
+        常用：`mine diamond_ore`（挖矿）、`explore`（探索）、`farm`（种田）、
+        `goto 100 64 -200`（带 Y 的 goto）、`come`、`thisway 100`。
 
         Args:
             command(string): Baritone 命令本体，**不带 `#` 前缀**。
@@ -366,11 +377,7 @@ class McBodyPlugin(Star):
 
     @filter.llm_tool(name="mc_inventory")
     async def mc_inventory(self, event: AstrMessageEvent):
-        """查看你背包里有什么、手上拿着哪一格、以及饥饿度。
-
-        想拿东西、想吃东西、想合成之前，**先调这个**看看自己有什么。
-        返回快捷栏 0-8 格、背包其余格子、副手，以及当前选中的快捷栏槽位。
-        """
+        """看背包：有什么、手上是哪一格、饥饿度。拿东西/吃东西/合成之前先看它。"""
         if (deny := self._guard(event)):
             return deny
         data, err = await self._call("mcb inventory")
@@ -380,11 +387,7 @@ class McBodyPlugin(Star):
 
     @filter.llm_tool(name="mc_hold")
     async def mc_hold(self, event: AstrMessageEvent, slot: int):
-        """把你快捷栏的第几格拿在手上（0 到 8）。
-
-        吃东西、放方块之前要先把手里的东西换对。
-        ⚠️ 只能选**快捷栏**（0-8）。如果东西在背包里，先用 `mc_inventory` 看看它在哪一格 ——
-        目前还没有把背包物品移到快捷栏的能力。
+        """把**快捷栏**第 0~8 格拿到手上。东西在背包里（不知道第几格）就用 mc_equip。
 
         Args:
             slot(number): 快捷栏槽位，0 是最左边，8 是最右边。
@@ -402,15 +405,38 @@ class McBodyPlugin(Star):
             return f"切换失败：{err}"
         return f"已经把手换到快捷栏第 {n} 格。"
 
+    @filter.llm_tool(name="mc_equip")
+    async def mc_equip(self, event: AstrMessageEvent, item: str, where: str = "hand"):
+        """把身上某物品**装到该去的地方** —— 给物品名就行，不用先查它在第几格。
+
+        where 可选：
+        · `hand`（默认）—— 拿到手上。放方块、吃东西、用工具都用它
+        · `off` —— 副手。举盾、放火把当光源
+        · `head` / `chest` / `legs` / `feet` —— 穿护甲
+
+        ⚠️ 物品名要用**注册名**不是中文名：`minecraft:iron_helmet` ✅ / `"铁头盔"` ❌。
+
+        Args:
+            item(string): 物品的注册名，例如 "minecraft:iron_helmet"、"minecraft:shield"。
+            where(string): "hand"（手上，默认）/ "off"（副手）/ "head" / "chest" / "legs" / "feet"。
+        """
+        if (deny := self._guard(event)):
+            return deny
+        name = str(item or "").strip()
+        if not name:
+            return "没说装哪个物品。"
+        if ":" not in name:
+            name = f"minecraft:{name}"
+        err = await mcb_containers.wear(self.io, name, str(where or "hand").strip().lower())
+        if err:
+            return err
+        return f"已经把 {name} 装到「{where}」了。"
+
     @filter.llm_tool(name="mc_use")
     async def mc_use(self, event: AstrMessageEvent):
-        """使用**手上**拿着的东西：吃东西、喝药水、放方块、射箭……
+        """用**手上**的东西：吃东西、喝药水、放方块、射箭。
 
-        最常见的用法是**吃东西**：先用 `mc_inventory` 找到食物在哪一格，
-        用 `mc_hold` 拿到手上，再调这个。
-
-        ⚠️ 这是"对着空气用"（比如吃东西）。要对着某个方块用（开箱子、放置到地上），
-        用 `mc_use_on`。
+        对着**方块**用（开箱子、放地上）请走 mc_use_on。
         """
         if (deny := self._guard(event)):
             return deny
@@ -423,16 +449,11 @@ class McBodyPlugin(Star):
     async def mc_use_on(
         self, event: AstrMessageEvent, x: float, y: float, z: float, keep_open: bool = False
     ):
-        """对着指定坐标的**方块**右键：放置方块、按按钮拉杆、开箱子/工作台。
+        """对指定坐标的**方块**右键：放方块、按按钮、开箱子/工作台。
 
-        会先转头看向那个坐标，再右键。
-
-        ⚠️ **距离限制约 4.5 格** —— 够不着就是够不着。先用 `mc_goto` 走到附近再调这个。
-
-        默认会**自动关掉弹出的界面**（界面开着的时候她动不了，这是安全兜底）。
-        但如果你想**操作界面里的东西**（从箱子里拿东西、在工作台合成），
-        就把 `keep_open` 设成 true，然后配合 `mc_menu`（看界面里有什么）和
-        `mc_click`（点格子）用。
+        ⚠️ 距离约 4.5 格，够不着先 mc_goto。
+        默认会自动关掉弹出的界面；要**操作界面里的东西**（拿箱子、合成）就设
+        `keep_open=true`，再配 mc_menu + mc_click 用。
 
         Args:
             x(number): 目标方块的 X 坐标
@@ -468,18 +489,9 @@ class McBodyPlugin(Star):
 
     @filter.llm_tool(name="mc_menu")
     async def mc_menu(self, event: AstrMessageEvent):
-        """看看**当前打开的界面**里有什么（箱子/工作台/背包合成格）。
+        """看**当前打开的界面**里有什么（箱子/工作台/背包合成格）：每格的**格子号**+内容。
 
-        用 `mc_use_on` 开容器时记得带 `keep_open=true`。
-        返回界面 id、总格数、以及每一格的**格子号**和里面是什么 ——
-        然后就能用 `mc_click` 点它。
-
-        ⚠️ 格子号是**这一套界面自己的编号**，不是背包格号。原版的约定：
-        · 箱子：0~26 是箱子的 27 格，27~62 是你的背包
-        · 工作台：0 是产物格，1~9 是 3×3 材料格，10 以后是背包
-        · 只开了背包（没开容器）：0 是产物格，1~4 是 2×2 材料格
-
-        如果显示"没开界面"，说明她手上是空的（只剩默认的背包界面）。
+        格子号是**这套界面自己的编号**，不是背包格号。用 mc_use_on 开容器时记得 `keep_open=true`。
         """
         if (deny := self._guard(event)):
             return deny
@@ -490,18 +502,10 @@ class McBodyPlugin(Star):
 
     @filter.llm_tool(name="mc_click")
     async def mc_click(self, event: AstrMessageEvent, slot: int, mode: int = 1):
-        """点当前界面的**第几号格子**。这是"从箱子里拿东西"和"合成"的核心动作。
+        """点当前界面的**第几号格子** —— 从箱子里拿东西、合成都靠它。先用 mc_menu 看格子号。
 
-        先用 `mc_menu` 看清楚格子号。
-
-        `mode` 的常用值：
-        · **1（默认）= shift 快速移动** —— 箱子格 → 你的背包；或**产物格 → 直接合成**
-        · 0 = 普通左键（拿起 / 放下）
-        · 6 = 双击（把同种东西全收过来）
-
-        ⚠️ 典型用法：
-        · **把箱子里的东西全拿走**：对着箱子的每一格（0~26）调 `mc_click <格子> 1`
-        · **合成**：先用 `mc_click <材料格> 0` 把材料摆进 2×2/3×3，再 `mc_click 0 1` 取产物
+        · `mode=1`（默认）shift 快速移动：箱子格→背包；或**产物格→直接合成**
+        · `mode=0` 普通左键（拿起/放下）；`mode=6` 双击收同种
 
         Args:
             slot(number): 格子号（用 mc_menu 查，不是背包格号）。
@@ -529,6 +533,71 @@ class McBodyPlugin(Star):
         after = "" if merr else "\n" + render.describe_menu(data)
         return f"已点第 {n} 号格（mode={m}）。过一会儿用 mc_inventory / mc_menu 看结果。{after}"
 
+    @filter.llm_tool(name="mc_craft")
+    async def mc_craft(self, event: AstrMessageEvent, item: str, count: int = 1):
+        """**做东西**：给物品名，她自己算整条链并一步步做出来（含自己找工作台、走过去、打开）。
+
+        例："做把木镐" → 她自己推原木→木板→木棍→木镐。配方来自服务端，**mod 物品也认识**。
+        ⚠️ 材料得她本来就有（缺料不会去挖，会如实说缺什么）；只支持工作台/背包合成，熔炉要烧的用 mc_smelt。
+
+        Args:
+            item(string): 要做的物品，例如 "wooden_pickaxe"、"crafting_table"、
+                "oak_planks"。带不带 `minecraft:` 前缀都行；mod 物品要带前缀。
+            count(number): 要做几个，默认 1。
+        """
+        if (deny := self._guard(event)):
+            return deny
+        name = str(item or "").strip()
+        if not name:
+            return "没说要做什么。"
+        try:
+            n = max(1, int(count))
+        except (TypeError, ValueError):
+            n = 1
+        if not self._cfg("enable_craft", True):
+            return "合成功能被管理员关掉了。"
+
+        crafter = Crafter(self.bridge)
+        runner = CraftRunner(self.bridge)
+        try:
+            plan = await crafter.plan(name, n)
+        except BridgeError as exc:
+            return f"算配方的时候没连上桥：{exc}"
+        if not plan.ok:
+            self.journal.add("craft", f"做 {name}×{n} 做不了：{plan.describe().splitlines()[0]}")
+            return "做不了：\n" + plan.describe()
+        if not plan.steps:
+            return f"不用做，她手上已经有 {name} 了。"
+        self.journal.add("craft", f"开始做 {name}×{n}")
+        try:
+            result = await runner.run(plan)
+        except BridgeError as exc:
+            self.journal.add("error", f"做 {name} 时桥断了")
+            return f"做的过程中桥断了：{exc}"
+        self.journal.add("craft", f"做 {name}×{n} —— {result.splitlines()[0]}")
+        return result
+
+    @filter.llm_tool(name="mc_smelt")
+    async def mc_smelt(self, event: AstrMessageEvent, item: str):
+        """**烧东西**：原料放进熔炉炼成成品（生铁→铁锭、沙子→玻璃、生肉→熟肉）。
+
+        自己挑配方（同一产物常有多个）、走过去、放料放燃料、**等烧完**、取走。
+        ⚠️ 要有**燃料**（煤/木炭）且熔炉在 16 格内；会把原料**整叠**放进去，出来多少是多少。
+        分不清该用这个还是 mc_craft 就先试 mc_craft —— 它会说"这个得烧"。
+
+        Args:
+            item(string): 要炼出来的东西，例如 "iron_ingot"、"glass"、"copper_ingot"。
+                带不带 `minecraft:` 前缀都行。
+        """
+        if (deny := self._guard(event)):
+            return deny
+        if not self._cfg("enable_craft", True):
+            return "冶炼功能被管理员关掉了。"
+        try:
+            return await Smelter(self.bridge, self.journal).smelt(str(item or ""))
+        except BridgeError as exc:
+            return f"烧的过程中桥断了：{exc}"
+
     @filter.llm_tool(name="mc_attack")
     async def mc_attack(self, event: AstrMessageEvent):
         """攻击你准星正指着的实体（打怪、打动物）。
@@ -546,13 +615,9 @@ class McBodyPlugin(Star):
 
     @filter.llm_tool(name="mc_threats")
     async def mc_threats(self, event: AstrMessageEvent):
-        """看看附近有没有怪、离你多远、什么怪、还剩多少血、**是不是正瞄着你**。
+        """看附近有没有怪、多远、什么怪、多少血、**是不是正瞄着你**（服务端直查世界，很准）。
 
-        数据来自**服务端直接查询世界**（不靠客户端看，所以很准）。
-        想知道"周围安不安全"、"该不该打"、"往哪跑"时用它。
-
-        返回按距离排序的实体列表；其中 `hostile` 为真的才是敌对怪，
-        `targeting` 为真的表示**它正盯着你**。
+        想判断"周围安不安全""该不该打""往哪跑"就用它。`targeting=true` 表示它正盯着你。
         """
         if (deny := self._guard(event)):
             return deny
@@ -563,18 +628,13 @@ class McBodyPlugin(Star):
 
     @filter.llm_tool(name="mc_stance")
     async def mc_stance(self, event: AstrMessageEvent, mode: str):
-        """设置你的**战斗姿态** —— 也就是"要不要主动打怪"这件事，**由你自己决定**。
+        """设**战斗姿态** —— "要不要主动打怪"这件事由你自己决定。
 
-        两种姿态：
+        · `defend`（默认）被动：只在**挨打**或**怪正瞄着你**时才还手，够不着**不追**
+        · `hunt` 主动清怪：5 格内有敌对就上去打，够不着会追过去
 
-        · `defend`（默认）—— **被动**。只在**挨打**、或者**有怪正瞄着你**的时候才还手。
-          够得着就挥，够不着就站着等它过来，**不追出去**。不主动挑事。
-        · `hunt` —— **主动清怪**。5 格内有敌对生物就上去打，够不着会追过去。
-
-        ⚠️ 无论哪种姿态，**挨打都会立刻自动还手**（这是反射，不经过你）——
-        所以不用担心"设成 defend 会不会被打死"。
-
-        想安安静静挖矿就设 `defend`；想主动清场、保护自己或别人就设 `hunt`。
+        ⚠️ 两种姿态下**挨打都会立刻自动还手**（反射，不经过你），所以 defend 不会被打死。
+        想安静挖矿设 defend；想清场设 hunt。
 
         Args:
             mode(string): 只能是 "defend"（被动还手）或 "hunt"（主动清怪）。
@@ -593,17 +653,10 @@ class McBodyPlugin(Star):
 
     @filter.llm_tool(name="mc_retreat")
     async def mc_retreat(self, event: AstrMessageEvent, toward: str = "owner"):
-        """**主动脱战** —— 立刻停止战斗，往安全方向或者用户那边撤。
+        """**主动脱战**：立刻停手往安全方向撤。血量好好的也能用（打不过、不想打、想回来找人）。
 
-        和"快死了才跑"不一样：这个**主动**的，血量好好的也能用。
-        打不过、不想打、觉得不划算、或者只是想回来找人了，都可以调它。
-
-        撤退方向：
-        · `owner`（默认）—— **朝用户跑**。你会在游戏里看到他，跟他会合最安全。
-          如果他不在线或不在同一维度，自动退化成"往安全方向跑"。
-        · `safe` —— 背离最近的怪跑一段，不管用户在不在。
-
-        撤退后她会退出战斗状态，**不会**打完这条命令又自己冲回去。
+        · `owner`（默认）朝用户跑，会合最安全；他不在线/不同维度则自动退化成 safe
+        · `safe` 背离最近的怪跑一段
 
         Args:
             toward(string): "owner"（朝用户跑，默认）或 "safe"（背离怪跑）。
@@ -615,6 +668,71 @@ class McBodyPlugin(Star):
         except ValueError as exc:
             return str(exc)
         return f"已脱战，{what}。她不会再自己冲回去打。"
+
+    # ---- 任务层（多步行为）-----------------------------------------------
+
+    @filter.llm_tool(name="mc_task")
+    async def mc_task(self, event: AstrMessageEvent, task: str, at: str = ""):
+        """派她去做一件**多步的事**，程序自己一步步做完。别的工具是**一个动作**，这个是**一件事**。
+
+        现在能派的：
+        · `torch` 沿途照明 —— 沿一个方向走，路边隔一段插一根火把。需要身上有火把
+        · `farm` 种田 —— 走到田边，收割+补种。有锄头/种子更好，没有也能只收（最多 3 分钟）
+
+        派出去她自己在做，你不用盯着 —— 进度看 mc_state 的「正在做的事」，停用 mc_task_stop。
+        ⚠️ **挨打/濒死会自动打断**她（保命优先），但那是**挂起**不是取消，危险过去她自己接着做。
+
+        ⚠️ 田远了（超过 16 格）她**扫不到**，`farm` 会扑空 —— 那就用 `at` 告诉她田在哪。
+
+        Args:
+            task(string): 任务名。不认得的名字会被拒绝并列出可选项。
+            at(string): 可选，任务的地点，格式 "x z"（例如 "-50 120"）。种田时用它指定田的位置。
+        """
+        if (deny := self._guard(event)):
+            return deny
+        if not self._cfg("enable_mc_task", True):
+            return "派任务的功能被管理员关掉了。"
+        name = str(task or "").strip()
+        if not name:
+            return "要派哪件事？现在能派的有：\n" + render.describe_catalog(self.tasks.catalog())
+        params: dict = {}
+        # `at` = "x z"。解析失败就忽略 —— 任务自己会退化成"就地干"。
+        parts = str(at or "").replace(",", " ").split()
+        if len(parts) >= 2:
+            px, pz = self._clean_coord(parts[0]), self._clean_coord(parts[1])
+            if px is not None and pz is not None:
+                params["x"], params["z"] = px, pz
+        return await self.tasks.start(name, **params)
+
+    @filter.llm_tool(name="mc_task_stop")
+    async def mc_task_stop(self, event: AstrMessageEvent):
+        """丢掉当前任务，回到闲着。
+
+        ⚠️ 是**取消**不是暂停，进度会丢。"先去做别的、回头接着做"不用这个，直接给新指令即可。
+        """
+        if (deny := self._guard(event)):
+            return deny
+        return await self.tasks.stop()
+
+    @filter.llm_tool(name="mc_journal")
+    async def mc_journal(self, event: AstrMessageEvent, count: int = 20):
+        """翻**状态日志**：刚才都发生了什么（分类：任务/反射/合成/身体/出错）。
+
+        用户问"你刚才在干嘛"而你记不清、或想确认某件事成没成时用它。
+        ⚠️ mc_state 里已带最近 10 条，这个是往前多翻。日志**只在内存**，插件重载就清空。
+
+        Args:
+            count(number): 往回翻多少条，默认 20，最多 100。
+        """
+        if (deny := self._guard(event)):
+            return deny
+        try:
+            n = max(1, min(int(count), 100))
+        except (TypeError, ValueError):
+            n = 20
+        if len(self.journal) == 0:
+            return "日志是空的 —— 要么刚重启过，要么真的什么都还没发生。"
+        return f"最近 {min(n, len(self.journal))} 条：\n{self.journal.render(n)}"
 
     # ---- 调试入口 -------------------------------------------------------
 

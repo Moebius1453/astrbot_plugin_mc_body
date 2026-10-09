@@ -22,6 +22,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 
 from astrbot.api import logger
 
@@ -30,6 +31,19 @@ BTN_LEFT = 0
 BTN_RIGHT = 1
 MODE_PICKUP = 0          # 普通点（拿起/放下）
 MODE_QUICK_MOVE = 1      # shift 快速移动
+MODE_SWAP = 2            # 和快捷栏/副手对调
+
+# ---- 玩家自己身上那几个固定格子 -------------------------------------------
+#
+# ⚠️ 这些号是**原版 `InventoryMenu` 定死的**（不是"某个容器"的格子）：
+#     0 合成产物 · 1~4 合成格 · **5~8 护甲(头/胸/腿/脚)** · 9~35 背包 · 36~44 快捷栏 · **45 副手**
+#
+# `ClickType.SWAP` 的 `button` 也有约定：**0~8 = 快捷栏第几格**，**40 = 副手**。
+# （40 不是"第 40 格"，是原版按 F 键时用的魔法值。）
+OFFHAND_SLOT = 45
+ARMOR_SLOTS = {"head": 5, "chest": 6, "legs": 7, "feet": 8}
+SWAP_OFFHAND = 40
+WEAR_PLACES = ("hand", "off", "head", "chest", "legs", "feet")
 
 # ---- 容器表 ---------------------------------------------------------------
 #
@@ -174,6 +188,27 @@ class ContainerIO:
         await self.click(src, BTN_LEFT, MODE_PICKUP)
         return True
 
+    async def put_stack(self, layout: dict, dest_slot: int, candidates: list[str]) -> bool:
+        """把**整叠**候选材料放进 `dest_slot`（冶炼/烧炼要一次放一堆，不是放一个）。
+
+        ⚠️ **目标格必须已经空着** —— 非空时"拿起整叠再放下"会变成**交换**，
+        手上反而多出一叠东西，后面全乱（`put_one` 那三步没这问题，因为它最后把余料放回去了）。
+        """
+        src = None
+        for cand in candidates:
+            src = await self.slot_of(cand, layout)
+            if src is not None:
+                break
+        if src is None:
+            logger.warning(f"[mc_body] 放料：身上没有 {candidates[0] if candidates else '?'}")
+            return False
+        if await self.count_slots([dest_slot]) > 0:
+            logger.warning(f"[mc_body] 放料：{dest_slot} 号格不是空的，放整叠会变成交换，跳过")
+            return False
+        await self.click(src, BTN_LEFT, MODE_PICKUP)
+        await self.click(dest_slot, BTN_LEFT, MODE_PICKUP)
+        return True
+
     async def take_all(self, slot: int) -> None:
         """shift 点一格 —— 把那一叠整个挪走（产物格 / 箱子格都这么拿）。"""
         await self.click(slot, BTN_LEFT, MODE_QUICK_MOVE)
@@ -181,21 +216,124 @@ class ContainerIO:
     async def empty_slots(self, slots: list[int], max_rounds: int = 8) -> None:
         """把一组格子搬空（比如开箱子全拿走）。shift 点一遍，反复直到不再减少。"""
         for _ in range(max_rounds):
-            before = await self._count_items(slots)
+            before = await self.count_slots(slots)
             if before == 0:
                 return
             for s in slots:
                 await self.take_all(s)
-            if await self._count_items(slots) >= before:
+            if await self.count_slots(slots) >= before:
                 return          # 没进展了，别死循环
 
-    async def _count_items(self, slots: list[int]) -> int:
+    async def count_slots(self, slots: list[int]) -> int:
+        """这组格子里一共有**几个东西**（产物格空了没、输入格还剩多少）。
+
+        判"冶炼好了没"就靠它 —— **别看格子非空就以为好了**，数量对不上是另一回事。
+        """
         m = await self.menu()
         if not isinstance(m, dict):
             return 0
         want = set(int(s) for s in slots)
         return sum(int(x.get("c") or 0) for x in (m.get("items") or [])
                    if int(x.get("i") or -1) in want)
+
+    async def send(self, command: str) -> dict | None:
+        """发一条**原始桥命令**（不走容器原语时用，比如 `mcb hotbar 3`）。"""
+        try:
+            reply = await self.bridge.call(command)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[mc_body] 容器命令 {command!r} 失败：{exc}")
+            return None
+        if not reply.get("ok"):
+            return None
+        data = reply.get("data")
+        return data if isinstance(data, dict) else {}
+
+    async def inventory(self) -> dict:
+        """她身上的东西。**读的是服务端真值**，不是界面快照。"""
+        return await self.send("mcb inventory") or {}
+
+
+def _rid(item: object) -> str:
+    """取注册名。**绝不回退到显示名** —— 那会跟语言走，匹配必然错（docs/04 坑 10o）。"""
+    return str((item or {}).get("id") or "") if isinstance(item, dict) else ""
+
+
+# ---- 「装到该去的地方」------------------------------------------------------
+#
+# ⚠️ 这是**原版那几格**（手/副手/护甲）的通用入口。
+#    **加一种新位置 = 加一行映射**（同 `CONTAINERS` 的规矩），别写新函数。
+
+async def wear(io: ContainerIO, item_id: str, where: str = "hand") -> str | None:
+    """把 `item_id` 装到 `where`。成功返回 None，失败返回一句人话。
+
+    · `hand`  —— 快捷栏并选中
+    · `off`   —— 副手（就是那个 F 键，原版 `SWAP` 的 button=40）
+    · `head` / `chest` / `legs` / `feet` —— 护甲格（shift 点，**原版自己会路由**，
+      不用我们算该放哪一格 —— 这也是为什么装备全靠一个 QUICK_MOVE 就够）
+    """
+    if where not in WEAR_PLACES:
+        return f"不认得「{where}」这个位置（只认 {' / '.join(WEAR_PLACES)}）"
+
+    # ① 快捷栏 —— **这条路不需要界面布局**，最省事也最可靠。
+    #    （踩过：一上来就要求布局，快捷栏里的东西反而拿不到。）
+    data = await io.inventory()
+    hot_index = None
+    for i, it in enumerate(data.get("hotbar") or []):
+        if _rid(it) == item_id:
+            hot_index = i
+            break
+    if where == "hand" and hot_index is not None:
+        await io.send(f"mcb hotbar {hot_index}")
+        return None
+
+    # ② 其它位置（和"东西不在快捷栏"的情况）才需要知道界面布局
+    layout = await io.layout()
+    if layout is None:
+        return "读不到界面布局（客户端没上报界面信息？）"
+
+    slot = await io.slot_of(item_id, layout)
+    if slot is None:
+        # ⚠️ **`slot_of` 看不见副手**（它只翻 hotbar / main）——
+        #    不单独认一下的话，"把盾从副手换到手上"会谎报"身上没有盾"（实战踩过）。
+        if _rid(data.get("offhand")) == item_id:
+            slot = _offhand_slot(layout)
+        else:
+            return f"身上没有 {item_id}"
+
+    if where == "hand":
+        hot_base = int(layout["hot_base"])
+        if hot_base <= slot < hot_base + 9:
+            # 已经在快捷栏里 —— 选中就行
+            await io.send(f"mcb hotbar {int(slot) - hot_base}")
+            return None
+        # ⚠️⚠️ **不能只判 `slot >= hot_base`**（踩过）：副手是 `hot_base + 9`，
+        #    落在快捷栏区间**外面**。按 `>= hot_base` 算会得到 `mcb hotbar 9`
+        #    （快捷栏只有 0~8）→ 越界、**静默失败**，而函数还以为成功了。
+        # SWAP 的 button=0 = 和快捷栏第 0 格对调，对**任何**格子都成立，包括副手。
+        await io.click(slot, 0, MODE_SWAP)
+        await io.send("mcb hotbar 0")
+        return None
+
+    if where == "off":
+        if slot == _offhand_slot(layout):
+            return None          # 已经在副手了，别自己和自己对调
+        await io.click(slot, SWAP_OFFHAND, MODE_SWAP)
+        return None
+
+    # 护甲：shift 点 —— 原版 `moveItemStackTo` 会自己塞进对应的护甲格
+    await io.click(slot, BTN_LEFT, MODE_QUICK_MOVE)
+    return None
+
+
+def _offhand_slot(layout: dict) -> int:
+    """副手在当前界面里的格子号。
+
+    ⚠️ **原版所有容器都满足 `副手 = hot_base + 9`**（快捷栏 9 格之后紧跟副手）。
+    已逐个核对过 `CONTAINERS` 里那十种：背包 36+9=45、工作台 37+9=46、
+    熔炉 30+9=39、箱子 54+9=63、切石 29+9=38、锻造 31+9=40、漏斗 32+9=41 …
+    **所以不用给每种容器各加一个字段** —— 加反而是找麻烦。
+    """
+    return int(layout["hot_base"]) + 9
 
 
 def _rid(item: dict) -> str:
@@ -208,6 +346,64 @@ def _rid(item: dict) -> str:
 # ⚠️ 这一层的意义：**上层不该关心"工作台在哪"**。
 #    白说"做把木镐"，它不该需要先知道"要先找张桌子"。
 #    需要什么容器，这一层自己去找、走过去、打开。
+
+# 走到目标几格以内算"到了"
+ARRIVE_RADIUS = 3.0
+# 连续几次轮询都没动才算真停 —— Baritone 中途会短暂 idle（挖一下、跳一下）
+STOP_DEBOUNCE = 2
+
+
+async def wait_baritone(bridge, *, timeout: float = 60.0, target=None,
+                        checkpoint=None) -> str:
+    """等 Baritone 走完。返回 `"arrived"` / `"timeout"`。
+
+    ⚠️⚠️ **必须熬过"刚下发还没起步"那几秒**（2026-10-09 实战踩到）：
+    刚 `goto` 完时 Baritone 的 `isPathing()` **还是 false** ——
+    天真的写法（"不在走 = 到了"）会**立刻判定到达**。
+    实测从 (-10,88) 去 (-45,66) 只花了 9 秒就报"到了"，而人一步没动，
+    后面所有步骤全在一个**错误的位置**上干。
+
+    **正解：先看它起步，再看它停下。** 传了 `target` 时还能确认
+    "她本来就在目标附近"（那种情况没起步是对的）。
+
+    `checkpoint` 是可选的无参协程 —— 任务层传进来，用来响应抢占。
+    """
+    moved = False
+    still = 0
+    waited = 0.0
+    while waited < timeout:
+        if checkpoint is not None:
+            await checkpoint()
+        try:
+            reply = await bridge.call("mcb state")
+        except Exception:  # noqa: BLE001
+            await asyncio.sleep(1.0)
+            waited += 1.0
+            continue
+        st = reply.get("data") or {}
+        task = st.get("task") or {}
+        walking = bool(task.get("available")) and task.get("status") == "moving"
+        if walking:
+            moved = True
+            still = 0
+        else:
+            still += 1
+            if moved and still >= STOP_DEBOUNCE:
+                return "arrived"
+            if not moved and target is not None and _within(st, target, ARRIVE_RADIUS):
+                return "arrived"
+        await asyncio.sleep(1.0)
+        waited += 1.0
+    return "timeout"
+
+
+def _within(state: dict, target, radius: float) -> bool:
+    """她是不是已经在 (x, z) 的 `radius` 格以内。读不到坐标时**说不知道**（False）。"""
+    try:
+        return math.dist((float(state["x"]), float(state["z"])), target) <= radius
+    except (KeyError, TypeError, ValueError):
+        return False
+
 
 async def find_block(bridge, block_id: str, radius: int = 16) -> list[int] | None:
     """附近找某个方块，返回 [x, y, z]；没有返回 None。
@@ -243,11 +439,11 @@ async def open_block(bridge, block_id: str, io: "ContainerIO",
     logger.info(f"[mc_body] 走向 {block_id} ({x},{y},{z})")
     await bridge.call("mcb closeGui")
     await bridge.call(f"mcb baritone goto {x} {z}")
-    for _ in range(12):
-        await asyncio.sleep(2)
-        task = ((await bridge.call("mcb state")).get("data") or {}).get("task") or {}
-        if task.get("status") == "idle":
-            break
+    # ⚠️ 用**共用**的等待原语 —— 别在这儿再写一遍循环。
+    #    这里原来写的是"睡 2 秒看一次，idle 就 break"，**同样会误判**：
+    #    刚下发时 Baritone 还没起步，第一次轮询就是 idle，2 秒后就当到了。
+    got = await wait_baritone(bridge, timeout=30.0, target=(float(x), float(z)))
+    logger.info(f"[mc_body] 走到 {block_id} 附近：{got}")
     await bridge.call("mcb stop")
     await asyncio.sleep(0.5)
     await bridge.call(f"mcb useOnAt {x} {y} {z}")

@@ -1,24 +1,27 @@
 """把桥回来的数据变成**给模型看的中文**。
 
-**所有** `_describe_*` 都在这 —— 别把它们再塞回 `main.py`。
+**所有** `describe_*` 都在这 —— 别把它们再塞回 `main.py`。
 理由：工具方法应该只管"授权 → 调桥 → 返回"，措辞是另一件事，
 混在一起会让 `main.py` 越滚越大（它曾经 853 行、18 个工具）。
 
 ⚠️ 这里的措辞**是模型唯一看得见的东西**，要说清"这是什么、意味着什么、下一步该干嘛"。
+
+⚠️⚠️ **本文件是纯函数，不许 import 插件里的别的东西、不许有工具方法。**
+（踩过：`mc_craft` 那个 `@filter.llm_tool` 曾经被误搬到这里，而这里没有 `filter`，
+插件直接加载失败 —— 见 docs/11。）
 """
 
 from __future__ import annotations
 
 
-@staticmethod
+# ---- 界面 -----------------------------------------------------------
+
 def describe_menu(data: dict) -> str:
     """把上行里的 menu 字段渲染成人话。"""
     task = data.get("task")
     menu = task.get("menu") if isinstance(task, dict) else None
     if not isinstance(menu, dict):
-        return (
-            "读不到界面信息（客户端没上报 —— 她不在线，或客户端脚本没加载）。"
-        )
+        return "读不到界面信息（客户端没上报 —— 她不在线，或客户端脚本没加载）。"
     items = menu.get("items") or []
     mid = menu.get("id")
     slots = menu.get("slots")
@@ -35,71 +38,25 @@ def describe_menu(data: dict) -> str:
     if items:
         lines.append("里面有什么：")
         for it in items[:40]:
-            lines.append(
-                f"  · 第 {it.get('i')} 号格：{it.get('n')} ×{int(it.get('c') or 0)}"
-            )
+            lines.append(f"  · 第 {it.get('i')} 号格：{it.get('n')} ×{int(it.get('c') or 0)}")
         if len(items) > 40:
             lines.append(f"  …（还有 {len(items) - 40} 格没列出来）")
     else:
         lines.append("（这个界面里是空的）")
     return "\n".join(lines)
 
-@filter.llm_tool(name="mc_craft")
-async def mc_craft(self, event: AstrMessageEvent, item: str, count: int = 1):
-    """**做东西** —— 给一个物品名，她自己张罗着把它做出来。
 
-    这是**高级工具**：它会自己算清楚整条链子 ——
-    比如"做一把木镐"，它会自己推出来"得先拿原木做木板、再用木板做木棍、最后上工作台"，
-    然后一步步做掉。中间产物、材料够不够、要不要工作台，**全不用你操心**。
-    需要工作台时她会**自己去找、走过去、打开**。
+# ---- 身体 -------------------------------------------------------------------
 
-    配方来自服务端，所以 **mod 的物品也认识**。
+def describe_state(data: dict, stance: str = "defend", work: dict | None = None,
+                   journal=None) -> str:
+    """她现在的样子 —— **身体状态 + 正在做的事 + 最近发生的事**。
 
-    ⚠️ 两件事你得知道：
-    1. **材料得她自己有**。缺料她**不会去挖**，会如实告诉你缺什么 ——
-       那就先派她去挖（`mc_baritone_raw` 发 `mine`）或用别的办法弄到。
-    2. 现在只支持**工作台/背包合成**。熔炉冶炼、切石机、锻造台**还不能**。
-
-    Args:
-        item(string): 要做的物品，例如 "wooden_pickaxe"、"crafting_table"、
-            "oak_planks"。带不带 `minecraft:` 前缀都行；mod 物品要带前缀。
-        count(number): 要做几个，默认 1。
+    三块缺一不可：只有身体数字，白不知道自己刚才干了什么（用户 2026-10-09
+    要的「让她可以感知到，表现出来她知道她在干什么」）。
     """
-    denied = self._authorize(event)
-    if denied:
-        return denied
-    name = str(item or "").strip()
-    if not name:
-        return "没说要做什么。"
-    try:
-        n = max(1, int(count))
-    except (TypeError, ValueError):
-        n = 1
-    if not self._cfg("enable_craft", True):
-        return "合成功能被管理员关掉了。"
-
-    crafter = Crafter(self.bridge)
-    runner = CraftRunner(self.bridge)
-    try:
-        plan = await crafter.plan(name, n)
-    except BridgeError as exc:
-        return f"算配方的时候没连上桥：{exc}"
-    if not plan.ok:
-        return "做不了：\n" + plan.describe()
-    if not plan.steps:
-        return f"不用做，她手上已经有 {name} 了。"
-    try:
-        return await runner.run(plan)
-    except BridgeError as exc:
-        return f"做的过程中桥断了：{exc}"
-
-# ---- 输出整形 -------------------------------------------------------
-
-def describe_state(self, data: dict) -> str:
     if not data.get("online"):
-        return (
-            f"Nanako 现在**不在线** —— 角色没连进服务器，任何动作都做不了。"
-        )
+        return "Nanako 现在**不在线** —— 角色没连进服务器，任何动作都做不了。"
 
     parts: list[str] = []
     if data.get("x") is not None:
@@ -124,13 +81,42 @@ def describe_state(self, data: dict) -> str:
         parts.append(f"正在使用 {using.get('item')}（还剩 {using.get('remain')} tick）")
 
     head = "Nanako 在线，" + "，".join(parts) if parts else "Nanako 在线。"
-    return f"{head}\n{self.describe_task(data.get('task'))}"
 
-@staticmethod
-def describe_task(task: object) -> str:
+    blocks = [head, describe_work(work), describe_path(data.get("task"))]
+    if journal is not None:
+        blocks.append("最近发生的事：\n" + journal.render())
+    return "\n".join(blocks)
+
+
+def describe_work(work: dict | None) -> str:
+    """**任务层在做什么。** 这就是「她知道自己正在干什么」那一句。"""
+    if not isinstance(work, dict):
+        return "正在做的事：没有任务在跑。"
+
+    if work.get("running"):
+        line = (
+            f"正在做的事：**{work.get('name')}** —— "
+            f"第 {work.get('step')}/{work.get('total')} 步「{work.get('doing')}」"
+        )
+        if work.get("paused"):
+            line += f"\n  ⏸ 暂时挂着（{work['paused']}），那边完事会自动接着做"
+        return line
+
+    last = work.get("last") or {}
+    if last.get("state") == "done":
+        return f"正在做的事：没有 —— 上一件事（{last.get('detail')}）已经做完了。"
+    if last.get("state") == "failed":
+        return f"正在做的事：没有 —— 上一件事没做成：{last.get('detail')}"
+    if last.get("state") == "stopped":
+        return "正在做的事：没有 —— 上一件事被叫停了。"
+    return "正在做的事：没有任务在跑。"
+
+
+def describe_path(task: object) -> str:
+    """客户端上报的 **Baritone 寻路**状态（跟上面的「任务层」不是一回事）。"""
     if not isinstance(task, dict) or not task.get("available"):
         reason = (task or {}).get("reason") if isinstance(task, dict) else None
-        return f"任务状态：**未知** —— {reason or '客户端没有上报状态'}"
+        return f"寻路：**未知** —— {reason or '客户端没有上报状态'}"
 
     bits: list[str] = []
     if task.get("status"):
@@ -142,12 +128,14 @@ def describe_task(task: object) -> str:
     if task.get("eta") is not None:
         bits.append(f"预计 {task['eta']} 秒")
 
-    text = "任务：" + ("，".join(bits) if bits else "无上报字段")
+    text = "寻路：" + ("，".join(bits) if bits else "无上报字段")
     if task.get("stale"):
         text += "（⚠️ 这份状态已过期，客户端可能卡住或掉线了）"
     return text
 
-@staticmethod
+
+# ---- 背包 -------------------------------------------------------------------
+
 def describe_inventory(data: dict) -> str:
     lines: list[str] = []
 
@@ -176,9 +164,7 @@ def describe_inventory(data: dict) -> str:
             lines.append(f"{label}：" + "，".join(rendered))
 
     # 快捷栏排除手上那格，免得重复
-    hotbar_rest = [
-        it for i, it in enumerate(hotbar) if isinstance(it, dict) and i != held
-    ]
+    hotbar_rest = [it for i, it in enumerate(hotbar) if isinstance(it, dict) and i != held]
     fmt_items(hotbar_rest, "快捷栏其它格")
     fmt_items(data.get("main") or [], "背包")
 
@@ -194,7 +180,9 @@ def describe_inventory(data: dict) -> str:
         return "背包是空的，什么都读不到。"
     return "\n".join(lines)
 
-@staticmethod
+
+# ---- 威胁 -------------------------------------------------------------------
+
 def describe_threats(data: dict) -> str:
     threats = data.get("threats") or []
     if not threats:
@@ -223,3 +211,12 @@ def describe_threats(data: dict) -> str:
     if err:
         lines.append("（查询异常：" + "；".join(str(e) for e in err) + "）")
     return "\n".join(lines)
+
+
+# ---- 任务清单 ---------------------------------------------------------------
+
+def describe_catalog(catalog: list[dict]) -> str:
+    """可选任务清单 —— 给工具描述和模型看。"""
+    if not catalog:
+        return "（现在没有可用的任务）"
+    return "\n".join(f"· `{t['id']}` —— {t['name']}：{t['summary']}" for t in catalog)
