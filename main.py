@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import math
 import re
+import time
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
@@ -72,12 +73,29 @@ class McBodyPlugin(Star):
             scan_range=int(self._cfg("reflex_scan_range", 24)),
             notify=self._notify,
         )
+        # 通知去重（见 _notify）
+        self._last_notify_text = ""
+        self._last_notify_at = 0.0
 
     async def _notify(self, text: str) -> None:
-        """把反射事件写到白的会话里（她/用户能看见）。"""
+        """把反射事件写到白的会话里（她/用户能看见）。
+
+        ⚠️ **只给"需要用户知道、需要用户动手"的事用**（比如"我饿了但身上没吃的"）。
+        **自动反射的状态翻转（进战/脱战/逃跑/卡住）一律只写日志**，不许占聊天正文 ——
+        用户明确要求过（2026-10-09）："这种东西日志里面出现就好了"。
+        """
         umo = str(self._cfg("white_session", "") or "")
         if not umo:
             return
+
+        # 去重保险：同一条消息 60 秒内只发一次。防止任何意料之外的重复刷屏。
+        now = time.monotonic()
+        if text == self._last_notify_text and (now - self._last_notify_at) < 60:
+            logger.info(f"[mc_body] 通知去重（60 秒内已发过同样的）：{text}")
+            return
+        self._last_notify_text = text
+        self._last_notify_at = now
+
         from astrbot.core.message.components import Plain
         from astrbot.core.message.message_event_result import MessageChain
 

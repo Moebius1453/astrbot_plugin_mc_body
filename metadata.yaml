@@ -2,7 +2,7 @@ name: astrbot_plugin_mc_body # 插件唯一识别名
 display_name: Minecraft 身体 # 展示名
 short_desc: 让智能体在 Minecraft 里长出手脚。 # 简短描述
 desc: 通过 RCON 桥接，让 AstrBot 的智能体查询 Minecraft 角色状态、说话、移动。 # 详细描述
-version: v0.7.0 # 版本号
+version: v0.8.1 # 版本号
 author: Moebius1453 # 作者
 repo: https://github.com/Moebius1453/astrbot_plugin_mc_body # 仓库地址
 astrbot_version: ">=4.27,<5" # 依赖的 AstrBot 版本范围

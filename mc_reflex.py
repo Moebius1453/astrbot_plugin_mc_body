@@ -43,8 +43,17 @@ ENGAGE_RANGE = 3.0
 # 连续多少 tick 看不到怪就脱战（抄女仆的 StopAttackingIfTargetInvalid）
 COMBAT_EXIT_TICKS = 5
 
+# 脱战滞后：怪要拉开到 NEAR_HOSTILE_RANGE × 这个倍数才算"走了"。
+# 防止怪在边界上晃一下导致"进战/脱战"反复横跳（踩过：刷屏到用户的 QQ 里）。
+COMBAT_EXIT_RATIO = 1.6
+
 # 走向目标的节流：别每 tick 都下发一遍 goto
 APPROACH_EVERY_TICKS = 2
+
+# 吃饭（抄女仆 MaidHealSelfTask）：饥饿低于这个值就吃
+HUNGER_LOW = 16
+# 限频 —— 抄女仆的 setMaxCheckRate：吃完隔一会儿再看，别每 tick 查背包
+EAT_COOLDOWN_TICKS = 5
 
 
 class ReflexGuard:
@@ -59,6 +68,7 @@ class ReflexGuard:
         hp_critical: float = 6.0,
         flee_distance: int = 32,
         scan_range: int = 24,
+        hunger_low: float = HUNGER_LOW,
         notify=None,
     ) -> None:
         self.bridge = bridge
@@ -67,6 +77,7 @@ class ReflexGuard:
         self.hp_critical = float(hp_critical)
         self.flee_distance = max(8, int(flee_distance))
         self.scan_range = max(6, int(scan_range))
+        self.hunger_low = float(hunger_low)
         self._notify = notify  # 可选：async callable(str)
 
         self._task: asyncio.Task | None = None
@@ -81,6 +92,10 @@ class ReflexGuard:
         self._in_combat = False
         self._no_threat_ticks = 0
         self._approach_wait = 0
+
+        # 吃饭
+        self._eat_cool = 0
+        self._no_food_warned = False
 
     # ---- 生命周期 -------------------------------------------------------
 
@@ -151,18 +166,21 @@ class ReflexGuard:
                 self._in_combat = True
                 self._no_threat_ticks = 0
                 why = "挨打了" if hurt else f"{nearest['name']} 贴到 {nearest['dist']:g} 格"
+                # ⚠️ **只写日志，不发 QQ** —— 战斗是自动跑的，用户不需要在聊天里看到它。
+                #    只有"白主动要告诉用户的事"才走 _notify（比如"我饿了但没吃的"）。
                 logger.warning(f"[mc_body] ⚔ 进入战斗（{why}）")
-                await self._notify_safe(f"进入战斗（{why}）。战斗归我管，你看着就行。")
                 if hurt:
                     await self._cmd("mcb stop")   # 别再顺着原路线撞进去
         else:
-            if nearest is None:
+            # ⚠️ 脱战要**滞后**（hysteresis）：进战是 ≤5 格，脱战得等拉开到 ~8 格。
+            #    否则怪在边界上晃一下就是"进战/脱战"来回刷（用户看到的现象）。
+            gone = nearest is None or nearest.get("dist", 1e9) > NEAR_HOSTILE_RANGE * COMBAT_EXIT_RATIO
+            if gone:
                 self._no_threat_ticks += 1
                 if self._no_threat_ticks >= COMBAT_EXIT_TICKS:
                     self._in_combat = False
                     self._fleeing = False
-                    logger.info("[mc_body] ⚔ 脱战：附近没怪了")
-                    await self._notify_safe("脱离战斗了。")
+                    logger.info("[mc_body] ⚔ 脱战：怪已经拉开或没了")
             else:
                 self._no_threat_ticks = 0
                 await self._fight(data, nearest, hp)
@@ -173,6 +191,74 @@ class ReflexGuard:
 
         # 卡住判定
         await self._check_stuck(data)
+
+        # 吃饭 —— 抄女仆 MaidHealSelfTask：饿了就吃，不经过 LLM
+        await self._maybe_eat(data)
+
+    async def _maybe_eat(self, data: dict) -> None:
+        """饿了就自己吃。判据抄女仆：**看 FoodProperties，不看白名单**（mod 食物自动兼容）。
+
+        抄了女仆这几个细节：
+          · 限频（`setMaxCheckRate`）—— 吃完隔几 tick 再看，别每 tick 翻背包
+          · 优先用手上/快捷栏里最顶饱的
+          · **记住原来手上拿的是什么，吃完换回来**（`memoryHandItemStack`）
+        """
+        if self._eat_cool > 0:
+            self._eat_cool -= 1
+            return
+
+        food = data.get("food") or {}
+        level = food.get("level")
+        if not isinstance(level, (int, float)) or level >= self.hunger_low:
+            return
+        if self._in_combat:
+            return  # 战斗的时候先保命，别停下来啃面包
+
+        best = await self._find_food()
+        if best is None:
+            if not self._no_food_warned:
+                self._no_food_warned = True
+                logger.warning(f"[mc_body] 🍖 饿了（{level:g}）但身上没吃的")
+                await self._notify_safe(f"我饿了（饱食度 {level:g}），但身上没有食物。")
+            return
+
+        slot, name, nutrition = best
+        self._no_food_warned = False
+        self._eat_cool = EAT_COOLDOWN_TICKS
+        logger.info(f"[mc_body] 🍖 饿了（{level:g}）→ 吃 {name}（第 {slot} 格，营养 {nutrition}）")
+
+        # 换到手上 → 吃 → 换回原来那格（抄女仆的 memoryHandItemStack）
+        before = data.get("held") if isinstance(data.get("held"), int) else None
+        await self._cmd(f"mcb hotbar {slot}")
+        await self._cmd("mcb use")
+        if before is not None and before != slot:
+            await self._cmd(f"mcb hotbar {before}")
+
+    async def _find_food(self) -> tuple[int, str, float] | None:
+        """在**快捷栏**里找最顶饱的食物。
+
+        ⚠️ 只能找快捷栏（0-8）—— 背包里的东西要先用 `swap` 挪出来，那一步还没接。
+        """
+        try:
+            reply = await self.bridge.call("mcb inventory")
+        except Exception:
+            return None
+        if not reply.get("ok"):
+            return None
+        hotbar = (reply.get("data") or {}).get("hotbar") or []
+        best = None
+        for slot, item in enumerate(hotbar):
+            if not isinstance(item, dict):
+                continue
+            fp = item.get("food")
+            if not isinstance(fp, dict):
+                continue          # 没有 food 字段 = 不能吃
+            nutrition = fp.get("nutrition")
+            if not isinstance(nutrition, (int, float)):
+                continue
+            if best is None or nutrition > best[2]:
+                best = (slot, str(item.get("n") or "?"), float(nutrition))
+        return best
 
     async def _fight(self, data: dict, nearest: dict, hp: float | None) -> None:
         """战斗态的一次决策：逃 / 走过去 / 挥。"""
@@ -275,9 +361,7 @@ class ReflexGuard:
             f"[mc_body] ⚠ 血量危急 —— {who}，跑 {self.flee_distance} 格到 ({tx},{tz})"
         )
         await self._cmd(f"mcb baritone goto {tx} {tz}")
-
-        if self._notify is not None:
-            await self._safe_notify(f"白血量危急，已让她逃跑（{who}，前往 {tx},{tz}）。")
+        # ⚠️ 只写日志，**不发 QQ** —— 自动反射的状态变化不该占用户的聊天正文
 
     async def _check_stuck(self, data: dict) -> None:
         """在寻路但坐标长时间不动 = 卡住了。"""
@@ -316,10 +400,7 @@ class ReflexGuard:
                 f"[mc_body] ⚠ 白卡住了：{elapsed:.0f} 秒只挪了 {moved:.1f} 格，已让她停下"
             )
             await self._cmd("mcb stop")
-            if self._notify is not None:
-                await self._safe_notify(
-                    f"白卡住了（{elapsed:.0f} 秒几乎没动），已让她停下。"
-                )
+            # ⚠️ 只写日志，**不发 QQ**（同上：自动反射不占聊天正文）
 
     # ---- 小工具 ---------------------------------------------------------
 
