@@ -77,13 +77,13 @@
     "default": 2
   },
   "hp_low": {
-    "type": "number",
+    "type": "float",
     "description": "血量警戒线",
     "hint": "低于这个值就算「危险」。挨打会立刻触发停止。",
     "default": 12
   },
   "hp_critical": {
-    "type": "number",
+    "type": "float",
     "description": "血量危急线（触发逃跑）",
     "hint": "战斗中血量掉到这个值以下，她会朝远离方向跑一段。",
     "default": 6
