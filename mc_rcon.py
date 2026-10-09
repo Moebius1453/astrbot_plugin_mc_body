@@ -10,8 +10,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
+import logging
 
-from astrbot.api import logger
+try:  # 在 AstrBot 里跑时用它的 logger；单独拿出来测时退回标准库
+    from astrbot.api import logger
+except ImportError:  # pragma: no cover - 只在脱离 AstrBot 时走到
+    logger = logging.getLogger(__name__)
 
 try:  # 惰性降级：缺依赖时插件仍能加载，只是工具会报明确的错
     import aiomcrcon
@@ -19,12 +24,40 @@ except ImportError:  # pragma: no cover - 取决于运行环境
     aiomcrcon = None
 
 
+ENVELOPE_PREFIX = "MCB "
+
+
 class BridgeError(RuntimeError):
-    """桥不可用：连不上、没响应、密码错。
+    """桥不可用：连不上、没响应、密码错、返回了看不懂的东西。
 
     消息是给人**和模型**看的中文 —— 它会原样进到白的下一次请求里，
-    所以要说清"是隧道断了"还是"命令本身失败了"。
+    所以要说清是"隧道断了"还是"命令本身失败了"。
     """
+
+
+def parse_envelope(raw: str) -> dict:
+    """把服务端返回的一行拆成信封字典。
+
+    服务端契约（见项目文档 09）：
+        MCB {"ok":true,  "action":"state", "data":{...}}
+        MCB {"ok":false, "action":"state", "error":"Nanako 不在线"}
+
+    解析不了就抛 `BridgeError` —— **绝不假装成功**。
+    """
+    if not raw.startswith(ENVELOPE_PREFIX):
+        raise BridgeError(
+            f"桥返回了非信封内容：{raw!r}。"
+            "可能是 RCON 打到了别的服务，或服务端脚本版本不对。"
+        )
+    body = raw[len(ENVELOPE_PREFIX) :].strip()
+    try:
+        obj = json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise BridgeError(f"桥返回的信封不是合法 JSON：{body!r}") from exc
+    if not isinstance(obj, dict) or "ok" not in obj:
+        raise BridgeError(f"桥返回的信封缺少 ok 字段：{obj!r}")
+    return obj
+
 
 
 class RconBridge:
@@ -82,6 +115,14 @@ class RconBridge:
     async def ping(self) -> str:
         """连通性探针。连不上会抛 BridgeError。"""
         return await self.run("mcb ping")
+
+    async def call(self, command: str) -> dict:
+        """发一条命令并把返回的信封解析成 dict。
+
+        只管**传输与解析**：信封里 `ok:false` 也照样返回（那是桥的正常回复，
+        比如"Nanako 不在线"）。只有连不上/解析不了才抛 `BridgeError`。
+        """
+        return parse_envelope(await self.run(command))
 
     async def close(self) -> None:
         async with self._lock:
