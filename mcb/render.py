@@ -220,3 +220,87 @@ def describe_catalog(catalog: list[dict]) -> str:
     if not catalog:
         return "（现在没有可用的任务）"
     return "\n".join(f"· `{t['id']}` —— {t['name']}：{t['summary']}" for t in catalog)
+
+
+# ---- 状态数据包 -------------------------------------------------------------
+#
+# ⚠️⚠️ **这是"感知"那一块，规矩跟上面所有 describe_* 都不一样。**
+#
+# 用户 2026-10-09 拍板（原话）：
+#   > "感知我是没法接受程序文本的。必须是如同上文附加在末尾一样，
+#   >   规定一个包含信息的状态数据包让她知道处境。"
+#
+# 区别**不是措辞问题**：
+#   ❌ `[身体] 我饿了（饱食度 6），但身上没有食物。` —— 程序替她写的**台词**
+#   ✅ `food=6/20 food_items=0`                      —— 关于她身体的**数据**
+#
+# **程序只负责把状态摆出来，不负责说出来。**
+# 凡是"她会用第一人称讲的话"，一律不许出现在这里。
+#
+# 另外三条：
+#   · **不做任何解读** —— 不许写"（危险）""（该吃了）"。那是她的判断
+#   · **缺失写 `?` 不写 0** —— 把"读不到"和"没有"分开（docs/04 坑 10f）
+#   · **字段名要短** —— 每次 LLM 请求都要重发，是按字收费的
+
+
+def _num(value, fmt: str = "g") -> str:
+    """数值渲染。**读不到回 `?`，不回 0** —— 把"不知道"和"零"分开。"""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return "?"
+    return format(value, fmt)
+
+
+def state_packet(data: dict, stance: str = "defend", work: dict | None = None,
+                 journal=None, places=None, *, log_lines: int = 4) -> str:
+    """**紧凑的状态数据包** —— 纯数据，给白当处境感知用。
+
+    形如：
+
+        [body] pos=-10.5,88.0,-8.0 dim=overworld hp=20.0/20 food=17/20
+        [act]  task=沿途照明 2/3 拿到手上 | stance=defend | path=idle
+        [log]  23:11 插火把×2 · 23:15 烧成 iron_ingot×1
+        [know] 家(-10,88,-9) 麦田(-51,65,-7)
+    """
+    if not isinstance(data, dict) or not data.get("online"):
+        return "[body] offline"
+
+    lines: list[str] = []
+
+    # ---- 身体 ----
+    body = [f"pos={_num(data.get('x'), '.1f')},{_num(data.get('y'), '.1f')},{_num(data.get('z'), '.1f')}"]
+    dim = str(data.get("dim") or "").removeprefix("minecraft:")
+    body.append(f"dim={dim or '?'}")
+    body.append(f"hp={_num(data.get('hp'), '.1f')}/20")
+    food = data.get("food") if isinstance(data.get("food"), dict) else {}
+    body.append(f"food={_num(food.get('level'), 'g')}/20")
+    using = data.get("using")
+    if isinstance(using, dict) and using.get("isUsing"):
+        body.append(f"using={using.get('item')}({_num(using.get('remain'), 'g')}t)")
+    lines.append("[body] " + " ".join(body))
+
+    # ---- 在干什么 ----
+    act = [f"stance={stance}"]
+    if isinstance(work, dict) and work.get("running"):
+        act.append(f"task={work.get('name')} {work.get('step')}/{work.get('total')} {work.get('doing')}")
+        if work.get("paused"):
+            act.append(f"paused={work['paused']}")
+    else:
+        act.append("task=-")
+    path = data.get("task") if isinstance(data.get("task"), dict) else {}
+    if path.get("available"):
+        act.append(f"path={path.get('status') or '?'}")
+    lines.append("[act]  " + " | ".join(act))
+
+    # ---- 最近发生了什么 ----
+    if journal is not None and len(journal) > 0:
+        rows = journal.tail(log_lines)
+        lines.append("[log]  " + " · ".join(f"{r['t'][:5]} {r['text']}" for r in rows))
+
+    # ---- 知道的地方 ----
+    if places is not None and len(places) > 0:
+        top = places.list()[:5]
+        lines.append("[know] " + " ".join(
+            f"{r['name']}({r['x']:g},{r['y']:g},{r['z']:g})" for r in top
+        ))
+
+    return "\n".join(lines)

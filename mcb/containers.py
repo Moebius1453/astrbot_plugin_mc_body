@@ -254,25 +254,76 @@ class ContainerIO:
 
 
 def _rid(item: object) -> str:
-    """取注册名。**绝不回退到显示名** —— 那会跟语言走，匹配必然错（docs/04 坑 10o）。"""
-    return str((item or {}).get("id") or "") if isinstance(item, dict) else ""
+    """取注册名。**绝不回退到显示名** —— 那会跟语言走，匹配必然错（docs/04 坑 10o）。
 
-
-# ---- 「装到该去的地方」------------------------------------------------------
+    ⚠️ **这一份是唯一的一份**（2026-10-10）。曾经文件里有两份同名 `_rid`，
+    后一份（没判 `isinstance`）**静默覆盖**了前一份 —— 于是快捷栏里的空槽位
+    （`null`）一走过就 `AttributeError`。**Python 不会警告重复定义，只会用最后一个。**
+    """
+    return str((item or {}).get("id") or "") if isinstance(item, dict) else ""# ---- 「装到该去的地方」------------------------------------------------------
 #
 # ⚠️ 这是**原版那几格**（手/副手/护甲）的通用入口。
 #    **加一种新位置 = 加一行映射**（同 `CONTAINERS` 的规矩），别写新函数。
 
 async def wear(io: ContainerIO, item_id: str, where: str = "hand") -> str | None:
-    """把 `item_id` 装到 `where`。成功返回 None，失败返回一句人话。
+    """把 `item_id` 挪到 `where`。成功返回 None，失败返回一句人话。
 
-    · `hand`  —— 快捷栏并选中
+    · `hand`  —— 快捷栏并选中（最快，不需要看界面）
     · `off`   —— 副手（就是那个 F 键，原版 `SWAP` 的 button=40）
-    · `head` / `chest` / `legs` / `feet` —— 护甲格（shift 点，**原版自己会路由**，
-      不用我们算该放哪一格 —— 这也是为什么装备全靠一个 QUICK_MOVE 就够）
+    · `head` / `chest` / `legs` / `feet` —— 护甲格（shift 点，**原版自己会路由**）
+    · **`hotbar0` ~ `hotbar8`** —— 放进快捷栏**指定那一格**（跟那格现有的东西对调）
+    · **`backpack`** —— 从快捷栏**收进背包**（找个空格放下）
+
+    后两个是 2026-10-10 加的：她快捷栏 9 格被杂物占满、武器躺在背包里，
+    没有"来回搬"的能力就谈不上换武器（见 `main/docs/13-战斗与物品.md` §2）。
     """
-    if where not in WEAR_PLACES:
-        return f"不认得「{where}」这个位置（只认 {' / '.join(WEAR_PLACES)}）"
+    w = str(where or "hand").strip().lower()
+
+    # ---- 快捷栏指定格 / 收进背包：先在这儿分出去，它们不走 hot_base 那套 ----
+    if w.startswith("hotbar"):
+        try:
+            idx = int(w[6:])
+        except ValueError:
+            return f"「{where}」看不懂 —— 快捷栏要写成 hotbar0 ~ hotbar8。"
+        if not 0 <= idx <= 8:
+            return f"快捷栏只有 0~8（给的是 {idx}）。"
+        layout = await io.layout()
+        if layout is None:
+            return "读不到界面布局（客户端没上报界面信息？）"
+        slot = await io.slot_of(item_id, layout)
+        if slot is None:
+            return f"身上没有 {item_id}"
+        if slot == int(layout["hot_base"]) + idx:
+            await io.send(f"mcb hotbar {idx}")     # 已经在那儿了，顺手选中
+            return None
+        # SWAP 的 button 就是**目标快捷栏格号**
+        await io.click(slot, idx, MODE_SWAP)
+        return None
+
+    if w in ("backpack", "bag", "main", "stow", "inventory"):
+        layout = await io.layout()
+        if layout is None:
+            return "读不到界面布局（客户端没上报界面信息？）"
+        slot = await io.slot_of(item_id, layout)
+        if slot is None:
+            return f"身上没有 {item_id}"
+        inv_base, hot_base = int(layout["inv_base"]), int(layout["hot_base"])
+        if inv_base <= slot < hot_base:
+            return None                            # 已经在背包里了
+        if slot >= hot_base + 9:
+            return None                            # 那是副手，别乱动
+        dest = await find_empty_main_slot(io, layout)
+        if dest is None:
+            return "背包满了，腾不出空格放它 —— 先丢掉/用掉点什么。"
+        # ⚠️ 这里用"拿起→放下"两步（不是 SWAP）—— SWAP 的 button 只能填快捷栏格号，
+        #    对"背包里的任意空格"没法表达。放下前已确认目标格是空的，不会变成交换。
+        await io.click(slot, BTN_LEFT, MODE_PICKUP)
+        await io.click(dest, BTN_LEFT, MODE_PICKUP)
+        return None
+
+    if w not in WEAR_PLACES:
+        return (f"不认得「{where}」这个位置（只认 {' / '.join(WEAR_PLACES)}"
+                " / hotbar0~hotbar8 / backpack）")
 
     # ① 快捷栏 —— **这条路不需要界面布局**，最省事也最可靠。
     #    （踩过：一上来就要求布局，快捷栏里的东西反而拿不到。）
@@ -282,7 +333,7 @@ async def wear(io: ContainerIO, item_id: str, where: str = "hand") -> str | None
         if _rid(it) == item_id:
             hot_index = i
             break
-    if where == "hand" and hot_index is not None:
+    if w == "hand" and hot_index is not None:
         await io.send(f"mcb hotbar {hot_index}")
         return None
 
@@ -300,7 +351,7 @@ async def wear(io: ContainerIO, item_id: str, where: str = "hand") -> str | None
         else:
             return f"身上没有 {item_id}"
 
-    if where == "hand":
+    if w == "hand":
         hot_base = int(layout["hot_base"])
         if hot_base <= slot < hot_base + 9:
             # 已经在快捷栏里 —— 选中就行
@@ -314,7 +365,7 @@ async def wear(io: ContainerIO, item_id: str, where: str = "hand") -> str | None
         await io.send("mcb hotbar 0")
         return None
 
-    if where == "off":
+    if w == "off":
         if slot == _offhand_slot(layout):
             return None          # 已经在副手了，别自己和自己对调
         await io.click(slot, SWAP_OFFHAND, MODE_SWAP)
@@ -322,6 +373,31 @@ async def wear(io: ContainerIO, item_id: str, where: str = "hand") -> str | None
 
     # 护甲：shift 点 —— 原版 `moveItemStackTo` 会自己塞进对应的护甲格
     await io.click(slot, BTN_LEFT, MODE_QUICK_MOVE)
+    return None
+
+
+async def find_empty_main_slot(io: ContainerIO, layout: dict) -> int | None:
+    """找一个**空着的背包格**（返回菜单格号；找不到返回 None）。
+
+    ⚠️ **空槽位不上报** —— `mcb inventory` 只列有东西的格子，
+    所以只能**反推**：背包区间 `[inv_base, hot_base)` 减去已经被占的那些。
+
+    ⚠️ 这里用的是**服务端真值**（`mcb inventory`），不是界面快照 ——
+    界面快照对默认背包界面只报 0~4 格，看不到背包里哪些是空的。
+    """
+    data = await io.inventory()
+    inv_base, hot_base = int(layout["inv_base"]), int(layout["hot_base"])
+    occupied = set()
+    for it in (data.get("main") or []):
+        if not isinstance(it, dict) or not it.get("id"):
+            continue
+        raw = it.get("slot")
+        if isinstance(raw, (int, float)):
+            # 服务端报的是**玩家背包格号**（9~35），换算成菜单格号
+            occupied.add(inv_base + max(0, int(raw) - 9))
+    for s in range(inv_base, hot_base):
+        if s not in occupied:
+            return s
     return None
 
 
@@ -334,12 +410,6 @@ def _offhand_slot(layout: dict) -> int:
     **所以不用给每种容器各加一个字段** —— 加反而是找麻烦。
     """
     return int(layout["hot_base"]) + 9
-
-
-def _rid(item: dict) -> str:
-    """取注册名。**绝不回退到显示名** —— 那会跟语言走，匹配必然错（docs/04 坑 10o）。"""
-    return str(item.get("id") or "")
-
 
 # ---- 「前置条件」原语 ------------------------------------------------------
 #

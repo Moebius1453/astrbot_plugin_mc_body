@@ -144,5 +144,53 @@
     "description": "状态日志最多攒多少条",
     "hint": "白「记得自己刚才干了什么」的那本账。**只存内存** —— 插件重载就清空。攒太多会占上下文 token，400 条够用。",
     "default": 400
+  },
+  "places_file": {
+    "type": "string",
+    "description": "地点簿存哪（留空用默认）",
+    "hint": "白「哪儿是什么」的记忆。**这个写磁盘** —— 跟状态日志不一样，地图丢了代价太大。留空 = 插件目录下的 data/places.json。",
+    "default": ""
+  },
+  "enable_body_state": {
+    "type": "bool",
+    "description": "让她感知到自己的身体和处境",
+    "hint": "开启后，每 N 次对话会给白附一份**状态数据包**（坐标/血量/饥饿/正在做什么/最近发生了什么/她记过的地方）。⚠️ 是**纯数据**、不是程序写好的句子 —— 怎么讲由她自己决定。关掉她也不会瞎，只是得自己调 mc_state 去看。",
+    "default": true
+  },
+  "body_state_every": {
+    "type": "int",
+    "description": "每几次对话附一次状态包",
+    "hint": "默认 3。**第一次对话一定会附**（她一上来就该知道自己站在哪）。调小=她更清楚但更烧 token；调大=更省但可能反应迟钝。",
+    "default": 3
+  },
+  "enable_sight": {
+    "type": "bool",
+    "description": "给她眼睛（截图 + 识图）",
+    "hint": "开启后白可以用 mc_look 看一眼周围。⚠️ 图片**不会**进她的大脑 —— 走的是「截图→识图 API→文字→上下文」。慢几秒，画面只有 640×360。",
+    "default": true
+  },
+  "vision_provider_id": {
+    "type": "string",
+    "description": "用哪个识图模型（留空=自动挑）",
+    "hint": "填 AstrBot 里某个 provider 的 id。**留空** = 自动挑一个名字里带 vl/vision/gemini 的（你配了 Qwen3-VL 和 deepseek-vision，够用）。",
+    "default": ""
+  },
+  "client_ssh_host": {
+    "type": "string",
+    "description": "游戏客户端在哪台机器上（ssh 目标）",
+    "hint": "格式 user@host，例如 moebius@10.107.230.205。**要配免密 ssh**（这台机器上能直接 ssh 过去）。留空 = mc_look 直接报错。",
+    "default": ""
+  },
+  "client_container": {
+    "type": "string",
+    "description": "跑游戏客户端的容器名",
+    "hint": "截图是在这个容器里截的。默认 mc-brain。",
+    "default": "mc-brain"
+  },
+  "client_sudo_password": {
+    "type": "string",
+    "description": "那台机器上 docker 的 sudo 密码",
+    "hint": "⚠️ docker 需要 sudo。密码**走 stdin 不走命令行**（命令行会被 ps 看见）。留空 = 假设免密 sudo。",
+    "default": ""
   }
 }

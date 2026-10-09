@@ -22,6 +22,7 @@ import asyncio
 import math
 import re
 import time
+from pathlib import Path
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
@@ -32,7 +33,9 @@ from .mcb import containers as mcb_containers
 from .mcb.containers import ContainerIO
 from .mcb.craft import CraftRunner, Crafter
 from .mcb.journal import Journal
+from .mcb.places import PlaceBook
 from .mcb.reflex import ReflexGuard
+from .mcb.sight import Sight
 from .mcb.smelt import Smelter
 from .mcb.tasks import TaskRunner
 from .mcb.uplink import ChatUplink
@@ -76,6 +79,24 @@ class McBodyPlugin(Star):
         # ⚠️ **存内存**（用户 2026-10-09 拍板）：插件热重载会丢，任务本身也一样。
         self.journal = Journal(capacity=int(self._cfg("journal_capacity", 400)))
 
+        # 地点簿 —— 「哪儿有什么、我在那儿干过什么」（见 mcb/places.py）。
+        # ⚠️ **这个写磁盘**：跟日志不一样，地图丢了代价太大。
+        places_path = str(self._cfg("places_file", "") or "").strip()
+        if not places_path:
+            places_path = str(Path(__file__).resolve().parent / "data" / "places.json")
+        self.places = PlaceBook(places_path)
+
+        # 眼睛 —— 截图 → 识图转述成文字（见 mcb/sight.py）。
+        # ⚠️ **图片永远不进白的大脑**：走"截图 → API → 文字 → 上下文"（用户 2026-10-08 定的）。
+        self.sight = Sight(
+            ssh_host=str(self._cfg("client_ssh_host", "")),
+            container=str(self._cfg("client_container", "mc-brain")),
+            sudo_password=str(self._cfg("client_sudo_password", "")),
+            context=context,
+            provider_id=str(self._cfg("vision_provider_id", "")),
+            vision_prompt=str(self._cfg("vision_prompt", "")),
+        )
+
         # 任务层 —— 把多步行为串成一个目标（见 mcb/tasks.py）
         self.io = ContainerIO(self.bridge)
         self.tasks = TaskRunner(self.bridge, self.journal, io=self.io)
@@ -98,13 +119,20 @@ class McBodyPlugin(Star):
         # 通知去重（见 _notify）
         self._last_notify_text = ""
         self._last_notify_at = 0.0
+        # 数她经历了多少次 LLM 请求 —— 用来"每 N 次附一次状态包"（见 inject_body_state）
+        self._llm_calls = 0
 
-    async def _notify(self, text: str) -> None:
-        """把反射事件写到白的会话里（她/用户能看见）。
+    async def _notify(self, facts: str) -> None:
+        """把一个**处境事实**推到白的会话里（她/用户能看见）。
 
-        ⚠️ **只给"需要用户知道、需要用户动手"的事用**（比如"我饿了但身上没吃的"）。
-        **自动反射的状态翻转（进战/脱战/逃跑/卡住）一律只写日志**，不许占聊天正文 ——
-        用户明确要求过（2026-10-09）："这种东西日志里面出现就好了"。
+        ⚠️⚠️ **只传事实，不许传句子**（用户 2026-10-09 拍板）：
+        > "感知我是没法接受程序文本的。"
+        ✅ `food=6/20 food_items=0` ／ ❌ `我饿了，但身上没有食物。`
+        —— 后者是**程序替她写的台词**。她想怎么讲是她的事，程序只负责把状态摆出来。
+
+        ⚠️ 而且**只给"需要用户知道、需要用户动手"的事用**。
+        自动反射的状态翻转（进战/脱战/逃跑/卡住）一律**只写状态日志**，不许占聊天正文 ——
+        用户明确要求过："这种东西日志里面出现就好了"。
         """
         umo = str(self._cfg("white_session", "") or "")
         if not umo:
@@ -112,16 +140,51 @@ class McBodyPlugin(Star):
 
         # 去重保险：同一条消息 60 秒内只发一次。防止任何意料之外的重复刷屏。
         now = time.monotonic()
-        if text == self._last_notify_text and (now - self._last_notify_at) < 60:
-            logger.info(f"[mc_body] 通知去重（60 秒内已发过同样的）：{text}")
+        if facts == self._last_notify_text and (now - self._last_notify_at) < 60:
+            logger.info(f"[mc_body] 通知去重（60 秒内已发过同样的）：{facts}")
             return
-        self._last_notify_text = text
+        self._last_notify_text = facts
         self._last_notify_at = now
 
         from astrbot.core.message.components import Plain
         from astrbot.core.message.message_event_result import MessageChain
 
-        await self.context.send_message(umo, MessageChain([Plain(f"[身体] {text}")]))
+        await self.context.send_message(umo, MessageChain([Plain(f"[body] {facts}")]))
+
+    # ---- 处境感知：每 N 次 LLM 请求附一次状态数据包 ------------------------
+
+    @filter.on_llm_request(priority=100)
+    async def inject_body_state(self, event: AstrMessageEvent, req) -> None:
+        """每 N 次 LLM 请求，把**状态数据包**附在她这条用户消息的末尾。
+
+        用户 2026-10-09 定："状态最少得三到四轮对话主动告诉她一次"，
+        并且**不接受程序文本** —— 所以这里只挂 §`render.state_packet` 那份**纯数据**。
+
+        ⚠️ 挂 `extra_user_content_parts`（用户消息侧）**而不是 system_prompt** ——
+        状态每轮都在变，塞进 system 会把提示词缓存全打掉。
+        （先例：`astrbot_plugin_dafeiyu_pet` 也在 `on_llm_request` 里注身体状态，
+          但它挂的是 system_prompt；我们数据更碎，走用户侧更划算。）
+        """
+        if not self._cfg("enable_body_state", True):
+            return
+        self._llm_calls += 1
+        every = max(1, int(self._cfg("body_state_every", 3)))
+        # 第一次就给 —— 她一开始就该知道自己站在哪、什么状态
+        if self._llm_calls != 1 and self._llm_calls % every != 0:
+            return
+        try:
+            data, err = await self._call("mcb state")
+            if err or not data.get("online"):
+                return
+            packet = render.state_packet(
+                data, self.reflex.stance, self.tasks.status(), self.journal, self.places
+            )
+            from astrbot.core.agent.message import TextPart
+            req.extra_user_content_parts.append(TextPart(text=packet))
+            logger.debug(f"[mc_body] 已附状态包（第 {self._llm_calls} 次请求）")
+        except Exception as exc:  # noqa: BLE001
+            # ⚠️ 附件失败**绝不能影响她这一轮对话** —— 感知是锦上添花，不是命脉
+            logger.warning(f"[mc_body] 状态包注入失败（忽略）：{exc}")
 
     # ---- 生命周期 -------------------------------------------------------
 
@@ -290,26 +353,119 @@ class McBodyPlugin(Star):
         return f"已经用 Nanako 的身体在游戏里说了：{clean}"
 
     @filter.llm_tool(name="mc_goto")
-    async def mc_goto(self, event: AstrMessageEvent, x: float, z: float):
-        """走到坐标 (x, z)。**异步** —— 下发后她自己走，过会儿用 mc_state 看坐标确认。
+    async def mc_goto(self, event: AstrMessageEvent, near: str = "", x: float = 0, z: float = 0):
+        """走到一个地方。**异步** —— 下发后她自己走，过会儿用 mc_state 看坐标确认。
+
+        三种给法，**给其一就行**：
+        · `near="工作台"` / `near="minecraft:furnace"` —— **走到那个东西旁边**。
+          先查**地点簿**（你以前记过的名字），查不到再当**方块注册名**在附近扫。
+          **这是最省事的给法 —— 不用知道坐标。**
+        · `x` + `z` —— 走到指定坐标（你看 F3 或者别人告诉你坐标时才用）
+
+        ⚠️ 按方块名找**只在附近 16 格内**（服务端扫描上限）。太远就找不到 ——
+        那就先走近点，或者**把它记进地点簿**（`mc_place`），以后直接 `near="名字"`。
+
+        常找的方块名：`minecraft:crafting_table` 工作台、`minecraft:furnace` 熔炉、
+        `minecraft:chest` 箱子、`minecraft:farmland` 耕地、`simpletomb:grave_cross` 墓碑。
 
         Args:
-            x(number): 目标 X 坐标
-            z(number): 目标 Z 坐标
+            near(string): 地点名（你记过的）或方块注册名，走到最近的那个旁边。
+            x(number): 目标 X 坐标（跟 z 一起用）。
+            z(number): 目标 Z 坐标。
         """
         if (deny := self._guard(event)):
             return deny
+
+        want = str(near or "").strip()
+        if want:
+            # ① 先查**地点簿** —— "家""田"这种名字比方块名好用得多
+            hit = self.places.match(want)
+            if hit is not None:
+                name, place = hit
+                tx, tz = int(float(place["x"])), int(float(place["z"]))
+                _, err = await self._call(f"mcb baritone goto {tx} {tz}")
+                if err:
+                    return f"没能让她出发：{err}"
+                return (f"出发去「{name}」（{tx}, {tz}）"
+                        + (f"，那儿是{place['what']}" if place.get("what") else "")
+                        + "。过会儿用 mc_state 看坐标确认到没到。")
+
+            # ② 不是地点名 → 当方块注册名在附近扫
+            block_id = want if ":" in want else f"minecraft:{want}"
+            pos = await mcb_containers.find_block(self.bridge, block_id)
+            if pos is None:
+                return (
+                    f"附近 16 格内没有「{want}」这种方块，地点簿里也没这个名字。\n"
+                    "要么走近点再试，要么直接给坐标（x/z），"
+                    "要么先过去一趟再用 mc_place 把它记下来。"
+                )
+            tx, tz = int(pos[0]), int(pos[2])
+            _, err = await self._call(f"mcb baritone goto {tx} {tz}")
+            if err:
+                return f"没能让她出发：{err}"
+            return (f"附近找到了 {block_id}（{pos[0]},{pos[1]},{pos[2]}），"
+                    "已让她出发。过会儿用 mc_state 看坐标确认。")
+
         tx, tz = self._clean_coord(x), self._clean_coord(z)
         if tx is None or tz is None:
-            return f"坐标不合法（x={x} z={z}）。要在世界边界 ±{COORD_LIMIT} 以内的数字。"
+            return (
+                "要么给 `near`（地点名或方块名），要么给 `x` 和 `z` 坐标 —— "
+                f"现在给的是 near={near!r} x={x} z={z}。"
+            )
         _, err = await self._call(f"mcb baritone goto {tx} {tz}")
         if err:
             return f"没能让她出发：{err}"
         return (
             f"已让她出发前往 x={tx} z={tz}。**她现在还在路上** —— "
-            "这个工具只能报告「已下发」，不知道她到没到。"
             "过一会儿调 mc_state 看坐标，确认她是不是真的到了。"
         )
+
+    @filter.llm_tool(name="mc_place")
+    async def mc_place(self, event: AstrMessageEvent, action: str = "list",
+                       name: str = "", what: str = "", note: str = ""):
+        """**地点簿** —— 记住 / 查看 / 忘掉「哪儿是什么」。
+
+        你的扫描只有附近 16 格，出了这个圈你就是瞎的。**把重要的地方记下来**，
+        以后 `mc_goto near="名字"` 就能直接过去，不用任何人报坐标。
+
+        · `action="remember"` —— **把你现在站的地方记下来**（要起个 `name`）。
+          顺手写 `what`（这儿是什么），以后翻到能看懂。
+        · `action="list"` —— 看看记过哪些地方
+        · `action="forget"` —— 忘掉一个（给 `name`）
+
+        **该记的时候**：造了个据点、发现一块田、放了箱子、找到矿洞入口、
+        墓碑在哪… **走过的路会忘，记下来才不会忘。**
+
+        Args:
+            action(string): "remember"（记下当前位置）/ "list"（列出来）/ "forget"（忘掉）。
+            name(string): 地点名，起个你自己记得住的（"家"、"麦田"、"矿洞口"）。
+            what(string): 这儿是什么（比名字多说一点）。
+            note(string): 备注（可选）。
+        """
+        if (deny := self._guard(event)):
+            return deny
+        act = str(action or "list").strip().lower()
+
+        if act in ("", "list", "ls", "all", "show"):
+            return "地点簿：\n" + self.places.render()
+
+        if act in ("forget", "delete", "del", "rm", "drop"):
+            return self.places.forget(name)
+
+        if act in ("remember", "save", "mark", "add", "note"):
+            data, err = await self._call("mcb state")
+            if err:
+                return f"读不到坐标，记不了：{err}"
+            if not data.get("online"):
+                return "她不在线，拿不到坐标。"
+            got = self.places.remember(
+                name, data.get("x") or 0, data.get("y") or 0, data.get("z") or 0,
+                dim=str(data.get("dim") or ""), what=what, note=note,
+            )
+            self.journal.add("body", f"记了个地方：{got}")
+            return got
+
+        return f"不认得 action={action!r}。只认 remember / list / forget。"
 
     @filter.llm_tool(name="mc_follow")
     async def mc_follow(self, event: AstrMessageEvent, player: str):
@@ -407,18 +563,21 @@ class McBodyPlugin(Star):
 
     @filter.llm_tool(name="mc_equip")
     async def mc_equip(self, event: AstrMessageEvent, item: str, where: str = "hand"):
-        """把身上某物品**装到该去的地方** —— 给物品名就行，不用先查它在第几格。
+        """把身上某物品**挪到指定位置** —— 给物品名就行，不用先查它在第几格。
 
         where 可选：
         · `hand`（默认）—— 拿到手上。放方块、吃东西、用工具都用它
         · `off` —— 副手。举盾、放火把当光源
         · `head` / `chest` / `legs` / `feet` —— 穿护甲
+        · **`hotbar0` ~ `hotbar8`** —— 放进快捷栏**某一格**（跟那格现有的对调）
+        · **`backpack`** —— 从快捷栏**收进背包**（自动找空格）
 
         ⚠️ 物品名要用**注册名**不是中文名：`minecraft:iron_helmet` ✅ / `"铁头盔"` ❌。
 
         Args:
             item(string): 物品的注册名，例如 "minecraft:iron_helmet"、"minecraft:shield"。
-            where(string): "hand"（手上，默认）/ "off"（副手）/ "head" / "chest" / "legs" / "feet"。
+            where(string): "hand"（默认）/ "off" / "head" / "chest" / "legs" / "feet"
+                / "hotbar0"~"hotbar8" / "backpack"。
         """
         if (deny := self._guard(event)):
             return deny
@@ -733,6 +892,33 @@ class McBodyPlugin(Star):
         if len(self.journal) == 0:
             return "日志是空的 —— 要么刚重启过，要么真的什么都还没发生。"
         return f"最近 {min(n, len(self.journal))} 条：\n{self.journal.render(n)}"
+
+    @filter.llm_tool(name="mc_look")
+    async def mc_look(self, event: AstrMessageEvent, question: str = ""):
+        """**看一眼你周围** —— 截下你游戏画面，转述成文字告诉你。
+
+        你平时只能"读数据"，看不见画面。这个工具给你**眼睛**。
+
+        什么时候用：
+        · 想知道"我面前是什么""这儿长什么样""那个方块是什么"
+        · 数据说不清的时候（`mc_state` 只有坐标，看不见风景）
+        · 想确认某件事成没成（东西放对地方了吗）
+
+        ⚠️ 三件事你得知道：
+        1. **慢** —— 截图 + 传 + 识图，好几秒到十几秒
+        2. **糊** —— 你的画面只有 640×360，看清轮廓和颜色，认不清小字
+        3. **只照到你正对着的** —— 第一人称视角，背后的看不见。
+           想换个角度就先走过去或者转头，再调一次
+
+        Args:
+            question(string): 你想知道什么（可选），比如"我面前是什么方块""田里熟了没"。
+                不填就是"描述一下你看到的东西"。
+        """
+        if (deny := self._guard(event)):
+            return deny
+        if not self._cfg("enable_sight", True):
+            return "看东西的功能被管理员关掉了。"
+        return await self.sight.look(str(question or ""))
 
     # ---- 调试入口 -------------------------------------------------------
 

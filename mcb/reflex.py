@@ -313,12 +313,20 @@ class ReflexGuard:
         await self._maybe_eat(data)
 
     async def _maybe_eat(self, data: dict) -> None:
-        """饿了就自己吃。判据抄女仆：**看 FoodProperties，不看白名单**（mod 食物自动兼容）。
+        """自己吃东西。**两个触发条件**（用户 2026-10-10 拍板）：
+
+          · **饿了**（`food < hunger_low`）—— 防饿死
+          · **快死了**（`hp <= hp_low`）—— **受伤回血靠的是饱食度，不是"饿不饿"**
+
+        ⚠️⚠️ **2026-10-10 踩到的大坑**：原来只有"饿了才吃"这一条，
+        而她饥饿度**恰好卡在 16**（`food < 16` 不成立），于是
+        **血 4.67 一直不回、也一直不吃**，卡死在那。
+        原版自然回血要**饱食度 ≥ 18**，跟"饿不饿"根本是两回事。
 
         抄了女仆这几个细节：
           · 限频（`setMaxCheckRate`）—— 吃完隔几 tick 再看，别每 tick 翻背包
-          · 优先用手上/快捷栏里最顶饱的
           · **记住原来手上拿的是什么，吃完换回来**（`memoryHandItemStack`）
+        **受伤时优先挑饱食度高的**（saturation，回血看它）；只是饿了就挑顶饱的（nutrition）。
 
         ⚠️⚠️ **2026-10-09 血泪教训：绝不能重发 `use`。**
         每发一次，服务端的 `useItemRemaining` 就被**重置回满值**（面包 32），
@@ -334,7 +342,10 @@ class ReflexGuard:
 
         food = data.get("food") or {}
         level = food.get("level")
-        if not isinstance(level, (int, float)) or level >= self.hunger_low:
+        hp = data.get("hp")
+        hungry = isinstance(level, (int, float)) and level < self.hunger_low
+        hurt = isinstance(hp, (int, float)) and hp <= self.hp_low
+        if not hungry and not hurt:
             return
         if self._in_combat:
             return  # 战斗的时候先保命，别停下来啃面包
@@ -348,19 +359,30 @@ class ReflexGuard:
             )
             return
 
-        best = await self._find_food()
+        best = await self._find_food(prefer_saturation=hurt)
         if best is None:
             if not self._no_food_warned:
                 self._no_food_warned = True
-                logger.warning(f"[mc_body] 🍖 饿了（{level:g}）但身上没吃的")
-                await self._notify_safe(f"我饿了（饱食度 {level:g}），但身上没有食物。")
+                why = (f"food={level:g}/20" if isinstance(level, (int, float)) else "food=?")
+                if isinstance(hp, (int, float)):
+                    why += f" hp={hp:g}"
+                logger.warning(f"[mc_body] 🍖 想吃（{why}）但身上没吃的")
+                # ⚠️ **只报事实，不写句子** —— 用户 2026-10-09：
+                #    "感知我是没法接受程序文本的"。怎么讲是她的事。
+                await self._notify_safe(f"{why} food_items=0")
             return
 
-        slot, name, nutrition = best
+        slot, name, score = best
         self._no_food_warned = False
         self._eat_cool = EAT_COOLDOWN_TICKS
-        logger.info(f"[mc_body] 🍖 饿了（{level:g}）→ 吃 {name}（第 {slot} 格，营养 {nutrition}）")
-        self._log(f"饿了（{level:g}），吃了 {name}")
+        why = "受伤" if (hurt and not hungry) else "饿了"
+        logger.info(
+            f"[mc_body] 🍖 {why} → 吃 {name}（第 {slot} 格，"
+            f"饱食度 {score:g}）hp={hp if isinstance(hp, (int, float)) else '?'} "
+            f"food={level if isinstance(level, (int, float)) else '?'}"
+        )
+        # ⚠️ **只报事实**（原始读数），不写"我饿了"这种台词
+        self._log(f"想吃东西（{why}）→ 吃 {name}")
 
         # 换到手上 → 吃。
         # ⚠️ **换回原来那格必须等吃完** —— 立刻换回去等于把吃了一半的东西扔掉。
@@ -384,10 +406,14 @@ class ReflexGuard:
         self._restore_slot = None
         await self._cmd(f"mcb hotbar {slot}")
 
-    async def _find_food(self) -> tuple[int, str, float] | None:
-        """在**快捷栏**里找最顶饱的食物。
+    async def _find_food(self, *, prefer_saturation: bool = False) -> tuple[int, str, float] | None:
+        """在**快捷栏**里找最该吃的那个食物。返回 `(格号, 名字, 分数)`。
 
-        ⚠️ 只能找快捷栏（0-8）—— 背包里的东西要先用 `swap` 挪出来，那一步还没接。
+        ⚠️ 只能找快捷栏（0-8）—— 背包里的东西还挪不出来（见 docs/13 §2）。
+        **这一步正是"物品要能在快捷栏/背包间搬"最直接的动机。**
+
+        `prefer_saturation=True`（受伤时）：按**饱食度**排 —— **原版自然回血看的是它**，
+        不是 nutrition。金苹果 sat=9.6 > 面包 6.0，受伤时该优先吃金苹果。
         """
         try:
             reply = await self.bridge.call("mcb inventory")
@@ -403,11 +429,15 @@ class ReflexGuard:
             fp = item.get("food")
             if not isinstance(fp, dict):
                 continue          # 没有 food 字段 = 不能吃
-            nutrition = fp.get("nutrition")
-            if not isinstance(nutrition, (int, float)):
+            # 受伤时按**饱食度**排（回血看它），平时按 nutrition 排（顶饱）
+            key = "saturation" if prefer_saturation else "nutrition"
+            score = fp.get(key)
+            if not isinstance(score, (int, float)):
+                score = fp.get("nutrition")      # 饱食度缺失时退回营养值
+            if not isinstance(score, (int, float)):
                 continue
-            if best is None or nutrition > best[2]:
-                best = (slot, str(item.get("n") or "?"), float(nutrition))
+            if best is None or score > best[2]:
+                best = (slot, str(item.get("n") or "?"), float(score))
         return best
 
     def _combat_trigger(
