@@ -311,12 +311,10 @@ FIELD_BLOCKS = (
     "minecraft:farmland",
 )
 
-# 收工判据：连续几次轮询都是"没在走"就算干完。
-# ⚠️ 只能这么判 —— 客户端上报里**没有"当前跑的是哪个 Baritone 进程"**，
-#    只有 `status`（moving / idle / following-idle）。所以用"安静一会儿"当信号。
+# ⚠️ **没有"收工判据"这个东西** —— 收作物是破坏方块，期间 `isPathing()` 常常为 false，
+#    拿"没在走"当收工信号会**刚开干就收工**（踩过）。所以只能按时间跑。
 FARM_POLL = 5.0
-FARM_IDLE_STREAK = 3          # 3 × 5 秒 = 15 秒没动就收工
-FARM_DEFAULT_MINUTES = 3.0    # 总时长兜底
+FARM_DEFAULT_MINUTES = 3.0    # 默认跑多久
 
 
 async def _step_find_field(ctx: TaskContext) -> str | None:
@@ -364,28 +362,30 @@ async def _step_check_farm_tools(ctx: TaskContext) -> str | None:
 
 
 async def _step_run_farm(ctx: TaskContext) -> str | None:
-    """开干 + 等收工 + 报收成。"""
+    """开干 + **跑满时间** + 报收成。
+
+    ⚠️⚠️ **不能靠"Baritone 没在走"判收工**（2026-10-09 踩到）：
+    收作物靠**破坏方块**，那期间 `isPathing()` 常常是 false ——
+    第一版用"安静 15 秒"当收工信号，结果**刚开干 15 秒就收工了**。
+
+    **只好按时间跑。** 想知道"真的干完没"，得让客户端上报
+    **当前跑的是哪个 Baritone 进程**（`getCurrentProcess()`）——
+    那要改客户端脚本 + 重启客户端，先记在 docs/12。
+    """
     minutes = float(ctx.params.get("minutes") or FARM_DEFAULT_MINUTES)
+    limit = max(30.0, minutes * 60)
     before = await _inventory_counts(ctx)
 
     await ctx.call("mcb baritone farm")
-    ctx.note(f"开始 farm（最多 {minutes:g} 分钟）")
+    ctx.note(f"开始 farm（跑满 {limit / 60:g} 分钟）")
 
-    idle_streak = 0
     waited = 0.0
-    limit = max(30.0, minutes * 60)
     while waited < limit:
         await ctx.checkpoint()
         await asyncio.sleep(FARM_POLL)
         waited += FARM_POLL
-        task = (await ctx.state()).get("task") or {}
-        if task.get("status") == "moving":
-            idle_streak = 0
-        else:
-            idle_streak += 1
-            if idle_streak >= FARM_IDLE_STREAK:
-                ctx.note(f"Baritone 安静 {FARM_IDLE_STREAK * FARM_POLL:g} 秒，当作干完了")
-                break
+        if int(waited) % 60 == 0:
+            ctx.note(f"farm 进行中 {int(waited)}s/{int(limit)}s")
 
     await ctx.call("mcb stop")
     await asyncio.sleep(0.5)
@@ -398,7 +398,7 @@ async def _step_run_farm(ctx: TaskContext) -> str | None:
     if lost:
         ctx.note("用掉/种下：" + "、".join(f"{k.split(':')[-1]}×{v}" for k, v in lost.items()))
     if not gained and not lost:
-        ctx.note("背包没变化 —— 附近可能本来就没成熟的作物")
+        ctx.note("背包没变化 —— 这块地可能没熟，或者本来就没种东西")
     return None
 
 
@@ -417,9 +417,14 @@ async def _inventory_counts(ctx: TaskContext) -> dict[str, int]:
 
 
 def _diff_counts(before: dict[str, int], after: dict[str, int]) -> tuple[dict, dict]:
-    """比对前后背包。返回 `(多了什么, 少了什么)` —— 这就是"收成"的实据。"""
+    """比对前后背包。返回 `(多了什么, 少了什么)` —— 这就是"收成"的实据。
+
+    ⚠️ `lost` 那边**必须用 `v` 减去 `after`**。第一版写成了
+    `before.get(k,0) - v`（也就是自己减自己），**恒等于 0** ——
+    日志里就会看到「用掉 wheat_seeds×0」这种见了鬼的行。
+    """
     gained = {k: v - before.get(k, 0) for k, v in after.items() if v > before.get(k, 0)}
-    lost = {k: before.get(k, 0) - v for k, v in before.items() if before.get(k, 0) > after.get(k, 0)}
+    lost = {k: v - after.get(k, 0) for k, v in before.items() if v > after.get(k, 0)}
     return gained, lost
 
 
