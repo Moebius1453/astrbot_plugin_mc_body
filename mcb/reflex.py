@@ -85,6 +85,17 @@ EAT_RESTORE_DELAY_TICKS = 2
 # 反射循环的任务名 —— 用来识别并掐掉重载留下的孤儿循环（见 `start()`）
 _TASK_NAME = "mc_body_reflex"
 
+# ---- 脱战（主动撤）---------------------------------------------------------
+#
+# 用户 2026-10-09："战斗还应该有一个**主动脱战**，或者说干脆就是脱战往安全地方
+# 或者我方向跑。"
+#
+# 两个方向：
+#   safe  —— 背离最近的怪跑一段（原来的行为）
+#   owner —— **朝主人跑**（"跟着我"本来就是要的效果，人多的地方也通常更安全）
+RETREAT_SAFE = "safe"
+RETREAT_OWNER = "owner"
+
 
 class ReflexGuard:
     """挨打就停 / 继续挨打就跑 / 卡住就停。"""
@@ -100,6 +111,8 @@ class ReflexGuard:
         scan_range: int = 24,
         hunger_low: float = HUNGER_LOW,
         stance: str = STANCE_DEFEND,
+        owner_name: str = "",
+        flee_toward: str = RETREAT_SAFE,
         notify=None,
     ) -> None:
         self.bridge = bridge
@@ -109,6 +122,8 @@ class ReflexGuard:
         self.flee_distance = max(8, int(flee_distance))
         self.scan_range = max(6, int(scan_range))
         self.hunger_low = float(hunger_low)
+        self.owner_name = str(owner_name or "").strip()
+        self.flee_toward = flee_toward if flee_toward in (RETREAT_SAFE, RETREAT_OWNER) else RETREAT_SAFE
         self._notify = notify  # 可选：async callable(str)
 
         self._task: asyncio.Task | None = None
@@ -405,10 +420,10 @@ class ReflexGuard:
         `chase=True`（hunt 姿态）：够不着就走过去（抄女仆的
         `SetWalkTargetFromAttackTargetIfTargetOutOfReach`）。
         """
-        # 濒死优先逃
+        # 濒死优先撤（**自动**脱战，选的方向由配置定）
         if hp is not None and hp <= self.hp_critical:
             if not self._fleeing:
-                await self._flee(data, nearest)
+                await self._retreat(data, nearest, self.flee_toward)
             return
         self._fleeing = False
 
@@ -462,17 +477,65 @@ class ReflexGuard:
 
     # ---- 反射动作 -------------------------------------------------------
 
-    async def _flee(self, data: dict, nearest: dict | None = None) -> None:
-        """朝**最近的怪的反方向**跑。没有再退回"刚才来的反方向"。"""
+    async def retreat(self, toward: str = RETREAT_SAFE) -> str:
+        """**主动脱战** —— 立刻停止战斗，往安全方向 / 主人方向撤。
+
+        和"濒死才跑"不同：这个是**主动**的，血量好好的也能用 ——
+        打不过、不想打、或者白自己判断该走了，都可以调它。
+
+        返回一句人话（给工具层直接回给白）。
+        """
+        t = str(toward or "").strip().lower() or RETREAT_SAFE
+        if t not in (RETREAT_SAFE, RETREAT_OWNER):
+            raise ValueError(
+                f"未知的撤离方向：{toward!r}（只认 {RETREAT_SAFE} / {RETREAT_OWNER}）"
+            )
+
+        # 退出战斗态 —— 否则下一次 tick 又会把她拉回去打
+        self._in_combat = False
+        self._no_threat_ticks = 0
+        self._fleeing = False
+        self._approach_wait = 0
+
+        data = await self._state()
+        if not data.get("online"):
+            return "她不在线，撤不了。"
+        hostiles = await self._hostiles()
+        return await self._retreat(data, hostiles[0] if hostiles else None, t)
+
+    async def _retreat(self, data: dict, nearest: dict | None, toward: str) -> str:
+        """真正下撤离指令。返回一句人话。"""
+        # 优先：往主人那边跑（人多的地方通常更安全，而且"跟着我"本来就是用户要的）
+        if toward == RETREAT_OWNER:
+            owner = await self._where(self.owner_name)
+            if owner is not None and owner.get("dim") == data.get("dim"):
+                try:
+                    tx, tz = int(owner["x"]), int(owner["z"])
+                except (KeyError, TypeError, ValueError):
+                    tx = tz = None
+                if tx is not None:
+                    # ⚠️ 用 **follow** 而不是 goto —— 主人在动，goto 是快照，追不上。
+                    #    follow 跟到几格以内就停，正好是"会合"的语义。
+                    logger.warning(
+                        f"[mc_body] 🏃 脱战 —— 撤向主人 {self.owner_name}"
+                        f"（follow，他当前在 {tx},{tz}）"
+                    )
+                    await self._cmd(f"mcb baritone follow player {self.owner_name}")
+                    return "正往你那边跑（会一直跟到你身边）"
+            logger.warning(
+                f"[mc_body] 🏃 脱战时找不到 {self.owner_name}（不在线/不在同维度），"
+                "改往安全方向跑"
+            )
+
+        # 安全方向：背离最近的怪
         self._fleeing = True
         try:
             x = float(data.get("x"))
             z = float(data.get("z"))
         except (TypeError, ValueError):
-            return
+            return "读不到坐标，撤不了。"
 
         dx, dz = None, None
-        # 首选：直接背离最近的怪
         if nearest is not None and isinstance(nearest.get("pos"), list) and len(nearest["pos"]) >= 3:
             try:
                 hx, hz = float(nearest["pos"][0]), float(nearest["pos"][2])
@@ -498,10 +561,34 @@ class ReflexGuard:
 
         who = f"躲开 {nearest['name']}" if nearest else "背离来时方向"
         logger.warning(
-            f"[mc_body] ⚠ 血量危急 —— {who}，跑 {self.flee_distance} 格到 ({tx},{tz})"
+            f"[mc_body] 🏃 脱战 —— {who}，跑 {self.flee_distance} 格到 ({tx},{tz})"
         )
         await self._cmd(f"mcb baritone goto {tx} {tz}")
         # ⚠️ 只写日志，**不发 QQ** —— 自动反射的状态变化不该占用户的聊天正文
+        return f"往安全方向跑（x={tx} z={tz}）"
+
+    async def _state(self) -> dict:
+        """读一次服务端状态。失败回空 dict（调用方按 online 判）。"""
+        try:
+            reply = await self.bridge.call("mcb state")
+        except Exception:
+            return {}
+        if not reply.get("ok"):
+            return {}
+        return reply.get("data") or {}
+
+    async def _where(self, name: str) -> dict | None:
+        """查**任意**玩家的位置（服务端真值）。不在线返回 None。"""
+        if not name:
+            return None
+        try:
+            reply = await self.bridge.call(f"mcb where {name}")
+        except Exception:
+            return None
+        if not reply.get("ok"):
+            return None
+        data = reply.get("data") or {}
+        return data if data.get("online") else None
 
     async def _check_stuck(self, data: dict) -> None:
         """在寻路但坐标长时间不动 = 卡住了。"""

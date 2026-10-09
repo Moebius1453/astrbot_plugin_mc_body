@@ -1,1 +1,5 @@
-aio-mc-rcon>=3.2.0
+# 无第三方依赖。
+#
+# RCON 协议我们自己在 mc_rcon.py 里实现 —— 原先用的 aio-mc-rcon 有个会串包的
+# bug（它只读一个包，而 Minecraft 会把超过 4096 字节的响应拆成多个包），
+# 详见 mc_rcon.py 开头的说明。

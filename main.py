@@ -26,9 +26,11 @@ from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
 
-from .mc_rcon import BridgeError, RconBridge
-from .mc_reflex import ReflexGuard
-from .mc_uplink import ChatUplink
+from .mcb.rcon import BridgeError, RconBridge
+from .mcb.craft import CraftRunner, Crafter
+from .mcb.reflex import ReflexGuard
+from .mcb.uplink import ChatUplink
+from .mcb import render
 
 PLUGIN_NAME = "mc_body"
 
@@ -66,12 +68,14 @@ class McBodyPlugin(Star):
         )
         self.reflex = ReflexGuard(
             self.bridge,
-            interval=float(self._cfg("reflex_interval_seconds", 2)),
+            interval=float(self._cfg("reflex_interval_seconds", 1)),
             hp_low=float(self._cfg("hp_low", 12)),
             hp_critical=float(self._cfg("hp_critical", 6)),
             flee_distance=int(self._cfg("flee_distance", 32)),
             scan_range=int(self._cfg("reflex_scan_range", 24)),
             stance=str(self._cfg("default_stance", "defend")),
+            owner_name=str(self._cfg("owner_player_name", "")),
+            flee_toward=str(self._cfg("retreat_toward", "safe")),
             notify=self._notify,
         )
         # 通知去重（见 _notify）
@@ -173,6 +177,15 @@ class McBodyPlugin(Star):
             return f"你没有调用 Minecraft 工具的权限（你的 ID：{sender}）。"
         return None
 
+    def _guard(self, event: AstrMessageEvent) -> str | None:
+        """工具的统一前置检查。返回拒绝理由；None = 放行。
+
+        ⚠️ **每个工具都必须走这里**，别自己抄一遍授权逻辑 ——
+        曾经 18 个工具抄了 18 遍，改一个公共行为要动 18 处。
+        要加"逐工具开关"之类的公共检查，只改这一个地方。
+        """
+        return self._authorize(event)
+
     # ---- 与桥对话 -------------------------------------------------------
 
     async def _call(self, command: str) -> tuple[dict | None, str | None]:
@@ -232,13 +245,12 @@ class McBodyPlugin(Star):
         如果返回"不在线"，说明 Nanako 的角色没连进服务器，任何动作都做不了。
         动作类工具（走路、跟随）下发之后，**必须**隔一会儿用它来确认结果。
         """
-        denied = self._authorize(event)
-        if denied:
-            return denied
+        if (deny := self._guard(event)):
+            return deny
         data, err = await self._call("mcb state")
         if err:
             return f"查不到 Nanako 的状态：{err}"
-        return self._describe_state(data)
+        return render.describe_state(data, self.reflex.stance)
 
     @filter.llm_tool(name="mc_say")
     async def mc_say(self, event: AstrMessageEvent, text: str):
@@ -250,9 +262,8 @@ class McBodyPlugin(Star):
         Args:
             text(string): 要说的话。会发到游戏公屏，所有人都看得见。
         """
-        denied = self._authorize(event)
-        if denied:
-            return denied
+        if (deny := self._guard(event)):
+            return deny
         clean = self._clean_text(text, MAX_SAY_LEN)
         if clean is None:
             return "要说的话是空的，或者只包含换行 —— 没发出去。"
@@ -272,9 +283,8 @@ class McBodyPlugin(Star):
             x(number): 目标 X 坐标
             z(number): 目标 Z 坐标
         """
-        denied = self._authorize(event)
-        if denied:
-            return denied
+        if (deny := self._guard(event)):
+            return deny
         tx, tz = self._clean_coord(x), self._clean_coord(z)
         if tx is None or tz is None:
             return f"坐标不合法（x={x} z={z}）。要在世界边界 ±{COORD_LIMIT} 以内的数字。"
@@ -299,9 +309,8 @@ class McBodyPlugin(Star):
         Args:
             player(string): 要跟随的玩家名（游戏 ID，只允许字母数字下划线）。
         """
-        denied = self._authorize(event)
-        if denied:
-            return denied
+        if (deny := self._guard(event)):
+            return deny
         name = self._clean_player(player)
         if name is None:
             return f"玩家名不合法：{player!r}。只允许 1-16 位字母、数字、下划线。"
@@ -320,9 +329,8 @@ class McBodyPlugin(Star):
         当你想让她别动了、或者发现她卡住/走错方向时用这个。
         这是最安全的"急停"。
         """
-        denied = self._authorize(event)
-        if denied:
-            return denied
+        if (deny := self._guard(event)):
+            return deny
         _, err = await self._call("mcb stop")
         # 顺手松开"使用键" —— 万一吃东西时出了岔子，按键卡住会让她一直重复动作
         await self._call("mcb release")
@@ -341,9 +349,8 @@ class McBodyPlugin(Star):
         Args:
             command(string): Baritone 命令本体，**不带 `#` 前缀**。
         """
-        denied = self._authorize(event)
-        if denied:
-            return denied
+        if (deny := self._guard(event)):
+            return deny
         clean = self._clean_text(command, MAX_RAW_LEN)
         if clean is None:
             return "命令是空的。"
@@ -364,13 +371,12 @@ class McBodyPlugin(Star):
         想拿东西、想吃东西、想合成之前，**先调这个**看看自己有什么。
         返回快捷栏 0-8 格、背包其余格子、副手，以及当前选中的快捷栏槽位。
         """
-        denied = self._authorize(event)
-        if denied:
-            return denied
+        if (deny := self._guard(event)):
+            return deny
         data, err = await self._call("mcb inventory")
         if err:
             return f"读不到背包：{err}"
-        return self._describe_inventory(data)
+        return render.describe_inventory(data)
 
     @filter.llm_tool(name="mc_hold")
     async def mc_hold(self, event: AstrMessageEvent, slot: int):
@@ -383,9 +389,8 @@ class McBodyPlugin(Star):
         Args:
             slot(number): 快捷栏槽位，0 是最左边，8 是最右边。
         """
-        denied = self._authorize(event)
-        if denied:
-            return denied
+        if (deny := self._guard(event)):
+            return deny
         try:
             n = int(slot)
         except (TypeError, ValueError):
@@ -407,51 +412,122 @@ class McBodyPlugin(Star):
         ⚠️ 这是"对着空气用"（比如吃东西）。要对着某个方块用（开箱子、放置到地上），
         用 `mc_use_on`。
         """
-        denied = self._authorize(event)
-        if denied:
-            return denied
+        if (deny := self._guard(event)):
+            return deny
         _, err = await self._call("mcb use")
         if err:
             return f"使用失败：{err}"
         return "已经用了一次手上的东西。过一会儿用 mc_inventory 或 mc_state 看效果。"
 
     @filter.llm_tool(name="mc_use_on")
-    async def mc_use_on(self, event: AstrMessageEvent, x: float, y: float, z: float):
+    async def mc_use_on(
+        self, event: AstrMessageEvent, x: float, y: float, z: float, keep_open: bool = False
+    ):
         """对着指定坐标的**方块**右键：放置方块、按按钮拉杆、开箱子/工作台。
 
-        会先转头看向那个坐标，再右键，**然后自动关掉弹出的界面**。
+        会先转头看向那个坐标，再右键。
 
         ⚠️ **距离限制约 4.5 格** —— 够不着就是够不着。先用 `mc_goto` 走到附近再调这个。
 
-        ⚠️ 现在**还不能操作箱子/工作台界面里的东西**（没有点击格子的能力），
-        所以打开容器暂时拿不到里面的物品。这个工具目前真正的用途是：
-        **放置方块**、按按钮/拉杆、以及"证明交互这条路是通的"。
+        默认会**自动关掉弹出的界面**（界面开着的时候她动不了，这是安全兜底）。
+        但如果你想**操作界面里的东西**（从箱子里拿东西、在工作台合成），
+        就把 `keep_open` 设成 true，然后配合 `mc_menu`（看界面里有什么）和
+        `mc_click`（点格子）用。
 
         Args:
             x(number): 目标方块的 X 坐标
             y(number): 目标方块的 Y 坐标
             z(number): 目标方块的 Z 坐标
+            keep_open(bool): true = 打开后**不关界面**，留着给 mc_menu / mc_click 用。
         """
-        denied = self._authorize(event)
-        if denied:
-            return denied
+        if (deny := self._guard(event)):
+            return deny
         coords = self._clean_coords3(x, y, z)
         if coords is None:
             return f"坐标不合法：({x}, {y}, {z})。"
         tx, ty, tz = coords
         # 走 useOnAt（直接给坐标构造命中），不依赖准星射线 —— 实测射线经常 MISS
         _, err = await self._call(f"mcb useOnAt {tx} {ty} {tz}")
-        # 不管成没成，都关一次界面 —— 开着界面她动不了，这是安全兜底
-        await self._call("mcb closeGui")
         if err:
             return (
                 f"对着 ({tx},{ty},{tz}) 右键没成功：{err}。"
                 "最常见的原因是**够不着**（超过约 4.5 格）—— 先用 mc_goto 走到附近。"
             )
+        if keep_open:
+            await asyncio.sleep(0.6)   # 等界面开起来
+            data, merr = await self._call("mcb state")
+            if merr:
+                return f"已对着 ({tx},{ty},{tz}) 右键，但读不到界面：{merr}"
+            return "已对着 ({tx},{ty},{tz}) 右键，界面留着没关。\n" + render.describe_menu(data)
+        # 不操作界面 → 关掉，免得她动不了
+        await self._call("mcb closeGui")
         return (
             f"已对着 ({tx},{ty},{tz}) 右键，并把可能弹出的界面关掉了。"
             "如果要确认放置生效，过一会儿用 mc_inventory 看手上东西少没少。"
         )
+
+    @filter.llm_tool(name="mc_menu")
+    async def mc_menu(self, event: AstrMessageEvent):
+        """看看**当前打开的界面**里有什么（箱子/工作台/背包合成格）。
+
+        用 `mc_use_on` 开容器时记得带 `keep_open=true`。
+        返回界面 id、总格数、以及每一格的**格子号**和里面是什么 ——
+        然后就能用 `mc_click` 点它。
+
+        ⚠️ 格子号是**这一套界面自己的编号**，不是背包格号。原版的约定：
+        · 箱子：0~26 是箱子的 27 格，27~62 是你的背包
+        · 工作台：0 是产物格，1~9 是 3×3 材料格，10 以后是背包
+        · 只开了背包（没开容器）：0 是产物格，1~4 是 2×2 材料格
+
+        如果显示"没开界面"，说明她手上是空的（只剩默认的背包界面）。
+        """
+        if (deny := self._guard(event)):
+            return deny
+        data, err = await self._call("mcb state")
+        if err:
+            return f"读不到界面：{err}"
+        return render.describe_menu(data)
+
+    @filter.llm_tool(name="mc_click")
+    async def mc_click(self, event: AstrMessageEvent, slot: int, mode: int = 1):
+        """点当前界面的**第几号格子**。这是"从箱子里拿东西"和"合成"的核心动作。
+
+        先用 `mc_menu` 看清楚格子号。
+
+        `mode` 的常用值：
+        · **1（默认）= shift 快速移动** —— 箱子格 → 你的背包；或**产物格 → 直接合成**
+        · 0 = 普通左键（拿起 / 放下）
+        · 6 = 双击（把同种东西全收过来）
+
+        ⚠️ 典型用法：
+        · **把箱子里的东西全拿走**：对着箱子的每一格（0~26）调 `mc_click <格子> 1`
+        · **合成**：先用 `mc_click <材料格> 0` 把材料摆进 2×2/3×3，再 `mc_click 0 1` 取产物
+
+        Args:
+            slot(number): 格子号（用 mc_menu 查，不是背包格号）。
+            mode(number): 1=shift 快速移动（默认，最常用）；0=普通左键；6=双击收同种。
+        """
+        if (deny := self._guard(event)):
+            return deny
+        try:
+            n = int(slot)
+        except (TypeError, ValueError):
+            return f"格子号不合法：{slot!r}。"
+        if n < 0:
+            return f"格子号不能是负数（给的是 {n}）。"
+        try:
+            m = int(mode)
+        except (TypeError, ValueError):
+            m = 1
+        if m not in (0, 1, 2, 3, 4, 5, 6):
+            return f"mode 只能是 0~6（给的是 {m}）。"
+        _, err = await self._call(f"mcb clickSlot {n} 0 {m}")
+        if err:
+            return f"点格子失败：{err}"
+        await asyncio.sleep(0.4)
+        data, merr = await self._call("mcb state")
+        after = "" if merr else "\n" + render.describe_menu(data)
+        return f"已点第 {n} 号格（mode={m}）。过一会儿用 mc_inventory / mc_menu 看结果。{after}"
 
     @filter.llm_tool(name="mc_attack")
     async def mc_attack(self, event: AstrMessageEvent):
@@ -461,9 +537,8 @@ class McBodyPlugin(Star):
         想先转向某个目标，可以先调 `mc_use_on` 的同款思路 —— 但目前没有独立的转向工具，
         通常是先走过去（`mc_goto` / `mc_follow`）让目标进视野。
         """
-        denied = self._authorize(event)
-        if denied:
-            return denied
+        if (deny := self._guard(event)):
+            return deny
         _, err = await self._call("mcb attack")
         if err:
             return f"攻击失败：{err}"
@@ -479,13 +554,12 @@ class McBodyPlugin(Star):
         返回按距离排序的实体列表；其中 `hostile` 为真的才是敌对怪，
         `targeting` 为真的表示**它正盯着你**。
         """
-        denied = self._authorize(event)
-        if denied:
-            return denied
+        if (deny := self._guard(event)):
+            return deny
         data, err = await self._call("mcb threats 24")
         if err:
             return f"查不到周围情况：{err}"
-        return self._describe_threats(data)
+        return render.describe_threats(data)
 
     @filter.llm_tool(name="mc_stance")
     async def mc_stance(self, event: AstrMessageEvent, mode: str):
@@ -505,9 +579,8 @@ class McBodyPlugin(Star):
         Args:
             mode(string): 只能是 "defend"（被动还手）或 "hunt"（主动清怪）。
         """
-        denied = self._authorize(event)
-        if denied:
-            return denied
+        if (deny := self._guard(event)):
+            return deny
         if not self._cfg("enable_mc_stance_tool", True):
             return "切换战斗姿态的功能被管理员关掉了。"
         try:
@@ -518,145 +591,38 @@ class McBodyPlugin(Star):
             return "战斗姿态已设为 **hunt**：我会主动打 5 格内的怪，够不着就追过去。"
         return "战斗姿态已设为 **defend**：我不主动挑事，只在挨打或怪瞄着我时才还手。"
 
-    # ---- 输出整形 -------------------------------------------------------
+    @filter.llm_tool(name="mc_retreat")
+    async def mc_retreat(self, event: AstrMessageEvent, toward: str = "owner"):
+        """**主动脱战** —— 立刻停止战斗，往安全方向或者用户那边撤。
 
-    def _describe_state(self, data: dict) -> str:
-        if not data.get("online"):
-            return (
-                f"Nanako 现在**不在线** —— 角色没连进服务器，任何动作都做不了。"
-            )
+        和"快死了才跑"不一样：这个**主动**的，血量好好的也能用。
+        打不过、不想打、觉得不划算、或者只是想回来找人了，都可以调它。
 
-        parts: list[str] = []
-        if data.get("x") is not None:
-            parts.append(f"坐标 x={data['x']} y={data['y']} z={data['z']}")
-        if data.get("hp") is not None:
-            parts.append(f"血量 {data['hp']}")
-        food = data.get("food")
-        if isinstance(food, dict) and food.get("level") is not None:
-            level = food["level"]
-            warn = "（饿了）" if isinstance(level, (int, float)) and level <= 6 else ""
-            parts.append(f"饥饿 {level}/20{warn}")
-        dim = data.get("dim")
-        if dim:
-            parts.append(f"维度 {str(dim).removeprefix('minecraft:')}")
+        撤退方向：
+        · `owner`（默认）—— **朝用户跑**。你会在游戏里看到他，跟他会合最安全。
+          如果他不在线或不在同一维度，自动退化成"往安全方向跑"。
+        · `safe` —— 背离最近的怪跑一段，不管用户在不在。
 
-        stance = "主动清怪（hunt）" if self.reflex.stance == "hunt" else "被动还手（defend）"
-        parts.append(f"战斗姿态 {stance}")
+        撤退后她会退出战斗状态，**不会**打完这条命令又自己冲回去。
 
-        # 正在吃东西的时候说一声 —— 否则白会以为动作没生效又下一遍命令
-        using = data.get("using")
-        if isinstance(using, dict) and using.get("isUsing"):
-            parts.append(f"正在使用 {using.get('item')}（还剩 {using.get('remain')} tick）")
-
-        head = "Nanako 在线，" + "，".join(parts) if parts else "Nanako 在线。"
-        return f"{head}\n{self._describe_task(data.get('task'))}"
-
-    @staticmethod
-    def _describe_task(task: object) -> str:
-        if not isinstance(task, dict) or not task.get("available"):
-            reason = (task or {}).get("reason") if isinstance(task, dict) else None
-            return f"任务状态：**未知** —— {reason or '客户端没有上报状态'}"
-
-        bits: list[str] = []
-        if task.get("status"):
-            bits.append(f"状态 {task['status']}")
-        if task.get("goal"):
-            bits.append(f"目标 {task['goal']}")
-        if task.get("dist") is not None:
-            bits.append(f"还剩约 {task['dist']} 格")
-        if task.get("eta") is not None:
-            bits.append(f"预计 {task['eta']} 秒")
-
-        text = "任务：" + ("，".join(bits) if bits else "无上报字段")
-        if task.get("stale"):
-            text += "（⚠️ 这份状态已过期，客户端可能卡住或掉线了）"
-        return text
-
-    @staticmethod
-    def _describe_inventory(data: dict) -> str:
-        lines: list[str] = []
-
-        food = data.get("food") or {}
-        if isinstance(food, dict) and food.get("level") is not None:
-            level = food["level"]
-            note = "（饿了，该吃东西了）" if isinstance(level, (int, float)) and level <= 6 else ""
-            lines.append(f"饥饿度 {level}/20{note}")
-
-        held = data.get("held")
-        hotbar = data.get("hotbar") or []
-        if isinstance(held, int) and 0 <= held < len(hotbar):
-            item = hotbar[held]
-            name = item.get("n") if isinstance(item, dict) else None
-            lines.append(f"手上（第 {held} 格）：{name or '空手'}")
-
-        def fmt_items(items, label: str) -> None:
-            if not items:
-                return
-            rendered = [
-                f"{it.get('n')}×{int(it.get('c') or 0)}"
-                for it in items
-                if isinstance(it, dict) and it.get("n")
-            ]
-            if rendered:
-                lines.append(f"{label}：" + "，".join(rendered))
-
-        # 快捷栏排除手上那格，免得重复
-        hotbar_rest = [
-            it for i, it in enumerate(hotbar) if isinstance(it, dict) and i != held
-        ]
-        fmt_items(hotbar_rest, "快捷栏其它格")
-        fmt_items(data.get("main") or [], "背包")
-
-        off = data.get("offhand")
-        if isinstance(off, dict) and off.get("n"):
-            lines.append(f"副手：{off['n']}×{int(off.get('c') or 0)}")
-
-        errors = data.get("err") or []
-        if errors:
-            lines.append("（读取时的异常：" + "；".join(str(e) for e in errors) + "）")
-
-        if not lines:
-            return "背包是空的，什么都读不到。"
-        return "\n".join(lines)
-
-    @staticmethod
-    def _describe_threats(data: dict) -> str:
-        threats = data.get("threats") or []
-        if not threats:
-            return "附近没看到任何实体。"
-
-        hostiles = [t for t in threats if isinstance(t, dict) and t.get("hostile")]
-        lines: list[str] = []
-        if hostiles:
-            lines.append(f"⚠️ 附近有 {len(hostiles)} 只敌对：")
-            for t in hostiles[:5]:
-                hp = t.get("hp")
-                aim = "**正瞄着你** " if t.get("targeting") else ""
-                lines.append(
-                    f"  · {aim}{t.get('name')}（{t.get('type')}）"
-                    f"距 {t.get('dist')} 格" + (f"，血量 {hp}" if hp is not None else "")
-                )
-        else:
-            lines.append("附近没有敌对怪。")
-
-        others = [t for t in threats if isinstance(t, dict) and not t.get("hostile")]
-        if others:
-            names = "，".join(f"{t.get('name')}({t.get('dist')}格)" for t in others[:6])
-            lines.append(f"其它实体：{names}")
-
-        err = data.get("err") or []
-        if err:
-            lines.append("（查询异常：" + "；".join(str(e) for e in err) + "）")
-        return "\n".join(lines)
+        Args:
+            toward(string): "owner"（朝用户跑，默认）或 "safe"（背离怪跑）。
+        """
+        if (deny := self._guard(event)):
+            return deny
+        try:
+            what = await self.reflex.retreat(str(toward or "owner"))
+        except ValueError as exc:
+            return str(exc)
+        return f"已脱战，{what}。她不会再自己冲回去打。"
 
     # ---- 调试入口 -------------------------------------------------------
 
     @filter.command("mcbody")
     async def cmd_mcbody(self, event: AstrMessageEvent):
         """不带 LLM 的连通性自检：`/mcbody` 直接打一次 RCON。"""
-        denied = self._authorize(event)
-        if denied:
-            yield event.plain_result(denied)
+        if (deny := self._guard(event)):
+            yield event.plain_result(deny)
             return
         data, err = await self._call("mcb diag")
         if err:

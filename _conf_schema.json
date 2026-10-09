@@ -50,7 +50,10 @@
     "type": "list",
     "description": "唤醒词",
     "hint": "游戏里的消息含这些词才算「被点名」，才唤醒她回应。留空 = 永远不唤醒（只攒上下文）。",
-    "default": ["Nanako", "白"]
+    "default": [
+      "Nanako",
+      "白"
+    ]
   },
   "poll_interval_seconds": {
     "type": "int",
@@ -73,8 +76,8 @@
   "reflex_interval_seconds": {
     "type": "int",
     "description": "反射检查间隔（秒）",
-    "hint": "多久看一眼她的血量/位置。2 秒比较合适。",
-    "default": 2
+    "hint": "多久看一眼她的血量/位置。**默认 1 秒** —— 抄 Kindred 的做法（他们的防御反射每 5 tick = 0.25 秒跑一次，「靠模型反应太慢，她会被打死」）。RCON 实测 33ms/条，1 秒完全付得起。想更灵敏可以调到 0.5。",
+    "default": 1
   },
   "hp_low": {
     "type": "float",
@@ -110,6 +113,24 @@
     "type": "bool",
     "description": "允许白自己切换战斗姿态",
     "hint": "关掉后 mc_stance 工具会拒绝执行，姿态固定在上面的初值。",
+    "default": true
+  },
+  "owner_player_name": {
+    "type": "string",
+    "description": "用户的游戏 ID",
+    "hint": "脱战时「朝用户跑」要用它找人。填用户在 Minecraft 里的 ID（不是 QQ 号），例如 Moebius1453。留空则「朝用户跑」会自动退化成「往安全方向跑」。",
+    "default": ""
+  },
+  "retreat_toward": {
+    "type": "string",
+    "description": "自动脱战时往哪跑",
+    "hint": "safe = 背离最近的怪跑（默认）；owner = 朝用户跑（找不到人就自动退化）。注意这只影响**濒死自动逃跑**；白用 mc_retreat 工具时自己指定方向。",
+    "default": "safe"
+  },
+  "enable_craft": {
+    "type": "bool",
+    "description": "允许白自己合成东西",
+    "hint": "关掉后 mc_craft 会拒绝执行。开着的时候白能自己规划并执行多步合成（含自己去找工作台）。",
     "default": true
   }
 }
