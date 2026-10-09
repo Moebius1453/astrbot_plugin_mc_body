@@ -168,6 +168,13 @@ class McBodyPlugin(Star):
             return None
         return int(round(number))
 
+    @classmethod
+    def _clean_coords3(cls, x, y, z) -> tuple[int, int, int] | None:
+        tx, ty, tz = cls._clean_coord(x), cls._clean_coord(y), cls._clean_coord(z)
+        if None in (tx, ty, tz):
+            return None
+        return tx, ty, tz
+
     # ---- 工具 -----------------------------------------------------------
 
     @filter.llm_tool(name="mc_state")
@@ -301,6 +308,120 @@ class McBodyPlugin(Star):
             return f"没能执行：{err}"
         return f"已把 Baritone 命令下发出去：{clean}。过一会儿用 mc_state 看效果。"
 
+    # ---- 背包与交互（生存必需）-------------------------------------------
+
+    @filter.llm_tool(name="mc_inventory")
+    async def mc_inventory(self, event: AstrMessageEvent):
+        """查看你背包里有什么、手上拿着哪一格、以及饥饿度。
+
+        想拿东西、想吃东西、想合成之前，**先调这个**看看自己有什么。
+        返回快捷栏 0-8 格、背包其余格子、副手，以及当前选中的快捷栏槽位。
+        """
+        denied = self._authorize(event)
+        if denied:
+            return denied
+        data, err = await self._call("mcb inventory")
+        if err:
+            return f"读不到背包：{err}"
+        return self._describe_inventory(data)
+
+    @filter.llm_tool(name="mc_hold")
+    async def mc_hold(self, event: AstrMessageEvent, slot: int):
+        """把你快捷栏的第几格拿在手上（0 到 8）。
+
+        吃东西、放方块之前要先把手里的东西换对。
+        ⚠️ 只能选**快捷栏**（0-8）。如果东西在背包里，先用 `mc_inventory` 看看它在哪一格 ——
+        目前还没有把背包物品移到快捷栏的能力。
+
+        Args:
+            slot(number): 快捷栏槽位，0 是最左边，8 是最右边。
+        """
+        denied = self._authorize(event)
+        if denied:
+            return denied
+        try:
+            n = int(slot)
+        except (TypeError, ValueError):
+            return f"槽位不合法：{slot!r}。应该是 0 到 8 的整数。"
+        if not 0 <= n <= 8:
+            return f"槽位 {n} 超范围。快捷栏只有 0 到 8。"
+        _, err = await self._call(f"mcb hotbar {n}")
+        if err:
+            return f"切换失败：{err}"
+        return f"已经把手换到快捷栏第 {n} 格。"
+
+    @filter.llm_tool(name="mc_use")
+    async def mc_use(self, event: AstrMessageEvent):
+        """使用**手上**拿着的东西：吃东西、喝药水、放方块、射箭……
+
+        最常见的用法是**吃东西**：先用 `mc_inventory` 找到食物在哪一格，
+        用 `mc_hold` 拿到手上，再调这个。
+
+        ⚠️ 这是"对着空气用"（比如吃东西）。要对着某个方块用（开箱子、放置到地上），
+        用 `mc_use_on`。
+        """
+        denied = self._authorize(event)
+        if denied:
+            return denied
+        _, err = await self._call("mcb use")
+        if err:
+            return f"使用失败：{err}"
+        return "已经用了一次手上的东西。过一会儿用 mc_inventory 或 mc_state 看效果。"
+
+    @filter.llm_tool(name="mc_use_on")
+    async def mc_use_on(self, event: AstrMessageEvent, x: float, y: float, z: float):
+        """对着指定坐标的**方块**右键：放置方块、按按钮拉杆、开箱子/工作台。
+
+        会先转头看向那个坐标，再右键，**然后自动关掉弹出的界面**。
+
+        ⚠️ **距离限制约 4.5 格** —— 够不着就是够不着。先用 `mc_goto` 走到附近再调这个。
+
+        ⚠️ 现在**还不能操作箱子/工作台界面里的东西**（没有点击格子的能力），
+        所以打开容器暂时拿不到里面的物品。这个工具目前真正的用途是：
+        **放置方块**、按按钮/拉杆、以及"证明交互这条路是通的"。
+
+        Args:
+            x(number): 目标方块的 X 坐标
+            y(number): 目标方块的 Y 坐标
+            z(number): 目标方块的 Z 坐标
+        """
+        denied = self._authorize(event)
+        if denied:
+            return denied
+        coords = self._clean_coords3(x, y, z)
+        if coords is None:
+            return f"坐标不合法：({x}, {y}, {z})。"
+        tx, ty, tz = coords
+        # 走 useOnAt（直接给坐标构造命中），不依赖准星射线 —— 实测射线经常 MISS
+        _, err = await self._call(f"mcb useOnAt {tx} {ty} {tz}")
+        # 不管成没成，都关一次界面 —— 开着界面她动不了，这是安全兜底
+        await self._call("mcb closeGui")
+        if err:
+            return (
+                f"对着 ({tx},{ty},{tz}) 右键没成功：{err}。"
+                "最常见的原因是**够不着**（超过约 4.5 格）—— 先用 mc_goto 走到附近。"
+            )
+        return (
+            f"已对着 ({tx},{ty},{tz}) 右键，并把可能弹出的界面关掉了。"
+            "如果要确认放置生效，过一会儿用 mc_inventory 看手上东西少没少。"
+        )
+
+    @filter.llm_tool(name="mc_attack")
+    async def mc_attack(self, event: AstrMessageEvent):
+        """攻击你准星正指着的实体（打怪、打动物）。
+
+        会先看看准星指着什么。如果没指着实体，会明确告诉你。
+        想先转向某个目标，可以先调 `mc_use_on` 的同款思路 —— 但目前没有独立的转向工具，
+        通常是先走过去（`mc_goto` / `mc_follow`）让目标进视野。
+        """
+        denied = self._authorize(event)
+        if denied:
+            return denied
+        _, err = await self._call("mcb attack")
+        if err:
+            return f"攻击失败：{err}"
+        return "已攻击准星指着的实体。过一会儿用 mc_state 看血量/效果。"
+
     # ---- 输出整形 -------------------------------------------------------
 
     @classmethod
@@ -315,6 +436,11 @@ class McBodyPlugin(Star):
             parts.append(f"坐标 x={data['x']} y={data['y']} z={data['z']}")
         if data.get("hp") is not None:
             parts.append(f"血量 {data['hp']}")
+        food = data.get("food")
+        if isinstance(food, dict) and food.get("level") is not None:
+            level = food["level"]
+            warn = "（饿了）" if isinstance(level, (int, float)) and level <= 6 else ""
+            parts.append(f"饥饿 {level}/20{warn}")
         dim = data.get("dim")
         if dim:
             parts.append(f"维度 {str(dim).removeprefix('minecraft:')}")
@@ -342,6 +468,53 @@ class McBodyPlugin(Star):
         if task.get("stale"):
             text += "（⚠️ 这份状态已过期，客户端可能卡住或掉线了）"
         return text
+
+    @staticmethod
+    def _describe_inventory(data: dict) -> str:
+        lines: list[str] = []
+
+        food = data.get("food") or {}
+        if isinstance(food, dict) and food.get("level") is not None:
+            level = food["level"]
+            note = "（饿了，该吃东西了）" if isinstance(level, (int, float)) and level <= 6 else ""
+            lines.append(f"饥饿度 {level}/20{note}")
+
+        held = data.get("held")
+        hotbar = data.get("hotbar") or []
+        if isinstance(held, int) and 0 <= held < len(hotbar):
+            item = hotbar[held]
+            name = item.get("n") if isinstance(item, dict) else None
+            lines.append(f"手上（第 {held} 格）：{name or '空手'}")
+
+        def fmt_items(items, label: str) -> None:
+            if not items:
+                return
+            rendered = [
+                f"{it.get('n')}×{int(it.get('c') or 0)}"
+                for it in items
+                if isinstance(it, dict) and it.get("n")
+            ]
+            if rendered:
+                lines.append(f"{label}：" + "，".join(rendered))
+
+        # 快捷栏排除手上那格，免得重复
+        hotbar_rest = [
+            it for i, it in enumerate(hotbar) if isinstance(it, dict) and i != held
+        ]
+        fmt_items(hotbar_rest, "快捷栏其它格")
+        fmt_items(data.get("main") or [], "背包")
+
+        off = data.get("offhand")
+        if isinstance(off, dict) and off.get("n"):
+            lines.append(f"副手：{off['n']}×{int(off.get('c') or 0)}")
+
+        errors = data.get("err") or []
+        if errors:
+            lines.append("（读取时的异常：" + "；".join(str(e) for e in errors) + "）")
+
+        if not lines:
+            return "背包是空的，什么都读不到。"
+        return "\n".join(lines)
 
     # ---- 调试入口 -------------------------------------------------------
 
