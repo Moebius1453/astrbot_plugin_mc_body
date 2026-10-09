@@ -99,5 +99,17 @@
     "description": "索敌半径（格）",
     "hint": "反射和周遭查询看多远。越小越省性能；24 格够用了。",
     "default": 24
+  },
+  "default_stance": {
+    "type": "string",
+    "description": "启动时的战斗姿态",
+    "hint": "defend = 被动，只在挨打或怪瞄着她时才还手（默认，安全）；hunt = 主动清怪，5 格内有怪就上去打。**运行中白可以用 mc_stance 工具自己改**，这里只是开机时的初值。",
+    "default": "defend"
+  },
+  "enable_mc_stance_tool": {
+    "type": "bool",
+    "description": "允许白自己切换战斗姿态",
+    "hint": "关掉后 mc_stance 工具会拒绝执行，姿态固定在上面的初值。",
+    "default": true
   }
 }

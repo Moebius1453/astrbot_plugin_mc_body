@@ -71,6 +71,7 @@ class McBodyPlugin(Star):
             hp_critical=float(self._cfg("hp_critical", 6)),
             flee_distance=int(self._cfg("flee_distance", 32)),
             scan_range=int(self._cfg("reflex_scan_range", 24)),
+            stance=str(self._cfg("default_stance", "defend")),
             notify=self._notify,
         )
         # 通知去重（见 _notify）
@@ -314,7 +315,7 @@ class McBodyPlugin(Star):
 
     @filter.llm_tool(name="mc_stop")
     async def mc_stop(self, event: AstrMessageEvent):
-        """让 Nanako 立刻停下：取消当前所有寻路、行走、跟随。
+        """让 Nanako 立刻停下：取消当前所有寻路、行走、跟随、使用动作。
 
         当你想让她别动了、或者发现她卡住/走错方向时用这个。
         这是最安全的"急停"。
@@ -323,6 +324,8 @@ class McBodyPlugin(Star):
         if denied:
             return denied
         _, err = await self._call("mcb stop")
+        # 顺手松开"使用键" —— 万一吃东西时出了岔子，按键卡住会让她一直重复动作
+        await self._call("mcb release")
         if err:
             return f"没能让她停下：{err}"
         return "已下发停止指令，她应该会停下来（惯性可能还会滑一小段）。"
@@ -468,12 +471,13 @@ class McBodyPlugin(Star):
 
     @filter.llm_tool(name="mc_threats")
     async def mc_threats(self, event: AstrMessageEvent):
-        """看看附近有没有怪、离你多远、什么怪、还剩多少血。
+        """看看附近有没有怪、离你多远、什么怪、还剩多少血、**是不是正瞄着你**。
 
         数据来自**服务端直接查询世界**（不靠客户端看，所以很准）。
         想知道"周围安不安全"、"该不该打"、"往哪跑"时用它。
 
-        返回按距离排序的实体列表；其中 `hostile` 为真的才是敌对怪。
+        返回按距离排序的实体列表；其中 `hostile` 为真的才是敌对怪，
+        `targeting` 为真的表示**它正盯着你**。
         """
         denied = self._authorize(event)
         if denied:
@@ -483,10 +487,40 @@ class McBodyPlugin(Star):
             return f"查不到周围情况：{err}"
         return self._describe_threats(data)
 
+    @filter.llm_tool(name="mc_stance")
+    async def mc_stance(self, event: AstrMessageEvent, mode: str):
+        """设置你的**战斗姿态** —— 也就是"要不要主动打怪"这件事，**由你自己决定**。
+
+        两种姿态：
+
+        · `defend`（默认）—— **被动**。只在**挨打**、或者**有怪正瞄着你**的时候才还手。
+          够得着就挥，够不着就站着等它过来，**不追出去**。不主动挑事。
+        · `hunt` —— **主动清怪**。5 格内有敌对生物就上去打，够不着会追过去。
+
+        ⚠️ 无论哪种姿态，**挨打都会立刻自动还手**（这是反射，不经过你）——
+        所以不用担心"设成 defend 会不会被打死"。
+
+        想安安静静挖矿就设 `defend`；想主动清场、保护自己或别人就设 `hunt`。
+
+        Args:
+            mode(string): 只能是 "defend"（被动还手）或 "hunt"（主动清怪）。
+        """
+        denied = self._authorize(event)
+        if denied:
+            return denied
+        if not self._cfg("enable_mc_stance_tool", True):
+            return "切换战斗姿态的功能被管理员关掉了。"
+        try:
+            actual = self.reflex.set_stance(str(mode))
+        except ValueError as exc:
+            return str(exc)
+        if actual == "hunt":
+            return "战斗姿态已设为 **hunt**：我会主动打 5 格内的怪，够不着就追过去。"
+        return "战斗姿态已设为 **defend**：我不主动挑事，只在挨打或怪瞄着我时才还手。"
+
     # ---- 输出整形 -------------------------------------------------------
 
-    @classmethod
-    def _describe_state(cls, data: dict) -> str:
+    def _describe_state(self, data: dict) -> str:
         if not data.get("online"):
             return (
                 f"Nanako 现在**不在线** —— 角色没连进服务器，任何动作都做不了。"
@@ -506,8 +540,16 @@ class McBodyPlugin(Star):
         if dim:
             parts.append(f"维度 {str(dim).removeprefix('minecraft:')}")
 
+        stance = "主动清怪（hunt）" if self.reflex.stance == "hunt" else "被动还手（defend）"
+        parts.append(f"战斗姿态 {stance}")
+
+        # 正在吃东西的时候说一声 —— 否则白会以为动作没生效又下一遍命令
+        using = data.get("using")
+        if isinstance(using, dict) and using.get("isUsing"):
+            parts.append(f"正在使用 {using.get('item')}（还剩 {using.get('remain')} tick）")
+
         head = "Nanako 在线，" + "，".join(parts) if parts else "Nanako 在线。"
-        return f"{head}\n{cls._describe_task(data.get('task'))}"
+        return f"{head}\n{self._describe_task(data.get('task'))}"
 
     @staticmethod
     def _describe_task(task: object) -> str:
@@ -589,8 +631,9 @@ class McBodyPlugin(Star):
             lines.append(f"⚠️ 附近有 {len(hostiles)} 只敌对：")
             for t in hostiles[:5]:
                 hp = t.get("hp")
+                aim = "**正瞄着你** " if t.get("targeting") else ""
                 lines.append(
-                    f"  · {t.get('name')}（{t.get('type')}）"
+                    f"  · {aim}{t.get('name')}（{t.get('type')}）"
                     f"距 {t.get('dist')} 格" + (f"，血量 {hp}" if hp is not None else "")
                 )
         else:

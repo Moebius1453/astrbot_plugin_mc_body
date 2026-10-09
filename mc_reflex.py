@@ -9,13 +9,19 @@
 
 白 2026-10-09 死于 Drowned（HP 每 10 秒掉 2 点，一路没反应）—— 同一个病。
 
-这套反射只做三件事，都很保守（**宁可停下，不要乱动**）：
-  1. **挨打** → 立刻 `mcb stop`（别再顺着原路线一头撞进去），并进入战斗态
-  2. **战斗态里继续掉血** → 朝反方向跑一段（`mcb baritone goto`）
-  3. **卡住**（在寻路但坐标长时间不动）→ `mcb stop`，别死等
+这套反射只做四件事（**宁可停下，不要乱动**）：
 
-⚠️ 还没做**反击** —— 我们没有可靠的目标选取（准星射线实测经常 MISS）。
-Kindred 有 `Senses` 做实体扫描；我们要做得另写一层。**先保命，再谈还手。**
+  1. **挨打** → 立刻 `mcb stop`（别再顺着原路线一头撞进去），并进入战斗态；然后还手
+  2. **战斗** → 逃（濒死） / 走过去 / 挥。**姿态由白选**（见下）
+  3. **卡住**（在寻路但坐标长时间不动）→ `mcb stop`，别死等
+  4. **饿了** → 自己找东西吃（抄女仆 `MaidHealSelfTask`）
+
+**战斗姿态**（`mc_stance` 工具，**白自己决定**）：
+  · `defend`（默认）—— 只在**挨打**或**有怪正瞄着我**时才还手，够不着不追
+  · `hunt`         —— 主动清怪，**5 格内**有敌对就上去打，够不着会追
+
+**两种姿态共用一条铁律：挨打就还手，不经过白。**
+（用户 2026-10-09："被攻击直接反击不需要 AI 决策" —— 保命是反射，不该等模型想明白）
 """
 
 from __future__ import annotations
@@ -50,10 +56,34 @@ COMBAT_EXIT_RATIO = 1.6
 # 走向目标的节流：别每 tick 都下发一遍 goto
 APPROACH_EVERY_TICKS = 2
 
+# ---- 战斗姿态（**由白自己决定**，见插件里的 `mc_stance` 工具）----------------
+#
+# 两种姿态，外加一条**两种都适用**的铁律：
+#
+#   铁律：**挨打就还手，不经过白。**（用户 2026-10-09 定："被攻击直接反击不需要 AI 决策"）
+#         —— 保命是反射，不该等模型想明白。
+#
+#   defend（默认）：只在**挨打**、或**有怪正瞄着我**时才还手；
+#                   够得着就挥，够不着**不追**。它不主动挑事。
+#   hunt          ：**5 格内**有敌对就上去打，够不着会**追过去**。主动清怪。
+STANCE_DEFEND = "defend"
+STANCE_HUNT = "hunt"
+STANCES = (STANCE_DEFEND, STANCE_HUNT)
+
+# hunt 姿态的索敌半径
+HUNT_RANGE = 5.0
+
 # 吃饭（抄女仆 MaidHealSelfTask）：饥饿低于这个值就吃
 HUNGER_LOW = 16
 # 限频 —— 抄女仆的 setMaxCheckRate：吃完隔一会儿再看，别每 tick 查背包
 EAT_COOLDOWN_TICKS = 5
+
+# 吃完之后要等几个反射 tick 才把手上那格换回去。
+# ⚠️ **不能立刻换** —— 换手会打断"正在使用"，等于把吃了一半的东西扔了。
+EAT_RESTORE_DELAY_TICKS = 2
+
+# 反射循环的任务名 —— 用来识别并掐掉重载留下的孤儿循环（见 `start()`）
+_TASK_NAME = "mc_body_reflex"
 
 
 class ReflexGuard:
@@ -69,6 +99,7 @@ class ReflexGuard:
         flee_distance: int = 32,
         scan_range: int = 24,
         hunger_low: float = HUNGER_LOW,
+        stance: str = STANCE_DEFEND,
         notify=None,
     ) -> None:
         self.bridge = bridge
@@ -89,6 +120,7 @@ class ReflexGuard:
         self._fail_streak = 0
 
         # 战斗状态机
+        self._stance = stance if stance in STANCES else STANCE_DEFEND
         self._in_combat = False
         self._no_threat_ticks = 0
         self._approach_wait = 0
@@ -96,15 +128,32 @@ class ReflexGuard:
         # 吃饭
         self._eat_cool = 0
         self._no_food_warned = False
+        self._restore_slot: int | None = None
+        self._restore_wait = 0
 
     # ---- 生命周期 -------------------------------------------------------
 
     def start(self) -> None:
         if self._task is not None:
             return
-        self._task = asyncio.create_task(self._loop(), name="mc_body_reflex")
+        # ⚠️ **孤儿循环防护** —— 踩过：反复重载插件会留下**多个还在跑的反射循环**，
+        #    它们各自发 `mcb use`，互相把对方的吃东西进度重置掉
+        #    （2026-10-09 实测：客户端在 1 秒内收到 3 次 use）。
+        #    起新的之前，先把所有同名旧任务掐掉。
+        try:
+            for old in asyncio.all_tasks():
+                if old is asyncio.current_task():
+                    continue
+                if old.get_name() == _TASK_NAME and not old.done():
+                    logger.warning("[mc_body] 发现上一个反射循环还活着，先掐掉它")
+                    old.cancel()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[mc_body] 清理旧反射循环时出错（忽略）：{exc}")
+
+        self._task = asyncio.create_task(self._loop(), name=_TASK_NAME)
         logger.info(
             f"[mc_body] 防御反射已启动：每 {self.interval:g} 秒看一眼，"
+            f"姿态 {self._stance}（挨打必还手）；"
             f"血量 <{self.hp_low:g} 警戒、<{self.hp_critical:g} 逃跑；"
             f"卡住 {STUCK_SECONDS:g} 秒自动停"
         )
@@ -118,6 +167,29 @@ class ReflexGuard:
         with contextlib.suppress(asyncio.CancelledError, Exception):
             await task
         logger.info("[mc_body] 防御反射已停止")
+
+    # ---- 战斗姿态（由白自己决定）-----------------------------------------
+
+    @property
+    def stance(self) -> str:
+        return self._stance
+
+    def set_stance(self, mode: str) -> str:
+        """切换战斗姿态。返回实际生效的姿态；不认得就抛 ValueError。
+
+        **这是白自己的决定**（用户 2026-10-09："是否攻击怪物这个状态应该由白自己决定"）。
+        改姿态时**重置战斗态** —— 免得带着上一个姿态的判断继续跑。
+        """
+        m = str(mode or "").strip().lower()
+        if m not in STANCES:
+            raise ValueError(f"未知的战斗姿态：{mode!r}（只认 {' / '.join(STANCES)}）")
+        if m != self._stance:
+            logger.info(f"[mc_body] ⚔ 战斗姿态 {self._stance} → {m}")
+        self._stance = m
+        self._in_combat = False
+        self._no_threat_ticks = 0
+        self._fleeing = False
+        return m
 
     # ---- 主循环 ---------------------------------------------------------
 
@@ -157,15 +229,17 @@ class ReflexGuard:
         was_hp = self._last_hp
         self._last_hp = hp
 
-        nearest = await self._nearest_hostile()
+        # 一次索敌，两个用途（别再查第二遍 —— 每 tick 一次 RCON 往返已经够了）
+        hostiles = await self._hostiles()
+        nearest = hostiles[0] if hostiles else None
+        targeting = next((h for h in hostiles if h.get("targeting")), None)
 
         # ---- 战斗状态机（抄女仆：StartAttacking / 走过去 / 挥 / 脱战）----
         if not self._in_combat:
-            close = nearest is not None and nearest.get("dist", 1e9) <= NEAR_HOSTILE_RANGE
-            if hurt or close:
+            why = self._combat_trigger(hurt, nearest, targeting)
+            if why:
                 self._in_combat = True
                 self._no_threat_ticks = 0
-                why = "挨打了" if hurt else f"{nearest['name']} 贴到 {nearest['dist']:g} 格"
                 # ⚠️ **只写日志，不发 QQ** —— 战斗是自动跑的，用户不需要在聊天里看到它。
                 #    只有"白主动要告诉用户的事"才走 _notify（比如"我饿了但没吃的"）。
                 logger.warning(f"[mc_body] ⚔ 进入战斗（{why}）")
@@ -183,7 +257,8 @@ class ReflexGuard:
                     logger.info("[mc_body] ⚔ 脱战：怪已经拉开或没了")
             else:
                 self._no_threat_ticks = 0
-                await self._fight(data, nearest, hp)
+                # 只有 hunt 姿态才**追出去**；defend 姿态够不着就站着等它过来。
+                await self._fight(data, nearest, hp, chase=(self._stance == STANCE_HUNT))
 
         # 挨打通知（只在掉血时，不刷屏）
         if hurt:
@@ -202,7 +277,15 @@ class ReflexGuard:
           · 限频（`setMaxCheckRate`）—— 吃完隔几 tick 再看，别每 tick 翻背包
           · 优先用手上/快捷栏里最顶饱的
           · **记住原来手上拿的是什么，吃完换回来**（`memoryHandItemStack`）
+
+        ⚠️⚠️ **2026-10-09 血泪教训：绝不能重发 `use`。**
+        每发一次，服务端的 `useItemRemaining` 就被**重置回满值**（面包 32），
+        永远数不到 0 —— 也就永远吃不完。实测服务端 remain 在 32↔31 之间反复跳。
+        所以这里：**服务端说她已经在使用，就什么都别做。**
         """
+        # 先把"用过之后把手换回去"这件事收尾（见 _restore_hand）
+        await self._restore_hand()
+
         if self._eat_cool > 0:
             self._eat_cool -= 1
             return
@@ -213,6 +296,15 @@ class ReflexGuard:
             return
         if self._in_combat:
             return  # 战斗的时候先保命，别停下来啃面包
+
+        # ⚠️ 关键守卫：**她正在吃东西就别再下令**。
+        #    重发 = 重置进度 = 永远吃不完（这就是之前"吃不动"的真正原因）。
+        using = data.get("using") or {}
+        if using.get("isUsing"):
+            logger.debug(
+                f"[mc_body] 🍖 她正在使用 {using.get('item')}（remain={using.get('remain')}），不打断"
+            )
+            return
 
         best = await self._find_food()
         if best is None:
@@ -227,12 +319,27 @@ class ReflexGuard:
         self._eat_cool = EAT_COOLDOWN_TICKS
         logger.info(f"[mc_body] 🍖 饿了（{level:g}）→ 吃 {name}（第 {slot} 格，营养 {nutrition}）")
 
-        # 换到手上 → 吃 → 换回原来那格（抄女仆的 memoryHandItemStack）
+        # 换到手上 → 吃。
+        # ⚠️ **换回原来那格必须等吃完** —— 立刻换回去等于把吃了一半的东西扔掉。
         before = data.get("held") if isinstance(data.get("held"), int) else None
         await self._cmd(f"mcb hotbar {slot}")
         await self._cmd("mcb use")
         if before is not None and before != slot:
-            await self._cmd(f"mcb hotbar {before}")
+            self._restore_slot = before
+            self._restore_wait = EAT_RESTORE_DELAY_TICKS
+        else:
+            self._restore_slot = None
+
+    async def _restore_hand(self) -> None:
+        """吃完了把手换回原来那格（抄女仆 `memoryHandItemStack`）。"""
+        if self._restore_slot is None:
+            return
+        if self._restore_wait > 0:
+            self._restore_wait -= 1
+            return
+        slot = self._restore_slot
+        self._restore_slot = None
+        await self._cmd(f"mcb hotbar {slot}")
 
     async def _find_food(self) -> tuple[int, str, float] | None:
         """在**快捷栏**里找最顶饱的食物。
@@ -260,8 +367,44 @@ class ReflexGuard:
                 best = (slot, str(item.get("n") or "?"), float(nutrition))
         return best
 
-    async def _fight(self, data: dict, nearest: dict, hp: float | None) -> None:
-        """战斗态的一次决策：逃 / 走过去 / 挥。"""
+    def _combat_trigger(
+        self, hurt: bool, nearest: dict | None, targeting: dict | None
+    ) -> str | None:
+        """现在该不该进入战斗态？返回理由（给日志用），None = 不用。
+
+        **两种姿态共用同一条铁律：挨打就还手，不经过白。**
+        （用户 2026-10-09："被攻击直接反击不需要 AI 决策"）
+        """
+        if hurt:
+            return "挨打了"
+
+        if self._stance == STANCE_HUNT:
+            # 主动清怪：5 格内有敌对就上去打（不管它瞄不瞄我）
+            if nearest is not None and nearest.get("dist", 1e9) <= HUNT_RANGE:
+                return f"{nearest.get('name')} 在 {nearest.get('dist'):g} 格内（hunt 主动出击）"
+            return None
+
+        # defend：不主动挑事，但**谁正瞄着我**算威胁 —— 先下手为强。
+        # 抄前人验证过的做法（Kindred 的坑 #1）：只算"敌对实体"不够，
+        # 得知道**谁在盯着我**，否则怪站在旁边不动手时会被当成无害。
+        if targeting is not None and targeting.get("dist", 1e9) <= NEAR_HOSTILE_RANGE:
+            return f"{targeting.get('name')} 正瞄着我，贴到 {targeting.get('dist'):g} 格"
+        return None
+
+    async def _nearest_targeting(self) -> dict | None:
+        """最近的那个**正瞄着白**的敌对实体。defend 姿态用它当开战判据。"""
+        hostiles = await self._hostiles()
+        return next((h for h in hostiles if h.get("targeting")), None)
+
+    async def _fight(
+        self, data: dict, nearest: dict, hp: float | None, *, chase: bool = True
+    ) -> None:
+        """战斗态的一次决策：逃 / 走过去 / 挥。
+
+        `chase=False`（defend 姿态）：够不着就**站着等**，不追出去。
+        `chase=True`（hunt 姿态）：够不着就走过去（抄女仆的
+        `SetWalkTargetFromAttackTargetIfTargetOutOfReach`）。
+        """
         # 濒死优先逃
         if hp is not None and hp <= self.hp_critical:
             if not self._fleeing:
@@ -276,7 +419,10 @@ class ReflexGuard:
         tx, ty, tz = pos[0], pos[1], pos[2]
 
         if dist > ENGAGE_RANGE:
-            # 够不着 —— 走过去（抄 SetWalkTargetFromAttackTargetIfTargetOutOfReach）
+            if not chase:
+                # defend：不追。只在她**已经开始走过去**时才知道停 —— 这里什么都不做。
+                return
+            # 够不着 —— 走过去
             if self._approach_wait <= 0:
                 self._approach_wait = APPROACH_EVERY_TICKS
                 logger.info(
@@ -297,28 +443,22 @@ class ReflexGuard:
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"[mc_body] 通知发不出去：{exc}")
 
-    async def _nearest_hostile(self, close_range: float | None = None) -> dict | None:
-        """服务端索敌。返回最近的敌对实体，没有就 None。
+    async def _hostiles(self) -> list[dict]:
+        """服务端索敌，返回**按距离排序**的敌对实体列表。
 
         服务端直接查世界（`mcb threats`）—— **不靠客户端准星射线**（实测经常 MISS）。
+        每条带 `dist` / `pos` / `name` / `hp`，以及 `targeting`（**它是不是正瞄着我**）。
         """
         try:
             reply = await self.bridge.call(f"mcb threats {int(self.scan_range)}")
         except Exception:
-            return None
+            return []
         if not reply.get("ok"):
-            return None
+            return []
         hostiles = (reply.get("data") or {}).get("hostiles") or []
-        best = None
-        for h in hostiles:
-            dist = h.get("dist")
-            if not isinstance(dist, (int, float)):
-                continue
-            if close_range is not None and dist > close_range:
-                continue
-            if best is None or dist < best["dist"]:
-                best = h
-        return best
+        out = [h for h in hostiles if isinstance(h, dict) and isinstance(h.get("dist"), (int, float))]
+        out.sort(key=lambda h: h["dist"])
+        return out
 
     # ---- 反射动作 -------------------------------------------------------
 
