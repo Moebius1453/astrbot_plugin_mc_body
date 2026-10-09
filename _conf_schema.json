@@ -1,0 +1,31 @@
+{
+  "rcon_host": {
+    "type": "string",
+    "description": "RCON 地址",
+    "hint": "Minecraft 服务端 RCON 监听地址。走 SSH 隧道时填 127.0.0.1。",
+    "default": "127.0.0.1"
+  },
+  "rcon_port": {
+    "type": "int",
+    "description": "RCON 端口",
+    "default": 25575
+  },
+  "rcon_password": {
+    "type": "string",
+    "description": "RCON 密码",
+    "hint": "与服务端 server.properties 里的 rcon.password 一致。留空则 MC 工具直接报错。",
+    "default": ""
+  },
+  "rcon_timeout_seconds": {
+    "type": "int",
+    "description": "RCON 命令超时（秒）",
+    "hint": "单条命令等待响应的最长时间。一般 5~15 秒够用。",
+    "default": 10
+  },
+  "allowed_sender_ids": {
+    "type": "list",
+    "description": "允许调用 MC 工具的发送者 ID",
+    "hint": "白名单。留空 = 对所有人关闭（默认拒绝）。填入允许的 QQ 号等平台 ID。这组工具能让游戏里的角色真实移动，别放开给所有人。",
+    "default": []
+  }
+}
