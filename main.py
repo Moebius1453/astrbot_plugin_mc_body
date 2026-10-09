@@ -26,6 +26,7 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
 
 from .mc_rcon import BridgeError, RconBridge
+from .mc_reflex import ReflexGuard
 from .mc_uplink import ChatUplink
 
 PLUGIN_NAME = "mc_body"
@@ -62,6 +63,25 @@ class McBodyPlugin(Star):
             ambient_limit=int(self._cfg("ambient_context_lines", 20)),
             self_name=str(self._cfg("character_name", "Nanako")),
         )
+        self.reflex = ReflexGuard(
+            self.bridge,
+            interval=float(self._cfg("reflex_interval_seconds", 2)),
+            hp_low=float(self._cfg("hp_low", 12)),
+            hp_critical=float(self._cfg("hp_critical", 6)),
+            flee_distance=int(self._cfg("flee_distance", 32)),
+            scan_range=int(self._cfg("reflex_scan_range", 24)),
+            notify=self._notify,
+        )
+
+    async def _notify(self, text: str) -> None:
+        """把反射事件写到白的会话里（她/用户能看见）。"""
+        umo = str(self._cfg("white_session", "") or "")
+        if not umo:
+            return
+        from astrbot.core.message.components import Plain
+        from astrbot.core.message.message_event_result import MessageChain
+
+        await self.context.send_message(umo, MessageChain([Plain(f"[身体] {text}")]))
 
     # ---- 生命周期 -------------------------------------------------------
 
@@ -86,11 +106,17 @@ class McBodyPlugin(Star):
         else:
             logger.info(f"[{PLUGIN_NAME}] 聊天上行已关闭（enable_chat_uplink=false）")
 
+        if self._cfg("enable_reflex", True):
+            self.reflex.start()
+        else:
+            logger.info(f"[{PLUGIN_NAME}] 防御反射已关闭（enable_reflex=false）")
+
         logger.info(
             f"[{PLUGIN_NAME}] 已加载，RCON 目标 {self.bridge.host}:{self.bridge.port}"
         )
 
     async def terminate(self) -> None:
+        await self.reflex.stop()
         await self.uplink.stop()
         await self.bridge.close()
         logger.info(f"[{PLUGIN_NAME}] 已卸载，RCON 连接已关闭")
@@ -422,6 +448,23 @@ class McBodyPlugin(Star):
             return f"攻击失败：{err}"
         return "已攻击准星指着的实体。过一会儿用 mc_state 看血量/效果。"
 
+    @filter.llm_tool(name="mc_threats")
+    async def mc_threats(self, event: AstrMessageEvent):
+        """看看附近有没有怪、离你多远、什么怪、还剩多少血。
+
+        数据来自**服务端直接查询世界**（不靠客户端看，所以很准）。
+        想知道"周围安不安全"、"该不该打"、"往哪跑"时用它。
+
+        返回按距离排序的实体列表；其中 `hostile` 为真的才是敌对怪。
+        """
+        denied = self._authorize(event)
+        if denied:
+            return denied
+        data, err = await self._call("mcb threats 24")
+        if err:
+            return f"查不到周围情况：{err}"
+        return self._describe_threats(data)
+
     # ---- 输出整形 -------------------------------------------------------
 
     @classmethod
@@ -514,6 +557,35 @@ class McBodyPlugin(Star):
 
         if not lines:
             return "背包是空的，什么都读不到。"
+        return "\n".join(lines)
+
+    @staticmethod
+    def _describe_threats(data: dict) -> str:
+        threats = data.get("threats") or []
+        if not threats:
+            return "附近没看到任何实体。"
+
+        hostiles = [t for t in threats if isinstance(t, dict) and t.get("hostile")]
+        lines: list[str] = []
+        if hostiles:
+            lines.append(f"⚠️ 附近有 {len(hostiles)} 只敌对：")
+            for t in hostiles[:5]:
+                hp = t.get("hp")
+                lines.append(
+                    f"  · {t.get('name')}（{t.get('type')}）"
+                    f"距 {t.get('dist')} 格" + (f"，血量 {hp}" if hp is not None else "")
+                )
+        else:
+            lines.append("附近没有敌对怪。")
+
+        others = [t for t in threats if isinstance(t, dict) and not t.get("hostile")]
+        if others:
+            names = "，".join(f"{t.get('name')}({t.get('dist')}格)" for t in others[:6])
+            lines.append(f"其它实体：{names}")
+
+        err = data.get("err") or []
+        if err:
+            lines.append("（查询异常：" + "；".join(str(e) for e in err) + "）")
         return "\n".join(lines)
 
     # ---- 调试入口 -------------------------------------------------------

@@ -63,5 +63,41 @@
     "description": "环境上下文最多攒多少条",
     "hint": "没被点名的游戏聊天会攒着，等她下次被唤醒时一并附上，让她知道刚才发生了什么。",
     "default": 20
+  },
+  "enable_reflex": {
+    "type": "bool",
+    "description": "启用防御反射（保命）",
+    "hint": "开启后，插件会独立于模型盯着她的血量：挨打就立刻停下、还在掉血就逃跑、卡住就停下。**不经过 LLM** —— 靠模型反应太慢，她会被打死。",
+    "default": true
+  },
+  "reflex_interval_seconds": {
+    "type": "int",
+    "description": "反射检查间隔（秒）",
+    "hint": "多久看一眼她的血量/位置。2 秒比较合适。",
+    "default": 2
+  },
+  "hp_low": {
+    "type": "number",
+    "description": "血量警戒线",
+    "hint": "低于这个值就算「危险」。挨打会立刻触发停止。",
+    "default": 12
+  },
+  "hp_critical": {
+    "type": "number",
+    "description": "血量危急线（触发逃跑）",
+    "hint": "战斗中血量掉到这个值以下，她会朝远离方向跑一段。",
+    "default": 6
+  },
+  "flee_distance": {
+    "type": "int",
+    "description": "逃跑距离（格）",
+    "hint": "血量危急时朝一个方向跑多远。",
+    "default": 32
+  },
+  "reflex_scan_range": {
+    "type": "int",
+    "description": "索敌半径（格）",
+    "hint": "反射和周遭查询看多远。越小越省性能；24 格够用了。",
+    "default": 24
   }
 }
