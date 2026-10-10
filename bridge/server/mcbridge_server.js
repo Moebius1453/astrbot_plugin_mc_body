@@ -691,6 +691,12 @@ try {
       //    （僵尸咬一口报 "Function" 那次，就是靠它定位的）
       try { extra.srcDbg = mcbSourceDebug(src) } catch (eSd) { }
 
+      // 注意： 事件里的 who 是"谁引起的"（打人的那个 / 进服的那个人），
+      //    而熟度判的是"谁**遭了**这件事"（挨打的 / 死的是谁）。
+      //    两个不是一回事：主人挨打时 who 是僵尸，victim 才是主人。
+      //    所以这里显式把受害者带上，别让插件去猜文本。
+      try { extra.victim = vname } catch (eV) { }
+
       if (iAmVictim) {
         mcbEvAdd('hurt', attacker === null ? '环境' : attacker, MCB_TARGET + ' 挨打', extra)
       } else if (iAmAttacker) {
@@ -719,7 +725,8 @@ try {
       var killer = mcbSourceLabel(src)
       var isPlayer = mcbIsPlayer(ent)
       if (!isPlayer && killer !== MCB_TARGET) return   // 怪之间互杀不记
-      mcbEvAdd('death', killer === null ? '环境' : killer, who + ' 死了')
+      // 同 hurt：who 是"谁引起的"，victim 才是"死的是谁"
+      mcbEvAdd('death', killer === null ? '环境' : killer, who + ' 死了', { victim: who })
     } catch (e) { }
   })
 } catch (eDeathReg) {

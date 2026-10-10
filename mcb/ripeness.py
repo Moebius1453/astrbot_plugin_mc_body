@@ -61,35 +61,41 @@ def wait_seconds(level: int) -> float:
     return 60000.0 * lv * lv / 3.0 / 1000.0
 
 
-def wakes(kind: str, who: str, owner: str, char: str) -> bool:
-    """这一条算不算"叫醒她的条目"（只有这些参与熟度）。"""
+def wakes(kind: str, victim: str, owner: str, char: str) -> bool:
+    """这一条算不算"叫醒她的条目"（只有这些参与熟度）。
+
+    注意： 判的是 **victim** —— "谁遭了这件事"，不是"谁引起的"。
+        hurt 事件的 who 是打人的那个（可能是僵尸），victim 才是挨打的人。
+        两个混了的话，"主人挨打"会被判成"僵尸挨打"。
+    """
     if kind == "hurt":
-        return bool(owner) and who == owner
+        return bool(owner) and victim == owner
     if kind == "death":
-        return who in (owner, char) and bool(who)
+        return bool(victim) and victim in (owner, char)
     if kind in ("join", "leave"):
-        return bool(owner) and who == owner
+        return bool(owner) and victim == owner
     return False
 
 
-def is_urgent(kind: str, who: str, hp, owner: str, char: str,
+def is_urgent(kind: str, victim: str, hp, owner: str, char: str,
               hurt_hp_line: float = DEFAULT_HURT_HP_LINE) -> bool:
     """急件 = 立刻叫醒她，不看熟度。"""
     if kind == "hurt":
-        if not owner or who != owner:
+        if not owner or victim != owner:
             return False
         # 血线以上只是记一笔 —— 挨一下就叫醒会把 token 烧在"哦你被打了"上
         return isinstance(hp, (int, float)) and float(hp) <= float(hurt_hp_line)
     if kind == "death":
         # 只有主人死了算急件；她自己死了解不开（死着不能动），记下就行
-        return bool(owner) and who == owner
+        return bool(owner) and victim == owner
     return False
 
 
 @dataclass
 class Waker:
     kind: str
-    who: str
+    victim: str        # 谁遭了这件事（熟度判的就是它）
+    who: str           # 谁引起的（只用来显示，比如"僵尸"）
     text: str
     at: float
     urgent: bool = False
@@ -125,19 +131,24 @@ class RipenessDesk:
 
     # ---- 收条目 ---------------------------------------------------------
 
-    def add(self, kind: str, who: str, text: str, *, hp=None, at: float | None = None) -> bool:
-        """记一条事件。返回"它够不够格叫醒她"（不管此刻醒不醒得了）。"""
-        if not wakes(kind, who, self.owner_name, self.char_name):
+    def add(self, kind: str, victim: str, who: str, text: str, *,
+            hp=None, at: float | None = None) -> bool:
+        """记一条事件。返回"它够不够格叫醒她"（不管此刻醒不醒得了）。
+
+        victim = 谁遭了这件事（挨打的 / 死的 / 进服的那个）；
+        who    = 谁引起的（打人的那个；进服/退服时和 victim 一样）。
+        """
+        if not wakes(kind, victim, self.owner_name, self.char_name):
             return False
-        if kind == "join" and who == self.owner_name:
+        if kind == "join" and victim == self.owner_name:
             # 主人回来了 —— 开闸。积压的条目马上会因为 LONG_ENOUGH 自己熟
             self.note_owner(True)
-        if kind == "leave" and who == self.owner_name:
+        if kind == "leave" and victim == self.owner_name:
             self.note_owner(False)
         self._pending.append(Waker(
-            kind=kind, who=who, text=str(text or ""),
+            kind=kind, victim=victim, who=str(who or ""), text=str(text or ""),
             at=time.monotonic() if at is None else float(at),
-            urgent=is_urgent(kind, who, hp, self.owner_name, self.char_name,
+            urgent=is_urgent(kind, victim, hp, self.owner_name, self.char_name,
                              self.hurt_hp_line),
         ))
         self._trim()
@@ -179,12 +190,19 @@ class RipenessDesk:
         """把攒着的条目全取走（取走即清）。"""
         out = self._pending
         self._pending = []
-        self._last_wake = time.monotonic()
+        self.note_turn()
         return out
+
+    def note_turn(self) -> None:
+        """她刚跑过一轮（不管是被点名还是被事件叫醒）—— 冷却从这一刻起算。
+
+        必须两条路都记：只记事件唤醒的话，被点名刚跑完一轮、下一个急件立刻又开一轮，
+        冷却形同虚设。
+        """
+        self._last_wake = time.monotonic()
 
     def dropped(self) -> int:
         return self._dropped
-
     def clear_dropped(self) -> int:
         n = self._dropped
         self._dropped = 0

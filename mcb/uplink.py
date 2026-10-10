@@ -257,24 +257,37 @@ class ChatUplink:
             # 注意： 不丢这条，记账（抄 Numen AgentLoop.pump() 的 pumpAgain）——
             #    原来直接 return，用户连发两句时第二句永远不会被回应，
             #    而且日志里只说"先只进上下文"，看起来像有意为之。
-            self._pending = trigger
+            self._pending = (trigger, prompt)
             logger.info("[mc_body] 上一次唤醒还没跑完，这条先记下，跑完补一轮")
             return
         async with self._busy:
-            current: str | None = trigger
+            current: tuple[str, str | None] | None = (trigger, prompt)
             rounds = 0
             while current is not None and rounds < MAX_FOLLOWUP_WAKES:
                 self._pending = None
-                await self._one_wake(current)
+                await self._one_wake(current[0], current[1])
                 current = self._pending        # 跑的过程中又被点名了  ->  再补一轮
                 rounds += 1
             if self._pending is not None:
                 logger.warning("[mc_body] 连续补唤醒到上限，这条留给下一轮轮询")
 
-    async def _one_wake(self, trigger: str) -> None:
+    async def wake_with_events(self, prompt: str) -> None:
+        """事件攒熟了 —— 拿这段现成的提示词唤醒她跑一轮（见 mcb/ripeness.py）。
+
+        注意： 和"被点名"走同一套机械（同一把会话锁、同一个补轮机制）——
+        两条路都只是"唤醒她跑一轮"的入口，没理由各写一套。
+        """
+        await self._wake("[mc:events]", prompt=prompt)
+
+    async def _one_wake(self, trigger: str, prompt: str | None = None) -> None:
         self.hold_reason = None
         self.hold_detail = ""
-        prompt = self._build_prompt(trigger)
+        if prompt is None:
+            prompt = self._build_prompt(trigger)
+        else:
+            # 事件唤醒的提示词由调用方拼好了（ripeness.render_prompt）——
+            # 旁听的聊天还是得带上，不然那些话就白攒了。
+            prompt = self._with_ambient(prompt)
         try:
             from astrbot.core.utils.session_lock import session_lock_manager
 
@@ -301,6 +314,16 @@ class ChatUplink:
             logger.info("[mc_body] 白这次没有输出文本，不往游戏里发")
             return
         await self._say_in_game(reply_text)
+
+    def _with_ambient(self, text: str) -> str:
+        """在一段提示词后面接上"她旁听到的聊天"。没有就原样返回。"""
+        if not self._ambient:
+            return text
+        parts = [text, "", "最近的游戏内聊天（供你参考上下文）："]
+        if self._ambient_dropped:
+            parts.append(f"  （更早的约 {self._ambient_dropped} 条已经挤掉了，你只看到最近这几条）")
+        parts += [f"  {line}" for line in self._ambient]
+        return "\n".join(parts)
 
     def _build_prompt(self, trigger: str) -> str:
         # 注意： 统一用 [mc:*] 前缀（规范见 docs\12）：凡是从 Minecraft 来的数据都带这个标签，

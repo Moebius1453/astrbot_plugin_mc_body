@@ -39,6 +39,8 @@ from .mcb.journal import Journal
 from .mcb import permission
 from .mcb import protocol
 from .mcb.places import PlaceBook
+from .mcb import ripeness
+from .mcb.ripeness import RipenessDesk
 from .mcb.reflex import ReflexGuard
 from .mcb import reflexes
 from .mcb.sight import Sight
@@ -176,7 +178,20 @@ class McBodyPlugin(Star):
         # 注意： 和 uplink.py 的聊天分工不同、两张表：那张管"人说的话"，
         #    这张管"聊天以外的事"。合表就是同一件事记两遍（见 mcb/events.py 头部）。
         self.events = EventFeed(self.bridge, self.journal,
-                                on_permission=self._permission_denied)
+                                on_permission=self._permission_denied,
+                                on_event=self._on_world_event,
+                                on_tick=self._maybe_wake_by_events)
+
+        # 熟度 —— 她什么时候该自己醒一轮（见 mcb/ripeness.py）。
+        # 用户 2026-10-11 定的方向：身体层自己动（闲逛）+ 筛选过的状态变化主动发。
+        # 总闸是"主人在线"—— 用户原话"进出服务器来裁定这个不停跑的进程该不该关掉"。
+        self.ripeness = RipenessDesk(
+            level=int(self._cfg("event_wake_level", 3)),
+            owner_name=str(self._cfg("owner_player_name", "") or ""),
+            char_name=str(self._cfg("character_name", "Nanako")),
+            hurt_hp_line=float(self._cfg("owner_hurt_hp_line", 8)),
+            cooldown=float(self._cfg("event_wake_cooldown_seconds", 60)),
+        )
 
         self.reflex = ReflexGuard(
             self.bridge,
@@ -216,9 +231,10 @@ class McBodyPlugin(Star):
             journal=self.journal,
         )
         self.reflex.bind_idle(self.idle)
-        # 用户一开口，闲逛的安静计时重新起算 —— 别聊到一半她走开了。
-        # （走路类的指令不用接：它们会占住 walk 通道，闲逛自己就让开了。）
-        self.uplink.on_activity = self.idle.note_activity
+        # 有人跟她说话时：闲逛重算安静计时，熟度重算冷却。
+        # 走路类的指令不用接：它们会占住 walk 通道，闲逛自己让开；
+        # 而"刚聊过"这件事对熟度有意义 —— 刚说完话不该马上又自己醒。
+        self.uplink.on_activity = self._on_user_activity
         # 通知去重（见 _notify）
         self._last_notify_text = ""
         self._last_notify_at = 0.0
@@ -330,6 +346,52 @@ class McBodyPlugin(Star):
         else:
             await self.arbiter.reject_walk(token)
         self.journal.add("body", f"[mc:permission] 已终止 {claim.owner} 的对应意图：{detail}")
+
+    # ---- 熟度：她什么时候该自己醒（见 mcb/ripeness.py）------------------
+
+    def _on_user_activity(self) -> None:
+        """有人在跟她说话 —— 闲逛重算安静计时，熟度重算冷却。"""
+        self.idle.note_activity()
+        self.ripeness.note_turn()
+
+    def _on_world_event(self, raw: dict) -> None:
+        """事件流收到一条新事件 —— 交给熟度桌攒着。同步函数（调用方不 await）。"""
+        if not self._cfg("enable_event_wake", True):
+            return
+        kind = str(raw.get("kind") or "")
+        if not kind:
+            return
+        who = str(raw.get("who") or "")
+        # 注意： victim 才是"谁遭了这件事"（熟度判的就是它）。
+        #    hurt 的 who 是打人的那个（可能是僵尸），death 的 who 是凶手。
+        #    所以服务端显式带了 victim 字段；进出服那两条 who 就是那个人。
+        victim = str(raw.get("victim") or "")
+        if kind in ("join", "leave"):
+            victim = victim or who
+        if not victim:
+            return
+        self.ripeness.add(kind, victim, who, str(raw.get("text") or ""),
+                          hp=raw.get("hp"))
+
+    async def _maybe_wake_by_events(self) -> None:
+        """熟度的心跳：借事件流那个 2 秒一次的节拍走，不另起循环。"""
+        if not self._cfg("enable_event_wake", True):
+            return
+        why = self.ripeness.why()
+        if why is None:
+            return
+        entries = self.ripeness.take()
+        if not entries:
+            return
+        prompt = ripeness.render_prompt(entries, self.ripeness.clear_dropped())
+        logger.info(
+            f"[{PLUGIN_NAME}] 熟度到了（{why}）：自己醒一轮，{len(entries)} 条事件"
+        )
+        self.journal.add("ripeness", f"自己醒了（{why}）：{entries[-1].text}")
+        try:
+            await self.uplink.wake_with_events(prompt)
+        except Exception as exc:  # noqa: BLE001 - 叫醒失败不该炸掉事件流那条循环
+            logger.warning(f"[{PLUGIN_NAME}] 事件唤醒失败：{exc}")
 
     async def _claim_walk_user(self, cmd: str, note: str) -> tuple[dict, str | None]:
         """用户级地声明 walk 通道。返回值和 _call 同形，方便原地替换。
@@ -487,6 +549,18 @@ class McBodyPlugin(Star):
             logger.info(
                 f"[{PLUGIN_NAME}] 自主心跳已关闭（enable_self_loop=false）—— "
                 "她自己那个 future_task 工具仍然可用"
+            )
+
+        # 熟度的总闸要有个初值 —— 之后由 join/leave 事件自己维护。
+        # 只在启动时问这一次；每次判熟都去问就是白花 RCON 往返。
+        owner = str(self._cfg("owner_player_name", "") or "").strip()
+        if owner and self._cfg("enable_event_wake", True):
+            data, err = await self._call(f"mcb where {owner}")
+            online = bool(not err and isinstance(data, dict) and data.get("online"))
+            self.ripeness.note_owner(online)
+            logger.info(
+                f"[{PLUGIN_NAME}] 熟度总闸初值：主人 {owner} "
+                f"{'在线' if online else '不在线（只攒不醒）'}"
             )
 
         logger.info(
