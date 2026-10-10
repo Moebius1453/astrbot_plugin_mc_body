@@ -141,6 +141,8 @@ class ChatUplink:
         # 跑着的时候又被点名了  ->  记在这儿，这一轮完事立刻补一轮（不是丢掉）
         self._pending: str | None = None
         self._fail_streak = 0
+        self.hold_reason: str | None = None
+        self.hold_detail = ""
 
     # ---- 生命周期 -------------------------------------------------------
 
@@ -262,14 +264,27 @@ class ChatUplink:
                 logger.warning("[mc_body] 连续补唤醒到上限，这条留给下一轮轮询")
 
     async def _one_wake(self, trigger: str) -> None:
+        self.hold_reason = None
+        self.hold_detail = ""
         prompt = self._build_prompt(trigger)
         try:
-            reply_text = await self._run_white(prompt)
+            from astrbot.core.utils.session_lock import session_lock_manager
+
+            self.hold_reason = "external"
+            self.hold_detail = "waiting_for_session_lock"
+            async with session_lock_manager.acquire_lock(self.umo):
+                self.hold_reason = None
+                self.hold_detail = ""
+                reply_text = await self._run_white(prompt)
         except Exception as exc:  # noqa: BLE001
+            self.hold_reason = "failed"
+            self.hold_detail = "game_turn_failed"
             logger.error(f"[mc_body] 唤醒白失败：{exc}", exc_info=True)
             return
 
-        # 跑成功了才清上下文 —— 失败时留着，下次还能带上
+        # 被阻断时保留旁听上下文，下一次点名重新检查。
+        if self.hold_reason is not None:
+            return
         self._ambient.clear()
         # 挤掉的条数已经报给她了，这一轮就算交代过，别一直挂着
         self._ambient_dropped = 0
@@ -403,7 +418,9 @@ class ChatUplink:
             req=req,
         )
         if not result:
-            raise RuntimeError("build_main_agent 返回空（会话或 provider 有问题？）")
+            self.hold_reason = "blocked"
+            self.hold_detail = "agent_build_unavailable"
+            return ""
 
         # 注意： 结构性防止"说两遍"：必须在 build 之后摘 ——
         #    build_main_agent 会把人格式的工具集 merge 进 req.func_tool（同名覆盖），

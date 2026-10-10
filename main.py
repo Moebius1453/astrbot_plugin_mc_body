@@ -341,7 +341,13 @@ class McBodyPlugin(Star):
             return
         try:
             data, err = await self._call("mcb state")
-            if err or not data.get("online"):
+            if err:
+                return
+            if not data.get("online"):
+                from astrbot.core.agent.message import TextPart
+                req.extra_user_content_parts.append(TextPart(
+                    text="[mc:body] offline\n" + render.describe_hold(data)
+                ))
                 return
             # 注意： 聊天只在她"被唤醒的那一刻"由 uplink 注入是不够的 ——
             #    实测（2026-10-10）她在 QQ 会说"我听不见游戏聊天"，
@@ -352,6 +358,8 @@ class McBodyPlugin(Star):
                 chat_lines if has_new_chat else None,
                 wiring=self._cfg("enable_wiring_note", True),
                 instincts=reflexes.overview(),
+                hold=render.describe_hold(data, self.uplink.hold_reason,
+                                          self.uplink.hold_detail),
             )
             from astrbot.core.agent.message import TextPart
             req.extra_user_content_parts.append(TextPart(text=packet))
@@ -610,7 +618,8 @@ class McBodyPlugin(Star):
             return render.reword(err, "查不到 Nanako 的状态", kind=render.Kind.BRIDGE,
                                 hint="过几秒重试一次；一直这样就说明桥断了（不是她不在线）")
         return render.describe_state(
-            data, self.reflex.stance, self.tasks.status(), self.journal
+            data, self.reflex.stance, self.tasks.status(), self.journal,
+            hold=render.describe_hold(data, self.uplink.hold_reason, self.uplink.hold_detail),
         )
 
     @filter.llm_tool(name="mc_say")

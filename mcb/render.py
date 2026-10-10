@@ -186,8 +186,25 @@ def describe_menu(data: dict) -> str:
 
 # ---- 身体 -------------------------------------------------------------------
 
+HOLD_RELEASES = {
+    "dead": "body_online_and_alive",
+    "external": "session_lock_acquired",
+    "blocked": "next_addressed_message_rechecks_provider",
+    "failed": "next_addressed_message",
+}
+
+
+def describe_hold(data: dict, reason: str | None = None, detail: str = "") -> str:
+    if not data.get("online") or (isinstance(data.get("hp"), (int, float))
+                                  and data["hp"] <= 0):
+        reason, detail = "dead", "body_unavailable"
+    if reason not in HOLD_RELEASES:
+        return "[mc:hold] none"
+    return f"[mc:hold] {reason} detail={detail or '?'} release={HOLD_RELEASES[reason]}"
+
+
 def describe_state(data: dict, stance: str = "defend", work: dict | None = None,
-                   journal=None) -> str:
+                   journal=None, *, hold: str = "") -> str:
     """她现在的样子 —— 身体状态 + 正在做的事 + 最近发生的事。
 
     三块缺一不可：只有身体数字，白不知道自己刚才干了什么（用户 2026-10-09
@@ -253,6 +270,8 @@ def describe_state(data: dict, stance: str = "defend", work: dict | None = None,
     head = "Nanako 在线，" + "，".join(parts) if parts else "Nanako 在线。"
 
     blocks = [head, describe_work(work), describe_path(data.get("task"))]
+    if hold:
+        blocks.append(hold)
     if journal is not None:
         blocks.append("最近发生的事：\n" + journal.render())
     return "\n".join(blocks)
@@ -685,7 +704,7 @@ def _num(value, fmt: str = "g") -> str:
 
 def state_packet(data: dict, stance: str = "defend", work: dict | None = None,
                  journal=None, places=None, chat=None, *, log_lines: int = 4,
-                 wiring: bool = True, instincts: str = "") -> str:
+                 wiring: bool = True, instincts: str = "", hold: str = "") -> str:
     """紧凑的状态数据包 —— 纯数据，给白当处境感知用。
 
     形如：
@@ -758,6 +777,8 @@ def state_packet(data: dict, stance: str = "defend", work: dict | None = None,
     if path.get("available"):
         act.append(f"path={path.get('status') or '?'}")
     lines.append("[mc:act] " + " | ".join(act))
+    if hold:
+        lines.append(hold)
 
     # ---- 最近发生了什么 ----
     if journal is not None and len(journal) > 0:
