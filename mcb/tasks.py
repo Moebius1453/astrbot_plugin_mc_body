@@ -62,7 +62,7 @@ from dataclasses import dataclass, field
 
 from astrbot.api import logger
 
-from .arbiter import LEVEL_TASK
+from .arbiter import LEVEL_TASK, TASK_TTL
 from .containers import ContainerIO, find_block, wait_baritone, wear
 from . import render
 
@@ -93,7 +93,7 @@ class Task:
     name: str
     summary: str          # 给模型看的一句话 —— 描述写得含糊模型就会用错
     steps: list[Step] = field(default_factory=list)
-    # ⭐ 受理前检查（抄 Numen Task.prepare / TaskDispatch.setTask）。
+    # 重点： 受理前检查（抄 Numen Task.prepare / TaskDispatch.setTask）。
     #
     #    契约和 Step.run 一样：返回 None = 可以开工；返回字符串 = 失败原因。
     #    注意： 它在 create_task 之前跑，判不过就"不换进槽" ——
@@ -187,7 +187,7 @@ class TaskContext:
     async def wait_path(self, timeout: float = 60.0, target=None) -> str:
         """等 Baritone 走完。返回 "arrived" / "timeout"。
 
-        注意：注意： 别天真地写成"不在走 = 到了"（2026-10-09 实战踩到）：
+        注意： 别天真地写成"不在走 = 到了"（2026-10-09 实战踩到）：
         刚 goto 完时 Baritone 的 isPathing() 还是 false —— 那种写法会
         立刻判定到达。实测从 (-10,88) 去 (-45,66) 只花 9 秒就报"到了"，
         而人一步没动，后面全在错误的位置上干。
@@ -403,7 +403,7 @@ async def _step_check_farm_tools(ctx: TaskContext) -> str | None:
 async def _step_run_farm(ctx: TaskContext) -> str | None:
     """开干 + 跑满时间 + 报收成。
 
-    注意：注意： 不能靠"Baritone 没在走"判收工（2026-10-09 踩到）：
+    注意： 不能靠"Baritone 没在走"判收工（2026-10-09 踩到）：
     收作物靠破坏方块，那期间 isPathing() 常常是 false ——
     第一版用"安静 15 秒"当收工信号，结果刚开干 15 秒就收工了。
 
@@ -571,7 +571,7 @@ class TaskRunner:
             # 抄 TLM 的 Already on task %s
             return f"已经在做「{task.name}」了 —— 没换。"
 
-        # ⭐ 受理前先判，判不过不换进槽（docs\25 §三 1.3）。
+        # 重点： 受理前先判，判不过不换进槽（docs\25 §三 1.3）。
         #    注意： 顺序要紧：先判、后停旧活。反过来的话，新活一失败她就两手空空。
         ctx = TaskContext(self, params)
         if task.precheck is not None:
@@ -635,7 +635,7 @@ class TaskRunner:
     async def checkpoint(self) -> None:
         if self._paused:
             raise Paused
-        # 注意：注意： 另一个挂起来源：walk 通道被别人（反射/用户）抢走了。
+        # 注意： 另一个挂起来源：walk 通道被别人（反射/用户）抢走了。
         #    这时"没在移动"是别人造成的，不是"走到了" ——
         #    不判的话 wait_path 会把"反射保命时把她叫停"误判成到达。
         #    （这条坑一直记在本文件顶部第 51 行，从来没有真正的解法。）
@@ -644,6 +644,11 @@ class TaskRunner:
             top = arb.walk_holder()
             if top is not None and top.owner != "task":
                 raise Paused
+            # 任务还在跑 = 它还活着 —— 顺手把自己的声明续上（第 2 批 2.5）。
+            # 注意： 这不是"释放"的来源，是"我还想要"的来源：
+            #    任务真死了（抛异常 / 被 cancel）就没人再调 checkpoint，
+            #    TASK_TTL 到点那条声明自己让位 —— 不用指望哪个调用点记得 release。
+            await arb.touch_walk("task", TASK_TTL)
 
     def note(self, text: str) -> None:
         self.journal.add("task", text)

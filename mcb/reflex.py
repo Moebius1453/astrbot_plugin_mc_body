@@ -127,7 +127,7 @@ _TASK_NAME = "mc_body_reflex"
 #   owner —— 朝主人跑（"跟着我"本来就是要的效果，人多的地方也通常更安全）
 RETREAT_SAFE = "safe"
 RETREAT_OWNER = "owner"
-# ⭐ auto = 按"主人离我多远"自己选（用户 2026-10-10 定的，也是现在的默认值）。
+# 重点： auto = 按"主人离我多远"自己选（用户 2026-10-10 定的，也是现在的默认值）。
 #   用户原话："safe 的寻路也许很合理，慌不择路 实际上怪可爱的……
 #   我的建议是按照我离她的距离判断是不是应该往我身边跑。"
 RETREAT_AUTO = "auto"
@@ -226,7 +226,7 @@ class ReflexGuard:
     #    而且它只在声明、不删别人的 —— 所以脱战一 release，
     #    任务/用户的路线会自己恢复（"挂起不是取消"的落点）。
     #
-    # ⭐ 2026-10-10：每一条都带 ttl —— 到期由 expire_stale() 自动让位。
+    # 重点： 2026-10-10：每一条都带 ttl —— 到期由 expire_stale() 自动让位。
     #    这是"卡住把 walk 通道永久锁死"那个真 bug 的兜底，见 arbiter.py。
     async def _walk_claim(self, cmd: str, note: str, ttl: float = FLEE_TTL) -> None:
         if self.arbiter is None:
@@ -344,10 +344,16 @@ class ReflexGuard:
             self._last_sample = None
             return
 
-        # ⭐ 先扫一遍过期的 walk 声明（每 tick 都做）。
+        # 重点： 先扫一遍过期的 walk 声明（每 tick 都做）。
         #    反射声明的 TTL 到点就自动让位 —— 这是"永久锁死"的兜底，
         #    见 arbiter.expire_stale 和 mcb/arbiter.py 的模块注释。
         if self.arbiter is not None:
+            # 续期要在过期之前：身体还在动，就把用户/任务那条续上（第 2 批 2.5）。
+            # 这里用的是刚读到的那份状态里的 status —— 不用额外再问一次桥。
+            task_info = data.get("task")
+            await self.arbiter.renew_active(
+                task_info.get("status") if isinstance(task_info, dict) else None
+            )
             await self.arbiter.expire_stale()
 
         hp = data.get("hp")
@@ -384,7 +390,7 @@ class ReflexGuard:
                 self._suspend_tasks("战斗中")
                 if hurt:
                     await self._walk_stop("进战：别顺着原路线撞进去")
-                # ⭐ 进战先看手上拿的是什么 —— 武器在背包里攥着面包打怪是白给。
+                # 重点： 进战先看手上拿的是什么 —— 武器在背包里攥着面包打怪是白给。
                 #    （2026-10-10 实测诊断：她手上是 minecraft:string，
                 #     钻石斧/钻石剑全在背包里，mc_attack 伤害 0。见 docs/13 §2）
                 await self._equip_best_weapon(data)
@@ -393,7 +399,7 @@ class ReflexGuard:
             #    NEAR_HOSTILE_RANGE × COMBAT_EXIT_RATIO（现在是 6.25 格）。
             #    否则怪在边界上晃一下就是"进战/脱战"来回刷（用户看到的现象）。
             #
-            # ⭐ 2026-10-10 加第二个出口：连续 COMBAT_QUIET_SECONDS 秒没挨打、
+            # 重点： 2026-10-10 加第二个出口：连续 COMBAT_QUIET_SECONDS 秒没挨打、
             #    而且没有任何东西在瞄着她  ->  直接算脱战。
             #    只看"怪在不在附近"的话，一只站在旁边发呆的蠹虫就能把她永久锁进战斗态
             #    （实测：21:10–21:19 连续 9 分钟，walk 通道一直被反射占着，
@@ -436,12 +442,12 @@ class ReflexGuard:
         await self._maybe_eat(data)
 
     async def _check_drowning(self, data: dict) -> None:
-        """溺水反射 —— 注意：注意： 判据是氧气，不是血量。
+        """溺水反射 —— 注意： 判据是氧气，不是血量。
 
         2026-10-10 实测：她卡在水里 253 秒，事件流里 drown 每秒一条，
         但 dmg: 0（身上挂着抗性 V） ->  只看 hp 的反射永远不触发，她就一直泡着。
 
-        ⭐ 教训：凡是要"保命"的判据，都得从「状态」判，不能只从「伤害」判。
+        教训：凡是要"保命"的判据，都得从「状态」判，不能只从「伤害」判。
         （抗性、水肺药水、吸收伤害……任何一个都能让"受伤"这条线失效。）
 
         动作：往她自己那一列的地表发一条 3D goto（服务端顺带报 surfY），
@@ -483,7 +489,7 @@ class ReflexGuard:
           · 饿了（food < hunger_low）—— 防饿死
           · 快死了（hp <= hp_low）—— 受伤回血靠的是饱食度，不是"饿不饿"
 
-        注意：注意： 2026-10-10 踩到的大坑：原来只有"饿了才吃"这一条，
+        注意： 2026-10-10 踩到的大坑：原来只有"饿了才吃"这一条，
         而她饥饿度恰好卡在 16（food < 16 不成立），于是
         血 4.67 一直不回、也一直不吃，卡死在那。
         原版自然回血要饱食度 ≥ 18，跟"饿不饿"根本是两回事。
@@ -493,7 +499,7 @@ class ReflexGuard:
           · 记住原来手上拿的是什么，吃完换回来（memoryHandItemStack）
         受伤时优先挑饱食度高的（saturation，回血看它）；只是饿了就挑顶饱的（nutrition）。
 
-        注意：注意： 2026-10-09 血泪教训：绝不能重发 use。
+        注意： 2026-10-09 血泪教训：绝不能重发 use。
         每发一次，服务端的 useItemRemaining 就被重置回满值（面包 32），
         永远数不到 0 —— 也就永远吃不完。实测服务端 remain 在 32 <-> 31 之间反复跳。
         所以这里：服务端说她已经在使用，就什么都别做。
@@ -589,7 +595,7 @@ class ReflexGuard:
     async def _find_food(self, *, prefer_saturation: bool = False):
         """找最该吃的那个食物。返回 (在哪, 位置, 注册名, 显示名, 分数)；没有回 None。
 
-        注意：注意： 快捷栏和背包都要翻。
+        注意： 快捷栏和背包都要翻。
         踩过（2026-10-10，用户报的"时不时还是弹出 [mc:alert] food=15/20 hp=18 food_items=0"）：
         原来只翻快捷栏，可她背包里揣着 64 个面包 ——
         于是反射一次次判定"身上没吃的"，一遍遍弹通知，还永远吃不上。
@@ -871,7 +877,7 @@ class ReflexGuard:
         | safe | 慌不择路 —— 背离最近的怪、随机偏一点，跑 flee_distance 格 |
         | auto（默认） | 按"主人离我多远"自己选 —— 见下 |
 
-        ⭐ auto 是用户 2026-10-10 定的，原话：
+        重点： auto 是用户 2026-10-10 定的，原话：
         *"safe 的寻路也许很合理，慌不择路 实际上怪可爱的……我的建议是
         按照我离她的距离判断是不是应该往我身边跑。"*
 

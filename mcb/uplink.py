@@ -24,6 +24,8 @@ import json
 
 from astrbot.api import logger
 
+from . import protocol
+
 # 游戏内聊天单条上限约 256；留点余量
 MAX_GAME_SAY_LEN = 200
 
@@ -50,7 +52,7 @@ MAX_FOLLOWUP_WAKES = 3
 def provider_settings_to_build_kwargs(cfg: dict) -> dict:
     """把 AstrBot 的全局配置翻成 MainAgentBuildConfig 的字段。
 
-    注意：注意： 必须和 pipeline 的映射逐字对齐
+    注意： 必须和 pipeline 的映射逐字对齐
     （pipeline/process_stage/method/agent_sub_stages/internal.py:75-155）。
     我们是绕过 pipeline 直接 build_main_agent 的，
     少传一个字段 = 那个字段悄悄退回 dataclass 默认值，而且不报错、看不出来。
@@ -322,7 +324,7 @@ class ChatUplink:
             "**不要分点、不要换行、不要旁白、不要括号里加解释、不要一口气说三件事**。"
             "想说的多就挑最要紧的那一句。",
             "",
-            # 注意：注意： 这一段是 2026-10-10 加的，因为实测她只答应不动手：
+            # 注意： 这一段是 2026-10-10 加的，因为实测她只答应不动手：
             #    用户在公屏说"放下熔炉"，她回"好嘞，熔炉放地上啦！" —— 其实根本没放，
             #    一翻背包熔炉还在。她是在演，不是在做。
             #    原来这段提示词只说"回应"，从没告诉她可以动手 —— 于是她把每次唤醒
@@ -379,7 +381,7 @@ class ChatUplink:
         conv = await _get_session_conv(event=event, plugin_context=self.context)
         req.conversation = conv
 
-        # 注意：注意： 必须自己把历史读出来塞进 req.contexts（2026-10-10 实测订正）。
+        # 注意： 必须自己把历史读出来塞进 req.contexts（2026-10-10 实测订正）。
         #
         #   原来这里写的是"不用手工塞，build_main_agent 会自己取" —— 那是错的。
         #   build_main_agent 里填 contexts 的两处（astr_main_agent.py:1442 / :1575）
@@ -387,11 +389,11 @@ class ChatUplink:
         #   所以那两处一次都不会跑  ->  req.contexts 一直停在
         #   ProviderRequest 的默认值 []（provider/entities.py:104）。
         #
-        #   ⇒ 后果：游戏里她看不到任何对话历史 —— QQ 那边看得见游戏里发生的事
+        #   => 后果：游戏里她看不到任何对话历史 —— QQ 那边看得见游戏里发生的事
         #     （因为都写进同一个会话），反过来在游戏里却看不见 QQ 说过什么。
         #     用户 2026-10-10 指出的就是这个不对称。
         #
-        # 注意：注意： conv.history 是 JSON 文本（str），不是 list —— 必须 json.loads。
+        # 注意： conv.history 是 JSON 文本（str），不是 list —— 必须 json.loads。
         #   绝对不许写 list(...)：list("<json文本>") 不抛异常，
         #   它把字符串逐字符拆开 —— 2026-10-10 那次把 478 条历史炸成 18 万条
         #   就是这么来的（见 docs\17 §七）。
@@ -432,7 +434,7 @@ class ChatUplink:
                 with contextlib.suppress(Exception):
                     tool_set.remove_tool("mc_say")
 
-        # ⭐⭐ 补上 on_llm_request 钩子 —— 这一步决定"游戏里的她"和"QQ 里的她"
+        # 重点： 补上 on_llm_request 钩子 —— 这一步决定"游戏里的她"和"QQ 里的她"
         #      是不是同一个白。
         #
         # 注意： 实测（2026-10-10）：call_event_hook(..., OnLLMRequestEvent, ...) 在
@@ -462,10 +464,31 @@ class ChatUplink:
         except Exception as exc:  # noqa: BLE001 - 钩子是加分项，不该让整轮挂掉
             logger.warning(f"[mc_body] 跑 on_llm_request 钩子失败（这一轮当没有它）：{exc}")
 
+        # 重点： 出口净化（第 2 批 2.1）—— 钩子跑完、真正出站之前的最后一道（我们管得着的那道）。
+        #
+        # 注意： 它管的是"我们这一段"，不是"最终那一份"：
+        #    runner 之后还会按 max_context_length 截断，那一步在框架内部
+        #    （core/agent/context/truncator.py::fix_messages），
+        #    按 docs\25 11.2 的明确要求（"不要更改框架文件或存储历史来修请求视图"）不去动它。
+        #    所以这是补强不是止血。
+        #    先让 audit() 在真实流量里把坏形状记下来 —— 有证据再决定要不要往更深的地方动。
+        try:
+            issues = protocol.audit(req.contexts)
+            if issues:
+                logger.warning(
+                    f"[mc_body] 出站历史有 {len(issues)} 处不合法（净化前）：{issues[:3]}"
+                )
+            cleaned = protocol.for_wire(req.contexts)
+            if len(cleaned) != len(req.contexts):
+                logger.info(f"[mc_body] 出站净化：{len(req.contexts)} -> {len(cleaned)} 条")
+            req.contexts = cleaned
+        except Exception as exc:  # noqa: BLE001 - 净化失败不该让这一轮发不出去
+            logger.warning(f"[mc_body] 出站净化失败（这一轮按原样发）：{exc}")
+
         runner = result.agent_runner
         async for _ in runner.step_until_done(self.max_steps):
             pass
-        # 注意：注意： 必须自己把这一轮存下来 —— 否则游戏里的对话从来不进她的历史。
+        # 注意： 必须自己把这一轮存下来 —— 否则游戏里的对话从来不进她的历史。
         #
         #    会话不是 agent 自己存的，是 pipeline 那一层存的：
         #    pipeline/.../agent_sub_stages/internal.py:333 的 _save_to_history
@@ -485,7 +508,7 @@ class ChatUplink:
     async def _load_stored(self, conv) -> list:
         """读出真正的历史 list。
 
-        注意：注意： 绝不要写 list(conv.history) —— conv.history 是 AstrBot v1 的
+        注意： 绝不要写 list(conv.history) —— conv.history 是 AstrBot v1 的
         legacy 字段，类型是 str（JSON 文本）：
         conversation_mgr.py:84  ->  history=json.dumps(conv_v2.content or [])。
 
@@ -518,14 +541,14 @@ class ChatUplink:
     async def _save_turn(self, req, runner) -> None:
         """把这一轮写回会话 —— 照 pipeline 的做法，但必须保证"只增不减 + 类型全对"。
 
-        注意：注意： 2026-10-10 血案（两次，同一个函数）：
+        注意： 2026-10-10 血案（两次，同一个函数）：
         1 初版直接把 runner.run_context.messages 丢进去，自以为那是"完整上下文" ——
            在我们这条绕过 pipeline 的路上，它只有本轮（第一条就是 uplink 的 prompt，
            前面没有历史）。update_conversation(history=...) 是替换语义  ->  494 条  ->  1 条。
         2 "修好"之后仍然写坏：stored = list(conv.history) —— 见 _load_stored 的说明，
            conv.history 是 str，list() 把 478 条历史拆成了 184467 个单字符。
 
-        ⭐ 2026-10-10 深夜按 Numen 的纪律加固（方案：docs\21 §2.2）。核心两处：
+        重点： 2026-10-10 深夜按 Numen 的纪律加固（方案：docs\21 §2.2）。核心两处：
 
         1. 不再猜"谁更长"。原来是
                if len(fresh) >= len(stored): combined = fresh else: stored + fresh
@@ -538,7 +561,7 @@ class ChatUplink:
            2 追加段的 role 只能是 user/assistant/tool
            3 膨胀闸：涨得太离谱就拒写（防"重复追加"这种慢性爆炸）
 
-        > ⭐ 先天差距要说清：AstrBot 的 update_conversation(history=…) 是替换语义，
+        > 重点： 先天差距要说清：AstrBot 的 update_conversation(history=…) 是替换语义，
         > 我们做不到真正的 append-only（Numen 的 ConvoLog 是 JSONL 追加 + 派生视图）。
         > 所以这里只能把"读-改-写"这条路守得更死 —— 守不出追加，只能守出"不敢乱写"。
         """

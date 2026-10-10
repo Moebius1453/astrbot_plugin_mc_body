@@ -14,7 +14,7 @@
 
 ## 模型（抄原版 Brain 的 memory 抢占 + AltoClef 的 TaskChain）
 
-⭐ 抢占不是靠"打断"，而是靠抢通道：高优先级的声明顶掉低的，
+重点： 抢占不是靠"打断"，而是靠抢通道：高优先级的声明顶掉低的，
 低的挂起不取消；高的释放后低的自动恢复。
 
 ```
@@ -42,12 +42,30 @@
     await arbiter.release_walk(task_id)
     await arbiter.claim_walk(LEVEL_REFLEX, "reflex", None, ttl=8.0)   # None = 要求停
 
-注意：注意： 反射的声明必须带 ttl（用户/任务的不带）。
+注意： 反射的声明必须带 ttl（用户/任务的不带）。
 起因（2026-10-10 用户报"我让她跟着我，她好像不会走路了"）：
 _check_stuck() 在战斗状态机外面调，它 _walk_stop() 之后
 没有任何代码路径会释放它（_walk_release 只在"脱战"那一支被调）——
 于是"卡住"变成一次性永久锁死，用户级的 mc_follow 永远排在下面、下不去。
 TTL 是这条的兜底：expire_stale() 每 tick 扫一遍，到点自动让位。
+
+## 2026-10-11（第 2 批 2.5）：TTL 从"反射的兜底"升级成"所有人的兜底"
+
+原来只有反射带 TTL，用户/任务的声明是永久的 —— 也就是"释放全靠调用点记得调 release_walk"。
+那次永久锁死的教训已经说明这条不成立。现在：
+
+| 谁 | TTL | 谁续期 |
+|---|---|---|
+| 反射 | 必须显式传（FLEE_TTL / STOP_TTL） | 反射自己 touch_walk —— 它有自己的"作用时间"纪律 |
+| 用户 | USER_TTL | renew_active()：身体报告还在动就自动续 |
+| 任务 | TASK_TTL | renew_active() + 任务自己的 checkpoint |
+
+续期的证据是身体的可观测状态，不是调用方的心情（renew_active 的注释里有理由）。
+显式 release_walk 仍然是立刻生效 —— 不照 Numen 的"release 只是不再续命"，
+那会让"停"慢一个 TTL 才停。
+
+被抢占挂起的声明冻结 TTL：被压在下面的那条不该因为别人跑得久而到期消失
+（"挂起不是取消"，用户 2026-10-09 拍板过）。
 """
 
 from __future__ import annotations
@@ -72,18 +90,31 @@ LEVEL_TASK = 20      # 正在跑的多步任务
 
 _LEVEL_CN = {LEVEL_REFLEX: "反射", LEVEL_USER: "用户", LEVEL_TASK: "任务"}
 
+# 用户 / 任务的默认 TTL（秒）。它们不靠调用点释放，靠"身体还在动就续期"。
+#
+# 为什么是 60：它要盖住"身体暂时没在动"的正常空档（Baritone 中途歇一下、
+# 任务在等熔炉），又不能长到让一把真正的死锁赖着不走。
+USER_TTL = 60.0
+TASK_TTL = 60.0
+
+# 身体"确实在干活"的二值信号（客户端上报的 status，见 bridge/client/mcbridge.js）。
+# following-idle 也算 —— 跟随时目标就在旁边，Baritone 不走路，但那正是在跟随。
+ACTIVE_STATUSES = frozenset({"moving", "following-idle"})
+
 
 class _Claim:
-    __slots__ = ("level", "owner", "cmd", "note", "expire_at", "token")
+    __slots__ = ("level", "owner", "cmd", "note", "expire_at", "ttl", "token")
 
     def __init__(self, level: int, owner: str, cmd: str | None, note: str,
-                 expire_at: float | None = None) -> None:
+                 expire_at: float | None = None, ttl: float | None = None) -> None:
         self.level = level
         self.owner = owner
         self.cmd = cmd
         self.note = note
-        # TTL 到点的单调时钟时刻；None = 永不过期（用户/任务的声明就该这样）
+        # TTL 到点的单调时钟时刻；None = 永不过期
         self.expire_at = expire_at
+        # 这条声明的 TTL 本身 —— renew_active 靠它算续期后的新到期时刻
+        self.ttl = ttl
         self.token = ""
 
 
@@ -97,6 +128,8 @@ class Arbiter:
         # 现在实际下发的是哪条命令（去重用 —— 别重复下同一条）
         self._walk_applied: str | None = None
         self._walk_applied_claim: _Claim | None = None
+        # renew_active 的时钟 —— 用来算"被挂起的声明冻结了多久"
+        self._ttl_clock = time.monotonic()
         # 上一次下发的错误。注意： 工具层要拿它回话给白 ——
         # 仲裁把异常吞了，要是连错误都不留，白会以为"发出去了"。
         self.last_error: str | None = None
@@ -111,16 +144,27 @@ class Arbiter:
         它顶掉任务的 goto 并停下，但不删除任务的声明，
         所以脱战之后任务的路线会自己恢复。
 
-        ⭐ ttl（秒）—— 到期自动让位，不 refresh 就消失。见 expire_stale。
+        重点： ttl（秒）—— 到期自动让位，不 refresh 就消失。见 expire_stale / renew_active。
 
-        | 谁 | 要不要 ttl |
+        | 谁 | ttl |
         |---|---|
-        | 反射（保命） | 已完成： 要 —— 用户 2026-10-10："反射肯定有作用时间，加个限制不至于无限触发" |
-        | 用户 / 任务 | 不成立或禁止： 不要 —— 那是"我要走这条"，该一直有效到显式释放 |
+        | 反射（保命） | 必须显式传（FLEE_TTL / STOP_TTL）—— "反射肯定有作用时间，加个限制不至于无限触发" |
+        | 用户 | 不传就用 USER_TTL，由 renew_active 按身体状态续期 |
+        | 任务 | 不传就用 TASK_TTL，同上 + 任务自己的 checkpoint 也会续 |
+
+        注意： 反射不传 ttl 会抛异常，不给默认值 —— 静默兜一个默认值就是
+        "看着有、实际没有"（反射的作用时间是设计出来的，不该被一个默认值顶掉）。
         """
-        expire_at = (time.monotonic() + float(ttl)) if ttl else None
+        if ttl is None:
+            if level <= LEVEL_REFLEX:
+                raise ValueError(
+                    "反射级的 walk 声明必须显式带 ttl（FLEE_TTL / STOP_TTL）—— "
+                    "见 mcb/arbiter.py 的模块注释"
+                )
+            ttl = USER_TTL if level <= LEVEL_USER else TASK_TTL
+        expire_at = time.monotonic() + float(ttl)
         self._walk = [c for c in self._walk if c.owner != owner]
-        self._walk.append(_Claim(level, owner, cmd, note, expire_at))
+        self._walk.append(_Claim(level, owner, cmd, note, expire_at, float(ttl)))
         # 稳定排序：小的在前，同级按插入顺序（list 顺序天然是插入序）
         self._walk.sort(key=lambda c: c.level)
         await self._sync_walk("claim:" + owner)
@@ -131,7 +175,7 @@ class Arbiter:
         给"还在逃、但不想每 tick 重算一遍逃跑目标"的反射用：
         _retreat() 算一次方向要查主人坐标 + 随机抖动，每 tick 重算既浪费又抖。
 
-        注意：注意： 只续"有路线"的声明，绝不续"停"（cmd is None 那种）。
+        注意： 只续"有路线"的声明，绝不续"停"（cmd is None 那种）。
         不然会出一个很阴的僵局：她正在逃  ->  "卡住"判定插进来把声明换成"停"  -> 
         下一 tick 这里又把那条"停"续了命  ->  她就永远站在那儿不动了。
         "停"天生就该是短命的（STOP_TTL）。
@@ -151,6 +195,40 @@ class Arbiter:
         而不是傻乎乎地继续续命。
         """
         return any(c.owner == owner and c.cmd is not None for c in self._walk)
+
+    async def renew_active(self, status: str | None) -> None:
+        """按身体的可观测状态给用户/任务的声明续期。反射主循环每 tick 调一次。
+
+        续期的证据是身体，不是调用方的心情（第 2 批 2.5）：
+
+            status 是 moving / following-idle  ->  栈顶那条真的在跑  ->  续它的命
+            status 是 idle / unknown          ->  栈顶没在干活      ->  让它自然到点
+
+        这条把"释放"从调用点上摘下来了：谁忘了 release 都不会永久锁死通道 ——
+        身体一停，TTL 一到，声明自己让位。这正是 docs\\16 §2.2.1 那个永久锁死 bug
+        的根治（原来只有反射有 TTL）。
+
+        两条不许动的规矩：
+        · 反射的声明不在这里续 —— 它有自己的 touch_walk 和"作用时间"纪律，
+          在这里续的话逃跑就永远不会结束了（FLEE_TTL 形同虚设）。
+        · 被抢占挂起的声明冻结 TTL —— 它在栈里的位置不是 0，说明是别人在跑。
+          把流逝的时间补回它的到期时刻，等于"你被压着的时候不算你的时间"，
+          对上"挂起不是取消"（用户 2026-10-09 拍板）。
+        """
+        now = time.monotonic()
+        dt = now - self._ttl_clock
+        self._ttl_clock = now
+        if dt < 0:                       # 单调钟不该倒退，防一手
+            dt = 0.0
+        active = str(status or "") in ACTIVE_STATUSES
+        for i, c in enumerate(self._walk):
+            if c.expire_at is None or c.level < LEVEL_USER:
+                continue
+            if i == 0:
+                if active and c.cmd is not None:
+                    c.expire_at = now + (c.ttl or USER_TTL)
+            else:
+                c.expire_at += dt        # 挂起中：冻结
 
     async def expire_stale(self) -> list[str]:
         """丢掉 TTL 到点的声明，返回被丢掉的 owner。

@@ -110,23 +110,105 @@ ROLE_SLOTS = {
 }
 
 
+def _from_roles(roles: str) -> dict:
+    """从客户端上行来的每格角色串推布局（第 3 批 3.2）。
+
+    角色是客户端按槽位对象的类型判的（见 bridge/client/mcbridge.js 的 mcbSlotRole）：
+    R 产物 · G 合成输入 · Y 她自己的背包 · O 只能拿不能放 · C 别的容器格 · ? 认不出。
+
+    能推出来的：
+      grid / result —— R 和 G 直接就是格号，所以任何模组的"合成式"界面都自动认，
+                       不用再加 CONTAINERS 里的表行
+      inv_base / hot_base —— 找最长的连续 Y 段（她的背包）。注意不能拿"第一个 Y"：
+                       默认界面里 5~8 是护甲格，它们也算 Y，第一个 Y 是 5 不是 9。
+                       背包段是 27 格主背包 + 9 格快捷栏，所以 hot_base = inv_base + 27。
+    推不出来的：熔炉那种"输入格 / 燃料格"—— 两者在类型上都是普通容器格，分不开，
+    所以那一半仍靠 CONTAINERS 表。这是承认的边界，别硬凑。
+    """
+    out: dict = {}
+    grid = [i for i, r in enumerate(roles) if r == "G"]
+    marked = [i for i, r in enumerate(roles) if r == "R"]
+    if grid:
+        out["grid"] = grid
+        out["stride"] = 3 if len(grid) == 9 else 2
+        out["result"] = marked[0] if marked else None
+    else:
+        # 没有合成格：产物格靠"只能拿不能放"认。只有一个才敢认，多了宁可不猜。
+        outputs = [i for i, r in enumerate(roles) if r == "O"]
+        if marked:
+            out["result"] = marked[0]
+        elif len(outputs) == 1:
+            out["result"] = outputs[0]
+    # 最长的连续 Y 段 = 她的背包那一片
+    best_start, best_len = None, 0
+    run_start, run_len = None, 0
+    for i, r in enumerate(roles):
+        if r == "Y":
+            if run_start is None:
+                run_start = i
+            run_len += 1
+            if run_len > best_len:
+                best_start, best_len = run_start, run_len
+        else:
+            run_start, run_len = None, 0
+    if best_len >= 36:
+        # 注意： 取这一段的**最后 36 格**，不是从段首开始。
+        #    默认界面里 5~8 是护甲格、它们也算 Y 而且和背包连着，
+        #    于是最长那一段是 40 格（实测就这么被测试抓出来的）。
+        #    玩家背包固定是"27 格主背包 + 9 格快捷栏"，快捷栏永远在最后 ——
+        #    所以从段尾往回数才是对的。
+        inv_base = best_start + best_len - 36
+        out["inv_base"] = inv_base
+        out["hot_base"] = inv_base + 27
+    return out
+
+
 def layout_for(menu: dict | None) -> dict | None:
     """从 mcb state 的 task.menu 里认出这是哪种容器，返回它的布局。认不出返回 None。
 
-    注意： 只看类型名。曾经按"是不是默认界面"来判，结果把开着的箱子当成了工作台，
-    点了一堆箱子格子（docs/04 坑 10n）。
+    两条来源，合起来用：
+      1 CONTAINERS 表 —— 按界面类型名查（有输入格/燃料格这类只有表才知道的信息）
+      2 客户端的每格角色串 —— 按槽位类型推（合成格、产物格、背包区，任何模组都认）
+
+    第 2 条是第 3 批 3.2 加的。加它之前，没进表的容器一律返回 None（模组机器界面
+    整个用不了），进过表的也得一个模组一个模组加行。现在只要那个界面是
+    服务端同步的 AbstractContainerMenu，角色串就能推出来。
+
+    注意： 表命中不了、角色串也推不出东西时仍然返回 None —— 那就是真的认不出来，
+    别返回一个空壳让上层以为能用。
     """
     if not isinstance(menu, dict):
         return None
     cls = str(menu.get("cls") or "")
+    roles = str(menu.get("roles") or "")
+    base = None
     for key, spec in CONTAINERS.items():
         if key in cls:
-            out = dict(spec)
-            out["cls"] = cls
-            out["slots"] = menu.get("slots")
-            out["id"] = menu.get("id")
-            return out
-    return None
+            base = dict(spec)
+            break
+    derived = _from_roles(roles) if roles else {}
+    if base is None and not derived:
+        return None
+    out = base if base is not None else {"name": "未登记容器", "result": None}
+    out["cls"] = cls
+    out["slots"] = menu.get("slots")
+    out["id"] = menu.get("id")
+    # 角色串推出来的优先：它认的是槽位本身，比按类型名查表更贴近事实。
+    #
+    # 注意： 形状要跟着表走，不能一律盖成整数 ——
+    #    合成类容器的 result 是**整数**（craft.py 用 int(layout["result"])），
+    #    加工类的是**列表**（smelt.py 用 int(layout["result"][0])）。
+    #    推出来的永远是单个格号，碰上表里是列表的要包成列表，
+    #    否则冶炼会 TypeError（这条是自查时发现的，不是等踩了才知道）。
+    for k, v in derived.items():
+        if k == "result":
+            old = out.get("result")
+            if isinstance(old, list) and not isinstance(v, list):
+                v = [v] if v is not None else None
+        out[k] = v
+    if roles:
+        out["roles"] = roles
+    return out
 
 
 def is_default(menu: dict | None) -> bool:
@@ -298,6 +380,10 @@ async def wear(io: ContainerIO, item_id: str, where: str = "hand") -> str | None
             return None
         # SWAP 的 button 就是目标快捷栏格号
         await io.click(slot, idx, MODE_SWAP)
+        # 第 3 批 3.3：搬完告诉客户端"维持手上是这个"。
+        # 不给这一句的话，插件以为手上是它、实际随时可能被别的东西改掉 ——
+        # 那种错从日志上很难看出来（表现是"她明明该拿镐子却在用火把"）。
+        await io.send(f"mcb hotbar {idx}")
         return None
 
     if w in ("backpack", "bag", "main", "stow", "inventory"):
@@ -334,6 +420,8 @@ async def wear(io: ContainerIO, item_id: str, where: str = "hand") -> str | None
             hot_index = i
             break
     if w == "hand" and hot_index is not None:
+        # 第 3 批 3.3：手上拿什么变成槽 —— 告诉客户端"维持这一格"。
+        # 不维持的话，"手上是它"只在发命令那一瞬间成立，之后随时会被改掉。
         await io.send(f"mcb hotbar {hot_index}")
         return None
 

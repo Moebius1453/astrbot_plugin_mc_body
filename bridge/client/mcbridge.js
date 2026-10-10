@@ -50,6 +50,11 @@ const MCB_IDLE_STEP_PITCH = 3
 const MCB_IDLE_NEAR_PLAYER = 8      // 这么近有人  ->  有机会看他
 const MCB_IDLE_LOOK_AT_PLAYER = 0.6 // 每次抽签"看人"的概率（1.0 = 一直盯着，那又成石像了）
 
+// 持续注视（aim 槽）最长保持多久 —— 2 分钟。
+// 理由见 mcbLookClaim 里那段：调用方忘了 releaseAim 时，她不该永远僵着。
+// 20 tick/秒 × 120 秒。到点自动放手，交给空闲扫视 / Baritone。
+const MCB_AIM_MAX_HOLD_TICKS = 2400
+
 let $BaritoneAPI = null
 try {
   $BaritoneAPI = Java.loadClass('baritone.api.BaritoneAPI')
@@ -120,7 +125,12 @@ var mcbSlots = {
     nextAt: 0                // 下次换目标的 tick
   },
   // 「按住使用」槽。一直是对象，ticks > 0 表示使用键正被我们按着
-  use: { ticks: 0, sawUsing: false }
+  use: { ticks: 0, sawUsing: false },
+  // 手上拿什么槽（第 3 批 3.3）。want = null 表示没人管，就随她去。
+  //   want = { slot: 0-8 }        —— 维持选中那一格
+  //   want = { item: '注册名' }   —— 在快捷栏里找它，找到就选它（找不到不动）
+  // 只管维持，不搬东西 —— 搬是插件侧 containers.wear 的事，见 mcbSlotHotbar 的注释。
+  hotbar: { want: null }
 }
 
 // ---- 朝向：挑"现在该由谁说话" ---------------------------------------------
@@ -135,7 +145,20 @@ function mcbLookClaim() {
     if ($mcbTick < mcbSlots.temp.until) return mcbSlots.temp
     mcbSlots.temp = null
   }
-  if (mcbSlots.aim !== null) return mcbSlots.aim
+  if (mcbSlots.aim !== null) {
+    // 最长保持（第 2 批 2.5）—— 和 temp 一样到期自动放手，只是长得多。
+    //
+    // 为什么要有：aim 原来是"要显式 releaseAim 才松"。模型要是调了 mc_aim 之后
+    // 忘了调 mc_aim(release=true)，她就永远僵在最后那个朝向上 ——
+    // 实测踩过：2026-10-11 用 RCON 手发了几次 aimAt，她 yaw=0 / pitch=-65.1
+    // 八秒纹丝不动，看着像"空闲扫视的代码没了"，其实是 aim 槽被占着没松。
+    //
+    // 这和 arbiter 那条"卡住 = 一次性永久锁死"是同一个病：
+    // 释放依赖调用点。到期自己松手才是根治。
+    if ($mcbTick < mcbSlots.aim.until) return mcbSlots.aim
+    mcbSlots.aim = null
+    console.info('[mcbridge] 持续注视到最长保持时间，自动松开（调用方没 releaseAim）')
+  }
   if (mcbSlots.idle.on) return mcbIdleClaim()
   return null
 }
@@ -275,6 +298,183 @@ function mcbLookTemp(claim) {
 
 function mcbLookTempAt(x, y, z, pitchMax) {
   mcbLookTemp({ mode: 'point', x: x, y: y, z: z, pitchMax: pitchMax })
+}
+
+// 上一次 useOnAt 对着哪一格右键 —— clickSlot 靠它转头（第 3 批 3.5）。
+// 开着箱子点格子时她原本是背对着的，看着不像在用那个箱子。
+var mcbLastUsePos = null
+
+// 给一格方块挑"手该点在哪一点"—— 抄 Numen Look.point 的三档候选（第 3 批 3.1）。
+//
+// 为什么不能写死上表面：隐藏方块（台阶、雪、耕地）、只能从侧面用的方块、
+// 形状不规则的模组方块，拿"上表面中心"去点会放错面或者直接失败。
+//
+// 三档，取第一个"看得见且够得着"的：
+//   1 轮廓中心 —— 整块轮廓盒的中心（大多数方块第一档就成了）
+//   2 各面中心 —— 朝向她的那几个面的中心
+//   3 面上离眼最近点 —— 把眼睛投影到那个面上
+//
+// 返回 { point: Vec3, face: Direction, via: 哪一档, blocked: 挡住它的方块还是 null }。
+// 全都不行时退回"上表面中心" —— 保持老行为，不让它比以前更差。
+function mcbPickHit(mc, bp, state) {
+  var $V3 = null, $DIR = null
+  try {
+    $V3 = Java.loadClass('net.minecraft.world.phys.Vec3')
+    $DIR = Java.loadClass('net.minecraft.core.Direction')
+  } catch (e0) {
+    return { point: null, face: null, via: 'unavailable', blocked: null }
+  }
+  var fallback = {
+    point: $V3.atCenterOf(bp), face: $DIR.UP, via: 'fallback-top', blocked: null
+  }
+  if ($V3 === null || $DIR === null) return fallback
+
+  var p = mc.player
+  var ex = Number(p.x), ey = Number(p.y) + Number(p.eyeHeight), ez = Number(p.z)
+  var reach = 4.5
+  try { reach = Number(p.blockInteractionRange) } catch (eR) { }
+
+  // 方块的轮廓盒；读不到就按整格算
+  var minX = bp.getX(), minY = bp.getY(), minZ = bp.getZ()
+  var maxX = minX + 1, maxY = minY + 1, maxZ = minZ + 1
+  try {
+    var shape = state.getShape(mc.level, bp)
+    var bb = shape.bounds()
+    if (bb !== null && bb !== undefined) {
+      minX = Number(bb.minX); minY = Number(bb.minY); minZ = Number(bb.minZ)
+      maxX = Number(bb.maxX); maxY = Number(bb.maxY); maxZ = Number(bb.maxZ)
+    }
+  } catch (eShape) { }
+
+  var cxm = (minX + maxX) / 2, cym = (minY + maxY) / 2, czm = (minZ + maxZ) / 2
+
+  // 面按"朝不朝她"排：朝她的先试
+  var faces = []
+  try {
+    var all = [$DIR.UP, $DIR.DOWN, $DIR.NORTH, $DIR.SOUTH, $DIR.EAST, $DIR.WEST]
+    for (var i = 0; i < all.length; i++) faces.push(all[i])
+  } catch (eD) { faces = [] }
+  var dx = ex - cxm, dy = ey - cym, dz = ez - czm
+  faces.sort(function (a, b) {
+    function score(d) {
+      var n = d.getNormal()
+      return -(Number(n.x) * dx + Number(n.y) * dy + Number(n.z) * dz)
+    }
+    return score(a) - score(b)
+  })
+
+  function ok(pt) {
+    var ddx = pt.x - ex, ddy = pt.y - ey, ddz = pt.z - ez
+    if (Math.sqrt(ddx * ddx + ddy * ddy + ddz * ddz) > reach) return false
+    return mcbVisible(mc, ex, ey, ez, pt, bp)
+  }
+
+  // 1 轮廓中心
+  var cand = $V3.atCenterOf(bp)
+  try { cand = new $V3(cxm, cym, czm) } catch (eC) { }
+  if (ok(cand)) return { point: cand, face: $DIR.UP, via: 'outline-center', blocked: null }
+
+  // 2 各面中心 / 3 面上离眼最近点
+  for (var k = 0; k < faces.length; k++) {
+    var f = faces[k]
+    var fc = mcbFacePoint(f, minX, minY, minZ, maxX, maxY, maxZ, 0.5)
+    if (ok(fc)) return { point: fc, face: f, via: 'face-center', blocked: null }
+    var fp = mcbFacePoint(f, minX, minY, minZ, maxX, maxY, maxZ, null, ex, ey, ez)
+    if (ok(fp)) return { point: fp, face: f, via: 'face-nearest', blocked: null }
+  }
+  return fallback
+}
+
+// 取一个面上的点。ratio 给了就是"按比例取中心"（0.5 = 正中心）；
+// 给 null 时把眼睛投影上去，取面上离眼最近的那一点。
+function mcbFacePoint(face, minX, minY, minZ, maxX, maxY, maxZ, ratio, ex, ey, ez) {
+  var $V3 = Java.loadClass('net.minecraft.world.phys.Vec3')
+  function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v) }
+  function axis(d) {
+    var n = d.getNormal()
+    if (Number(n.x) > 0) return 'east'
+    if (Number(n.x) < 0) return 'west'
+    if (Number(n.y) > 0) return 'up'
+    if (Number(n.y) < 0) return 'down'
+    if (Number(n.z) > 0) return 'south'
+    return 'north'
+  }
+  var a = axis(face)
+  var x, y, z
+  if (a === 'east') { x = maxX; y = ratio === null ? clamp(ey, minY, maxY) : (minY + maxY) / 2; z = ratio === null ? clamp(ez, minZ, maxZ) : (minZ + maxZ) / 2 }
+  else if (a === 'west') { x = minX; y = ratio === null ? clamp(ey, minY, maxY) : (minY + maxY) / 2; z = ratio === null ? clamp(ez, minZ, maxZ) : (minZ + maxZ) / 2 }
+  else if (a === 'up') { y = maxY; x = ratio === null ? clamp(ex, minX, maxX) : (minX + maxX) / 2; z = ratio === null ? clamp(ez, minZ, maxZ) : (minZ + maxZ) / 2 }
+  else if (a === 'down') { y = minY; x = ratio === null ? clamp(ex, minX, maxX) : (minX + maxX) / 2; z = ratio === null ? clamp(ez, minZ, maxZ) : (minZ + maxZ) / 2 }
+  else if (a === 'south') { z = maxZ; x = ratio === null ? clamp(ex, minX, maxX) : (minX + maxX) / 2; y = ratio === null ? clamp(ey, minY, maxY) : (minY + maxY) / 2 }
+  else { z = minZ; x = ratio === null ? clamp(ex, minX, maxX) : (minX + maxX) / 2; y = ratio === null ? clamp(ey, minY, maxY) : (minY + maxY) / 2 }
+  return new $V3(x, y, z)
+}
+
+// 一格的"角色"，一个字母 —— 第 3 批 3.2。整表发（空槽也发），
+// 否则判不出"哪一格是空的输入格"，摆料就没法做。
+//
+// 判据全部按槽位对象的类型推，不按界面类名（抄 Numen GuiOps.window）：
+//   Y 她自己的背包格 —— container 是 net.minecraft.world.entity.player.Inventory
+//   R 产物格         —— ResultSlot
+//   G 合成输入格     —— container 是 CraftingContainer
+//   O 只能拿不能放   —— mayPlace 回 false（模组机器的产出格吃这一条）
+//   C 别的容器格
+// 顺序要紧：产物格既是 ResultSlot 又在 CraftingContainer 里，先判 R。
+// 认不出来的给 ?，调用方按"不知道"处理，别猜。
+var mcbRoleClasses = null
+
+function mcbSlotRole(sl, player) {
+  if (sl === null || sl === undefined) return '?'
+  if (mcbRoleClasses === null) {
+    var c = { ok: false }
+    try {
+      c.ResultSlot = Java.loadClass('net.minecraft.world.inventory.ResultSlot')
+      c.Crafting = Java.loadClass('net.minecraft.world.inventory.CraftingContainer')
+      c.Inventory = Java.loadClass('net.minecraft.world.entity.player.Inventory')
+      c.Stack = Java.loadClass('net.minecraft.world.item.ItemStack')
+      c.ok = true
+    } catch (eLoad) { c.ok = false }
+    mcbRoleClasses = c
+  }
+  var C = mcbRoleClasses
+  if (!C.ok) return '?'
+  try {
+    if (sl instanceof C.ResultSlot) return 'R'
+    var cont = null
+    try { cont = sl.container } catch (e1) { try { cont = sl.getContainer() } catch (e2) { cont = null } }
+    if (cont !== null && cont !== undefined) {
+      if (cont instanceof C.Inventory) return 'Y'
+      if (cont instanceof C.Crafting) return 'G'
+    }
+    var canPlace = true
+    try { canPlace = !!sl.mayPlace(C.Stack.EMPTY) } catch (e3) { canPlace = true }
+    if (!canPlace) return 'O'
+    return 'C'
+  } catch (e4) {
+    return '?'
+  }
+}
+
+// 从眼睛到这一点之间有没有别的方块挡着。读不到判定就说"看得见"（老行为，不更差）。
+function mcbVisible(mc, ex, ey, ez, pt, bp) {
+  try {
+    var $V3 = Java.loadClass('net.minecraft.world.phys.Vec3')
+    var $CC = Java.loadClass('net.minecraft.world.phys.ClipContext')
+    var $Blk = Java.loadClass('net.minecraft.world.level.ClipContext$Block')
+    var $Flu = Java.loadClass('net.minecraft.world.level.ClipContext$Fluid')
+    var from = new $V3(ex, ey, ez)
+    var ctx = new $CC(from, pt, $Blk.OUTLINE, $Flu.NONE, mc.player)
+    var res = mc.level.clip(ctx)
+    if (res === null || res === undefined) return true
+    var hitPos = null
+    try { hitPos = res.getBlockPos() } catch (eP) { try { hitPos = res.blockPos } catch (eP2) { } }
+    if (hitPos === null || hitPos === undefined) return true        // MISS：路上没东西
+    return (Number(hitPos.getX()) === Number(bp.getX())
+         && Number(hitPos.getY()) === Number(bp.getY())
+         && Number(hitPos.getZ()) === Number(bp.getZ()))
+  } catch (eV) {
+    return true
+  }
 }
 
 // 把当前朝向算一遍并推出去一次（给"设完立刻生效"的调用方用）。
@@ -572,9 +772,22 @@ function mcbSnapshot() {
         //    （不能调 .getClass() —— Rhino 禁；String(menu) 走 toString 就够）
         var mcls = null
         try { mcls = String(menu) } catch (eCls) { mcls = null }
+        // 第 3 批 3.2：每一格的"角色"标记。一格一个字母，整表发（空槽也发）——
+        //    判不出"哪一格是空的输入格"就没法摆料。
+        //    有一条规则是按槽位对象的类型推的，不按界面类名 —— 所以任何模组的
+        //    机器界面都能自动认，加新容器不用再加表行。
+        var mroles = ''
+        try {
+          var rbuf = []
+          for (var ri = 0; ri < mSlots; ri++) {
+            rbuf.push(mcbSlotRole(menu.slots.get(ri), mc.player))
+          }
+          mroles = rbuf.join('')
+        } catch (eRole) { mroles = '' }
         // 注意： 故意序列化成 JSON 字符串再上行：CompoundTag 里套 list 再套 compound，
         //    服务端那边要靠 getList/getCompound 一层层扒，容易错。一串 JSON 最省事。
-        snap.menu = JSON.stringify({ id: mId, slots: mSlots, def: isDefault, cls: mcls, items: cells })
+        snap.menu = JSON.stringify({ id: mId, slots: mSlots, def: isDefault, cls: mcls,
+                                     items: cells, roles: mroles })
       }
     }
   } catch (eMenu) { }
@@ -751,12 +964,36 @@ function mcbHandle(action, arg) {
 
   if (action === 'hotbar') {
     // 切换快捷栏槽位（0-8）。吃东西/放方块前要先换到手的东西。
+    //
+    // 第 3 批 3.3：从这里开始它也进"手上拿什么"槽 —— 不再是一次性命令，
+    // 而是每 tick 维持住，直到被 releaseHotbar 撤掉或被下一条顶掉。
     var mcH = mcbMc()
     if (mcH === null || mcH.player === null) { console.error('[mcbridge] hotbar: 没进世界'); return }
     var slot = parseInt(arg, 10)
     if (isNaN(slot) || slot < 0 || slot > 8) { console.error('[mcbridge] hotbar 槽位非法: ' + arg); return }
-    mcH.player.inventory.selected = slot
-    console.info('[mcbridge] 快捷栏 -> ' + slot)
+    mcbSlots.hotbar.want = { slot: slot }
+    try { mcH.player.inventory.selected = slot } catch (eH2) { }
+    console.info('[mcbridge] 快捷栏 -> ' + slot + '（已进 hotbar 槽，会维持）')
+    return
+  }
+
+  if (action === 'hotbarItem') {
+    // 让"手上是某个东西"变成一个持续维持的性质：在快捷栏里找它，找到就选它。
+    // 找不到就什么都不做 —— 搬东西是插件侧的事（containers.wear），
+    // 客户端每 tick 去点格子太吵，还会搅乱正在跑的界面操作。
+    var mcHI = mcbMc()
+    if (mcHI === null || mcHI.player === null) { console.error('[mcbridge] hotbarItem: 没进世界'); return }
+    var wantId = String(arg || '').trim()
+    if (!wantId) { console.error('[mcbridge] hotbarItem: 没给物品注册名'); return }
+    mcbSlots.hotbar.want = { item: wantId }
+    console.info('[mcbridge] hotbar 槽 -> 要手上是 ' + wantId + '（找不到就不动，等插件侧搬）')
+    return
+  }
+
+  if (action === 'releaseHotbar') {
+    // 松手：不再管她手上是什么，随她自己 / 随别的动作。
+    mcbSlots.hotbar.want = null
+    console.info('[mcbridge] hotbar 槽已松开')
     return
   }
 
@@ -904,17 +1141,89 @@ function mcbHandle(action, arg) {
       var $BHR = Java.loadClass('net.minecraft.world.phys.BlockHitResult')
       var $DIR = Java.loadClass('net.minecraft.core.Direction')
       var tbp = new $BP(qx, qy, qz)
-      var thit = new $BHR($V3.atCenterOf(tbp), $DIR.UP, tbp, false)
+      var tstate = null
+      try { tstate = mcX.level.getBlockState(tbp) } catch (eSt) { tstate = null }
+      // 第 3 批 3.1：三档候选挑"点哪一点"（抄 Numen Look.point），
+      // 不再写死上表面 —— 写死的话隐藏方块、侧面放置、形状不规则的方块会放错面或失败。
+      var pick = mcbPickHit(mcX, tbp, tstate)
+      var thit = new $BHR(pick.point, pick.face, tbp, false)
       // 先转向它（让人看着自然，也让服务端的视线校验好过）
       // ⭐ 走 temp 槽（带 TTL）—— 不再裸 setXRot 留下残值。
       //    实测过的病：瞄准脚边的方块 = pitch 80°，用完不还原  ->  低头低到天荒地老。
       //    MCB_LOOK_PITCH_MAX 再把角度夹住（人不会为看脚边的方块把脖子折成 90°）。
-      mcbLookTempAt(qx + 0.5, qy + 0.5, qz + 0.5, MCB_LOOK_PITCH_MAX)
+      mcbLookTempAt(pick.point.x, pick.point.y, pick.point.z, MCB_LOOK_PITCH_MAX)
+      mcbLastUsePos = { x: qx, y: qy, z: qz }      // clickSlot 要用它转头（3.5）
       mcX.gameMode.useItemOn(mcX.player, $Hand.MAIN_HAND, thit)
-      console.info('[mcbridge] 已 useItemOn -> (' + qx + ',' + qy + ',' + qz + ')')
+      console.info('[mcbridge] 已 useItemOn -> (' + qx + ',' + qy + ',' + qz + ')'
+        + ' 面=' + pick.face + ' 取点=' + pick.via + ' 遮挡=' + (pick.blocked === null ? '不知道' : pick.blocked))
     } catch (eU) {
       console.error('[mcbridge] useOnAt 失败: ' + eU)
     }
+    return
+  }
+
+  if (action === 'recipebook') {
+    // 只读探针 —— 第 3 批 3.4 的前置核实，不是实现。
+    //
+    // 为什么要先探：配方书一键摆料（handlePlaceRecipe）要求服务端认得这个配方、
+    // 而且客户端的配方书里真有它。服务端的 NBT 查出来是空的
+    // （data get entity Nanako recipeBook 回 {}），但那个空到底是
+    // "她真的没解锁任何配方"还是"这条 NBT 不暴露"，从服务端看不出来。
+    // 所以到客户端问一次：配方书里到底有多少条、能不能查到某个物品。
+    // 结果只写客户端日志（launch.log）—— 那是我们既有的取证通道，
+    // 不占上行协议的位置。
+    //
+    // 用法：mcb recipebook [物品注册名]
+    var mcRB = mcbMc()
+    if (mcRB === null || mcRB.player === null) { console.error('[mcbridge] recipebook: 没进世界'); return }
+    var rbWant = String(arg || '').trim()
+    var rbOut = { want: rbWant || null, err: [], via: [] }
+    var rb = null
+    try { rb = mcRB.player.getRecipeBook() } catch (eRB1) { rbOut.err.push('getRecipeBook: ' + eRB1) }
+    if (rb === null || rb === undefined) {
+      console.info('[mcbridge] RECIPEBOOK ' + JSON.stringify(rbOut))
+      return
+    }
+    var cols = null
+    try { cols = rb.getCollections(); rbOut.via.push('getCollections') } catch (eRB2) { rbOut.err.push('getCollections: ' + eRB2) }
+    try {
+      if (cols !== null && cols !== undefined) {
+        var nCols = Number(cols.size())
+        rbOut.collections = nCols
+        var total = 0
+        var found = 0
+        var iter = cols.iterator()
+        while (iter.hasNext()) {
+          var col = iter.next()
+          var recs = null
+          try { recs = col.getRecipes() } catch (eR3) { continue }
+          if (recs === null || recs === undefined) continue
+          var n = Number(recs.size())
+          total += n
+          if (rbWant && !found) {
+            var it2 = recs.iterator()
+            while (it2.hasNext()) {
+              var entry = it2.next()
+              var idtxt = ''
+              try { idtxt = String(entry.id()) } catch (eId) { }
+              try {
+                var res = entry.recipe().value().getResultItem(null)
+                if (res !== null && res !== undefined && !res.isEmpty()) {
+                  rbOut.sampleResult = String(res.getItem())
+                }
+              } catch (eRes) { }
+              if (idtxt.indexOf(rbWant) >= 0) { found++; break }
+            }
+          }
+        }
+        rbOut.entries = total
+        rbOut.matched = found
+      }
+    } catch (eWalk) { rbOut.err.push('walk: ' + eWalk) }
+    // 顺便看一眼两个 API 在不在（实现要用它们）
+    try { rbOut.hasPlaceRecipe = (typeof mcRB.gameMode.handlePlaceRecipe === 'function') } catch (ePR) { rbOut.err.push('handlePlaceRecipe: ' + ePR) }
+    try { rbOut.hasContains = (typeof rb.contains === 'function') } catch (eCt) { }
+    console.info('[mcbridge] RECIPEBOOK ' + JSON.stringify(rbOut))
     return
   }
 
@@ -1103,7 +1412,8 @@ function mcbHandle(action, arg) {
     var aiPitch = aiParts.length > 1 ? Number(aiParts[1]) : 0
     if (isNaN(aiYaw) || isNaN(aiPitch)) { console.error('[mcbridge] aim 参数非法: ' + arg); return }
     mcbTuneBaritone()
-    mcbSlots.aim = { mode: 'angle', yaw: aiYaw, pitch: aiPitch }
+    mcbSlots.aim = { mode: 'angle', yaw: aiYaw, pitch: aiPitch,
+                     until: $mcbTick + MCB_AIM_MAX_HOLD_TICKS }
     mcbSetAntiCheat(false)     //  <-  瞄准期间：让 Baritone 别管朝向
     mcbAimApply()          // 立刻来一发，别等下一个 tick
     console.info('[mcbridge] aim -> yaw=' + aiYaw + ' pitch=' + aiPitch + '（每 tick 保持）')
@@ -1120,7 +1430,8 @@ function mcbHandle(action, arg) {
     var atx = Number(atParts[0]), aty = Number(atParts[1]), atz = Number(atParts[2])
     if (isNaN(atx) || isNaN(aty) || isNaN(atz)) { console.error('[mcbridge] aimAt 参数非法: ' + arg); return }
     mcbTuneBaritone()
-    mcbSlots.aim = { mode: 'point', x: atx, y: aty, z: atz }
+    mcbSlots.aim = { mode: 'point', x: atx, y: aty, z: atz,
+                     until: $mcbTick + MCB_AIM_MAX_HOLD_TICKS }
     mcbSetAntiCheat(false)     //  <-  瞄准期间：让 Baritone 别管朝向
     mcbAimApply()
     console.info('[mcbridge] aimAt (' + atx + ',' + aty + ',' + atz + ')（每 tick 重算，保持）')
@@ -1180,6 +1491,14 @@ function mcbHandle(action, arg) {
     if (cSlot < 0 || (nSlots >= 0 && cSlot >= nSlots)) {
       console.error('[mcbridge] clickSlot: 格子号 ' + cSlot + ' 越界（当前界面只有 ' + nSlots + ' 格）')
       return
+    }
+
+    // 第 3 批 3.5：点格子之前先转过去看着那个容器。
+    // 原来开着箱子点格子时她是背对着的 —— 格子点对了，但看着不像在用它。
+    // 位置用上一次 useOnAt 的那一格（开容器必然先经过它）；拿不到就不转。
+    if (mcbLastUsePos !== null) {
+      mcbLookTempAt(mcbLastUsePos.x + 0.5, mcbLastUsePos.y + 0.5, mcbLastUsePos.z + 0.5,
+                    MCB_LOOK_PITCH_MAX)
     }
 
     try {
@@ -1273,6 +1592,60 @@ ClientEvents.tick(() => {
 function mcbTickSlots() {
   mcbSlotAim()
   mcbSlotUse()
+  mcbSlotHotbar()
+}
+
+// 手上拿什么 —— 第 3 批 3.3。第四个槽，和 walk / aim / use 并列。
+//
+// 为什么要有：原来"手上是什么"是一次性命令（mcb hotbar / mcb equip），
+// 发完就当它一直是那样了。可它随时会被别的东西改掉（另一次点击、她自己的动作），
+// 于是插件侧以为手上是镐子、实际拿着火把 —— 这种错很难从日志上看出来。
+// 改成槽之后，"手上是它"变成一个每 tick 维持的性质。
+//
+// 注意： 这个槽只管两件事：
+//   1 把选中的快捷栏格按 want.slot 维持住
+//   2 want.item 给了的话，在快捷栏里找那个东西，找到就选它
+// 它**不搬东西**（背包  <->  快捷栏的交换）—— 那是插件侧 containers.wear 的活，
+// 客户端每 tick 去点格子太吵，而且会把正在跑的其它界面操作搅乱。
+// 找不到就什么都不做，让插件侧去搬；别每 tick 反复试同一件做不到的事。
+function mcbSlotHotbar() {
+  var w = mcbSlots.hotbar.want
+  if (w === null || w === undefined) return
+  var mc = mcbMc()
+  if (mc === null || mc.player === null) return
+  var inv = null
+  try { inv = mc.player.inventory } catch (eI) { return }
+  if (inv === null || inv === undefined) return
+  var want = null
+  try {
+    if (typeof w.slot === 'number') want = w.slot
+    else if (w.item) want = mcbFindHotbarItem(inv, String(w.item))
+  } catch (eW) { return }
+  if (want === null || want < 0 || want > 8) return
+  try {
+    if (Number(inv.selected) !== want) {
+      inv.selected = want
+      console.info('[mcbridge] hotbar 槽：维持手上 = ' + want
+        + '（' + (w.item ? w.item : '指定格') + '）')
+    }
+  } catch (eS) { }
+}
+
+// 在快捷栏 0~8 里找某个注册名，返回格号；没有回 null。
+function mcbFindHotbarItem(inv, id) {
+  var reg = null
+  try { reg = Java.loadClass('net.minecraft.core.registries.BuiltInRegistries') } catch (eR) { return null }
+  try {
+    for (var i = 0; i < 9; i++) {
+      var st = inv.getItem(i)
+      if (st === null || st === undefined) continue
+      try { if (st.isEmpty()) continue } catch (eE) { }
+      var nm = null
+      try { nm = String(reg.ITEM.getKey(st.getItem())) } catch (eK) { nm = null }
+      if (nm === id) return i
+    }
+  } catch (eF) { }
+  return null
 }
 
 // 朝向槽 —— 每 tick 重设。

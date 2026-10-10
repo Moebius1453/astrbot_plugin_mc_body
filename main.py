@@ -36,6 +36,7 @@ from .mcb.craft import CraftRunner, Crafter
 from .mcb.events import EventFeed
 from .mcb.journal import Journal
 from .mcb import permission
+from .mcb import protocol
 from .mcb.places import PlaceBook
 from .mcb.reflex import ReflexGuard
 from .mcb import reflexes
@@ -70,7 +71,7 @@ PLAYER_NAME_RE = re.compile(r"^[A-Za-z0-9_]{1,16}$")
 MAX_SAY_LEN = 200
 MAX_RAW_LEN = 200
 
-# ---- ⭐ 抄 Numen 的纪律：Baritone 原始命令走白名单，不走黑名单 ------------
+# ---- 重点： 抄 Numen 的纪律：Baritone 原始命令走白名单，不走黑名单 ------------
 #
 # 重要： 这是我们现在最大的安全敞口（2026-10-10 核实）：
 #    mc_baritone_raw 把模型给的字符串原样下发，客户端
@@ -102,7 +103,7 @@ BARITONE_VERBS = frozenset({
 # 重要： 但它有个洞：提示词里说的是"运行一条 shell 命令去读"（cat / type），
 #    而那个文件工具被 provider_settings.computer_use_runtime ∈ {local, sandbox} 门控
 #    （astrbot/core/tools/computer_tools/fs.py:69）—— 我们的配置是 "none"，
-#    ⇒ 她看得见技能索引，读不到技能正文。（mc_skill 补的就是这一环。）
+#    => 她看得见技能索引，读不到技能正文。（mc_skill 补的就是这一环。）
 #
 # 注意： 为什么不直接把 computer_use_runtime 改成 local：那一开就是
 #    读/写/编辑/grep 整个本机文件系统。为了读一个 SKILL.md 不值得。
@@ -213,7 +214,7 @@ class McBodyPlugin(Star):
     async def _notify(self, facts: str) -> None:
         """把一个处境事实推到白的会话里（她/用户能看见）。
 
-        注意：注意： 只传事实，不许传句子（用户 2026-10-09 拍板）：
+        注意： 只传事实，不许传句子（用户 2026-10-09 拍板）：
         > "感知我是没法接受程序文本的。"
         已完成： food=6/20 food_items=0 ／ 不成立或禁止： 我饿了，但身上没有食物。
         —— 后者是程序替她写的台词。她想怎么讲是她的事，程序只负责把状态摆出来。
@@ -276,7 +277,7 @@ class McBodyPlugin(Star):
         用途：mc_use_on 靠"手上的数量少没少"来判定"到底放没放成" ——
         这是唯一能自动验证的实据（见那个工具里的说明）。
 
-        注意：注意： 2026-10-10 订正（这就是 docs/18 A2 那个"held 对不上"的真因）：
+        注意： 2026-10-10 订正（这就是 docs/18 A2 那个"held 对不上"的真因）：
         老代码拿 data['held'] 去比 hotbar 项里的 slot 字段 ——
         而那个字段在 hotbar 里压根不存在（服务端只给 main 的项加 slot），
         于是循环永远匹配不上、恒返回 None  ->  mc_use_on 永远只会说"确认不了"。
@@ -324,6 +325,35 @@ class McBodyPlugin(Star):
     async def _release_walk_user(self) -> None:
         await self.arbiter.release_walk("llm")
 
+
+    @filter.on_llm_request(priority=999)
+    async def sanitize_wire(self, event: AstrMessageEvent, req) -> None:
+        """出口净化（第 2 批 2.1）—— QQ 这条路的最后一道。
+
+        注意： 和 uplink 里那条是同一件事的两半：uplink 管"游戏内唤醒"那条路
+        （我们绕过 pipeline，钩子得自己调），这条管 QQ 走 pipeline 的正常路。
+        单独挂一个钩子、不塞进 inject_body_state —— 后者的开关是 enable_body_state，
+        关掉状态包不该连带把净化也关了。
+
+        priority=999 是想让它排在其他钩子之后跑（别的钩子可能还在往请求里塞东西），
+        净化要看着最终那一份做。
+
+        注意： 它管不到 runner 之后那一次截断（那在框架内部，按 docs\\25 11.2 不动它）。
+        所以是补强不是止血；坏形状由 protocol.audit() 记日志，先在真实流量里攒证据。
+        """
+        try:
+            issues = protocol.audit(getattr(req, "contexts", None))
+            if issues:
+                logger.warning(
+                    f"[{PLUGIN_NAME}] 出站历史有 {len(issues)} 处不合法（净化前）：{issues[:3]}"
+                )
+            before = getattr(req, "contexts", None)
+            cleaned = protocol.for_wire(before)
+            if isinstance(before, list) and len(cleaned) != len(before):
+                logger.info(f"[{PLUGIN_NAME}] 出站净化：{len(before)} -> {len(cleaned)} 条")
+            req.contexts = cleaned
+        except Exception as exc:  # noqa: BLE001 - 净化失败不该让这一轮发不出去
+            logger.warning(f"[{PLUGIN_NAME}] 出站净化失败（这一轮按原样发）：{exc}")
 
     @filter.on_llm_request(priority=100)
     async def inject_body_state(self, event: AstrMessageEvent, req) -> None:
@@ -459,7 +489,7 @@ class McBodyPlugin(Star):
 
     # ---- 自主心跳 --------------------------------------------------------
     #
-    # 注意：注意： 这个会花钱，默认关着。
+    # 注意： 这个会花钱，默认关着。
     #     每次唤醒 = 一整轮 agent（30 个工具描述 + 记忆注入 + 状态包），
     #     一次几千到上万 token。每 20 分钟醒一次 ≈ 一天 72 轮。
     #
@@ -1157,7 +1187,7 @@ class McBodyPlugin(Star):
         #    踩过（2026-10-10，用户在公屏让她放熔炉）：工具只回了一句
         #    "已对着 (…) 右键…过一会儿用 mc_inventory 看手上东西少没少"，
         #    她没看，转头就在公屏上说"熔炉放地上啦！" —— 其实熔炉还在包里。
-        #    ⭐ 教训：把验证甩给一个不会去验证的人，等于没有验证。
+        #    教训：把验证甩给一个不会去验证的人，等于没有验证。
         #    （和 docs\11 那条"成功判据用世界真的变了，不用命令发出去了"是同一条。）
         before_item, before = await self._held_stack()
         # 权限门（docs\22 §6 第 4 步：先只接 PLACE 一个动词，别贪多）。
@@ -1263,7 +1293,7 @@ class McBodyPlugin(Star):
             return render.reword(err, "点格子失败", kind=render.Kind.REFUSED,
                                 hint="先用 mc_menu 看一次界面 id，确认还是同一个容器再重点")
         await asyncio.sleep(0.4)
-        # ⭐ 当场对账 —— 点之前那张快照和点之后比（docs\25 §三 1.8）
+        # 重点： 当场对账 —— 点之前那张快照和点之后比（docs\25 §三 1.8）
         after = await self._menu_snapshot()
         return render.describe_click_result(n, m, before, after)
 
@@ -1349,7 +1379,7 @@ class McBodyPlugin(Star):
             return deny
         # 权限门（docs\22 §4）：准星制的 mc_attack 可能打到主人驯的宠物，所以先问服务端
         # "准星指着的那只是谁"，再过闸。
-        # 注意： 自动反击（reflex.py 的 attackAt）按设计**不过闸** —— 挨打还手是保命，
+        # 注意： 自动反击（reflex.py 的 attackAt）按设计不过闸 —— 挨打还手是保命，
         #    物理优先级高于权限，那一条走的是另一条路。
         data, err = await self._call("mcb attackTarget")
         if err or not isinstance(data, dict):
