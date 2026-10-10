@@ -671,7 +671,9 @@ WIRING_NOTE = (
     "woken with that line directly, and your reply is then posted to the public chat "
     "automatically (do not call mc_say). You can also pull chat yourself with mc_chat_log. "
     "You have a `future_task` tool: use it (action=create + note) to schedule your OWN next "
-    "wake-up when you want to keep doing something later without waiting to be called."
+    "wake-up when you want to keep doing something later without waiting to be called. "
+    "Your `## Skills` section tells you to open a SKILL.md with a shell command — "
+    "**you have no shell, that will fail**; call `mc_skill` with the skill's NAME instead."
 )
 
 # [chat] 段最多带几条 —— 每次注入都要重发，别贪

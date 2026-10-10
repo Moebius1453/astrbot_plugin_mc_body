@@ -68,6 +68,46 @@ PLAYER_NAME_RE = re.compile(r"^[A-Za-z0-9_]{1,16}$")
 MAX_SAY_LEN = 200
 MAX_RAW_LEN = 200
 
+# ---- ⭐ 抄 Numen 的纪律：Baritone 原始命令**走白名单，不走黑名单** ------------
+#
+# 🔴 **这是我们现在最大的安全敞口**（2026-10-10 核实）：
+#    `mc_baritone_raw` 把模型给的字符串**原样**下发，客户端
+#    （`bridge/client/mcbridge.js` 的 `action === 'baritone'`）**直接
+#    `getCommandManager().execute(arg)`，零检查**。
+#    → **模型出一条 `build` / `clearArea` 就能一次抹掉一片建筑。**
+#
+# ⚠️ **白名单而不是黑名单** —— 黑名单死在"没想到"，白名单死在"不让你做"。
+#
+# ⚠️ `mine` **必须留着**：它是她现在**唯一**的挖矿方式（我们还没 `mc_mine`）。
+#    挖矿那边的粒度保护在**客户端**：Baritone 的 `blocksToDisallowBreaking`
+#    （一次设置，护住箱子/熔炉这类"里面装着东西的"）—— 见 `docs\24`。
+BARITONE_VERBS = frozenset({
+    # 移动
+    "goto", "follow", "come", "thisway", "explore", "path", "surface",
+    # 干活（mine 是唯一允许的"改世界"动词，理由见上）
+    "mine", "farm",
+    # 控制
+    "stop", "cancel", "pause", "resume", "proc", "axis", "version", "help",
+})
+
+# ---- 技能（Skill）正文读取 ---------------------------------------------------
+#
+# ⚠️ **AstrBot 自己已经有完整的 skill 机制**（`astrbot/core/skills/skill_manager.py`）：
+#    每轮把 `## Skills` 索引（名字 + 描述 + SKILL.md 路径）拼进系统提示词，
+#    并且**自动扫描 `data/plugins/*/skills/<名>/SKILL.md`** —— 所以我们只要把技能
+#    放进**插件目录下的 `skills/`** 就行，**不用自己造一套**。
+#
+# 🔴 **但它有个洞**：提示词里说的是"**运行一条 shell 命令去读**"（`cat` / `type`），
+#    而那个文件工具被 `provider_settings.computer_use_runtime ∈ {local, sandbox}` 门控
+#    （`astrbot/core/tools/computer_tools/fs.py:69`）—— 我们的配置是 `"none"`，
+#    ⇒ **她看得见技能索引，读不到技能正文。**（`mc_skill` 补的就是这一环。）
+#
+# ⚠️ 为什么不直接把 `computer_use_runtime` 改成 `local`：那一开就是
+#    读/写/编辑/grep **整个本机文件系统**。为了读一个 SKILL.md 不值得。
+SKILLS_DIR = Path(__file__).resolve().parent / "skills"
+SKILL_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+MAX_SKILL_CHARS = 24000   # SKILL.md 是给人读的说明书，超长的多半是写错了
+
 
 @register(
     "astrbot_plugin_mc_body",
@@ -798,10 +838,54 @@ class McBodyPlugin(Star):
         clean = clean.lstrip("#").strip()
         if not clean:
             return "命令是空的。"
+        # ⚠️ **白名单**（见 `BARITONE_VERBS` 的注释）—— 别改成黑名单。
+        verb = clean.split()[0].lower()
+        if verb not in BARITONE_VERBS:
+            return (
+                f"error: 不允许「{verb}」这个 Baritone 动词 —— 它可能有能力一次改掉一大片方块。\n"
+                f"usage: 只允许 {' / '.join(sorted(BARITONE_VERBS))}\n"
+                "hint: 挖东西用 `mine <方块>`（例如 `mine oak_log`）；"
+                "想去某个地方用 `mc_goto`；想看周围用 `mc_around`。"
+            )
         _, err = await self._claim_walk_user(clean, "mc_baritone_raw")
         if err:
             return f"没能执行：{err}"
         return f"已把 Baritone 命令下发出去：{clean}。过一会儿用 mc_state 看效果。"
+
+    @filter.llm_tool(name="mc_skill")
+    async def mc_skill(self, event: AstrMessageEvent, name: str):
+        """Read the FULL text of one of your skills.
+
+        WARNING: your instructions have a `## Skills` section listing your skills, and it tells
+        you to open the SKILL.md file with a shell command (`cat` / `type`). **You have no
+        shell** -- that command will fail. Use THIS tool instead, with the skill NAME.
+
+        Read a skill's SKILL.md BEFORE you use it. Never assume what is inside it.
+
+        WARNING: this is for YOUR OWN instruction bundles, not for game files.
+
+        Args:
+            name(string): the skill name exactly as listed in your `## Skills` section."""
+        if (deny := self._guard(event)):
+            return deny
+        key = str(name or "").strip()
+        if not SKILL_NAME_RE.match(key):
+            return f"技能名不合法：{key!r}（只能用字母数字下划线短横线）。"
+        path = SKILLS_DIR / key / "SKILL.md"
+        try:
+            if not path.is_file():
+                have = [p.name for p in SKILLS_DIR.iterdir()
+                        if p.is_dir()] if SKILLS_DIR.is_dir() else []
+                return (
+                    f"没有叫「{key}」的技能。现有："
+                    + ("、".join(sorted(have)) if have else "（一个都还没有）")
+                )
+            text = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            return f"读不到技能正文：{exc}"
+        if len(text) > MAX_SKILL_CHARS:
+            text = text[:MAX_SKILL_CHARS] + f"\n\n…（只显示了前 {MAX_SKILL_CHARS} 字）"
+        return f"技能「{key}」的正文：\n\n{text}"
 
     # ---- 背包与交互（生存必需）-------------------------------------------
 

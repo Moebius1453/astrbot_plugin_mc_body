@@ -472,7 +472,7 @@ class ChatUplink:
         return list(raw) if isinstance(raw, list) else []
 
     async def _save_turn(self, req, runner) -> None:
-        """把这一轮写回会话 —— 照 pipeline 的做法，但**必须保证"只增不减"**。
+        """把这一轮写回会话 —— 照 pipeline 的做法，但**必须保证"只增不减 + 类型全对"**。
 
         ⚠️⚠️ **2026-10-10 血案（两次，同一个函数）**：
         ① 初版直接把 `runner.run_context.messages` 丢进去，自以为那是"完整上下文" ——
@@ -481,8 +481,22 @@ class ChatUplink:
         ② "修好"之后仍然写坏：`stored = list(conv.history)` —— 见 `_load_stored` 的说明，
            `conv.history` 是 **str**，`list()` 把 478 条历史拆成了 184467 个单字符。
 
-        现在两处都堵死了：历史只从 `ConversationV2.content`（真 list）取，
-        合并后**元素个数不可能比原来少**。
+        ⭐ **2026-10-10 深夜按 Numen 的纪律加固**（方案：`docs\21` §2.2）。核心两处：
+
+        1. **不再猜"谁更长"**。原来是
+               `if len(fresh) >= len(stored): combined = fresh else: stored + fresh`
+           —— 这是**"run 里含历史"这个假设**，一旦假设错就是 494→1。
+           改成**只追加**：`stored + [历史上没有过的那些]`。
+           两种情况都对：run 含历史时重复部分被滤掉；run 只有本轮时全部追加。
+        2. **四道闸一起上**（原来是"长度"一道，而**类型错了时长度闸永远通过**）：
+           ⓪ 类型闸：`stored` 里**每个元素都得是 dict**（血案②就是元素变成了 str）
+           ① 只增不减
+           ② 追加段的 role 只能是 `user/assistant/tool`
+           ③ 膨胀闸：涨得太离谱就**拒写**（防"重复追加"这种慢性爆炸）
+
+        > ⭐ 先天差距要说清：AstrBot 的 `update_conversation(history=…)` 是**替换语义**，
+        > 我们**做不到真正的 append-only**（Numen 的 `ConvoLog` 是 JSONL 追加 + 派生视图）。
+        > 所以这里只能把"读-改-写"这条路守得更死 —— **守不出追加，只能守出"不敢乱写"**。
         """
         try:
             from astrbot.core.agent.message import dump_messages_with_checkpoints
@@ -491,24 +505,62 @@ class ChatUplink:
             if conv is None:
                 return
             stored = await self._load_stored(conv)
+
+            # ── 第⓪道闸：**类型闸** ──────────────────────────────────────
+            # 血案②就是这里没查：`stored` 变成了 184467 个 **str**，
+            # 而"长度不许变少"那道闸比的是**元素个数**，垃圾越多越容易通过。
+            if not isinstance(stored, list) or any(not isinstance(m, dict) for m in stored):
+                bad = type(stored).__name__
+                logger.error(
+                    f"[mc_body] 🔴 拒绝写回：读到的历史不是 list[dict]（顶层是 {bad}）。"
+                    " 这一步如果继续走下去就是 2026-10-10 那次 478→18 万的重演。"
+                )
+                return
+
             run_msgs = list(getattr(getattr(runner, "run_context", None), "messages", []) or [])
             # 第一条 system 不要 —— 那是每轮重建的人格/提示词，存了会把历史撑爆
             fresh = [m for m in run_msgs if getattr(m, "role", "") != "system"]
             fresh_dicts = dump_messages_with_checkpoints(fresh)
 
-            if len(fresh_dicts) >= len(stored):
-                combined = fresh_dicts              # run 里已经含历史了
-            else:
-                combined = stored + fresh_dicts     # run 里只有本轮，历史补上
+            # ── 只追加：不做"谁更长"的猜测（见方法说明第 1 条）──────────
+            appended = [m for m in fresh_dicts if m not in stored]
+            combined = stored + appended
 
-            # 🔴 保命闸：**绝不允许写回一个更短的历史**。
-            #    宁可这一轮不落库，也不能再吞掉一次历史。
+            # ── 第①道闸：只增不减 ────────────────────────────────────────
             if len(combined) < len(stored):
                 logger.error(
-                    f"[mc_body] 拒绝写回：{len(stored)} 条历史会变成 {len(combined)} 条。"
+                    f"[mc_body] 🔴 拒绝写回：{len(stored)} 条历史会变成 {len(combined)} 条。"
                     "（这不该发生，是 bug —— 见 _save_turn 的说明）"
                 )
                 return
+
+            # ── 第②道闸：追加段的 role 只能是这三种 ──────────────────────
+            bad_roles = [
+                m.get("role") for m in appended
+                if m.get("role") not in ("user", "assistant", "tool")
+            ]
+            if bad_roles:
+                logger.error(
+                    f"[mc_body] 🔴 拒绝写回：追加段里出现非法 role {bad_roles[:5]}。"
+                    "（合法只有 user/assistant/tool）"
+                )
+                return
+
+            # ── 第③道闸：膨胀闸（防"重复追加"这种慢性爆炸）──────────────
+            # 正常一轮最多加几条到几十条；一次涨了一倍以上必然有问题。
+            if len(combined) > max(40, len(stored) * 2):
+                logger.error(
+                    f"[mc_body] 🔴 拒绝写回：{len(stored)} 条 → {len(combined)} 条，涨得离谱。"
+                    f"（追加了 {len(appended)} 条，多半是重复追加）"
+                )
+                return
+
+            # 写前留一份**形状摘要** —— 出事了能一眼看出是第几步坏的。
+            # ⚠️ 不打印全文（900 条 dict 灌进日志没意义也没人看）。
+            logger.info(
+                f"[mc_body] 落库前：stored={len(stored)} 追加={len(appended)} "
+                f"→ {len(combined)} 条（{_shape_digest(combined)}）"
+            )
 
             await self.context.conversation_manager.update_conversation(
                 self.umo, conv.cid, history=combined
@@ -533,6 +585,23 @@ class ChatUplink:
 
 
 # ---- 小工具 -------------------------------------------------------------
+
+
+def _shape_digest(msgs: list) -> str:
+    """一句话说清一批消息的**形状** —— 出事了能一眼看出是哪一步开始不对的。
+
+    ⚠️ 为什么不直接把整批打印出来：900 条 dict 灌进日志既没人看、又会把日志撑爆。
+    这里只给 **角色计数 + 首尾角色**，定位"从哪一步起变形"足够了。
+    （2026-10-10 那两次血案的共同点就是**形状变了**：一次只剩 1 条，一次变成 18 万个单字符。）
+    """
+    counts: dict[str, int] = {}
+    for m in msgs or []:
+        r = m.get("role") if isinstance(m, dict) else type(m).__name__
+        counts[str(r)] = counts.get(str(r), 0) + 1
+    parts = " ".join(f"{k}={v}" for k, v in sorted(counts.items()))
+    head = msgs[0].get("role") if msgs and isinstance(msgs[0], dict) else "?"
+    tail = msgs[-1].get("role") if msgs and isinstance(msgs[-1], dict) else "?"
+    return f"{parts} 首={head} 尾={tail}"
 
 
 def _as_int(value, default: int = 0) -> int:
