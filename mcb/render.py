@@ -322,11 +322,12 @@ def describe_look(data: dict, places=None) -> str:
 
 # ---- 周边概览（mc_around）---------------------------------------------------
 
-def describe_around(data: dict) -> str:
+def describe_around(data: dict, t2: dict | None = None) -> str:
     """把 `mcb around` 的结果说清楚 —— "我周围有什么"。
 
-    ⚠️ 必须**如实交代缺口**：没有方块实体的设施（工作台/铁砧/石切机/堆肥桶）
-    这个通道根本拿不到。不说的话她会以为"附近没有工作台"。
+    `t2` 是**第二层**（`mcb t2`，跨 tick 全分辨率扫描）的状态或结果，可能没有。
+    ⚠️ 有 T2 结果时，那句"没有方块实体的设施我看不见"的**缺口说明要撤掉** ——
+    否则她会在明明拿到了工作台坐标的情况下还说"附近没有工作台"。
     """
     if not isinstance(data, dict):
         return "看不了：桥返回的不是数据。"
@@ -384,16 +385,83 @@ def describe_around(data: dict) -> str:
     if data.get("truncatedChunks"):
         lines.append(f"· ⚠️ 有 {_num(data.get('truncatedChunks'))} 个区块**没走到**（撞到时间预算）")
 
-    # ⚠️ 缺口必须说出来 —— 否则她会断言"附近没有工作台"
-    lines.append(
-        "⚠️ **这个列表只含「有方块实体」的东西**（箱子/熔炉/木桶/床/告示牌/刷怪笼/传送门…）。"
-        "**工作台、铁砧、石切机、织布机、制箭台、堆肥桶、传送门框这些没有方块实体，不在里面** —— "
-        "要找它们得用 `mc_goto near`（那是定点扫描，范围小但准）。"
-    )
+    # ---- 第二层：T2 跨 tick 全分辨率扫描 ----
+    done = isinstance(t2, dict) and t2.get("job") == "done"
+    lines.extend(_around_deep(t2, done))
+
+    # ⚠️ 缺口只在**第二层还没给出结果**时才说 —— 拿到了还说"看不见"是自相矛盾
+    if not done:
+        lines.append(
+            "⚠️ **上面这个列表只含「有方块实体」的东西**（箱子/熔炉/木桶/床/告示牌/刷怪笼/传送门…）。"
+            "**工作台、铁砧、石切机、织布机、制箭台、堆肥桶、传送门框这些没有方块实体，不在里面** —— "
+            "要找它们得用 `mc_goto near`（那是定点扫描，范围小但准），或者等第二层扫完。"
+        )
     err = data.get("err") or []
     if err:
         lines.append("（查询异常：" + "；".join(str(e) for e in err) + "）")
     return "\n".join(lines)
+
+
+def _around_deep(t2: dict | None, done: bool) -> list[str]:
+    """`mc_around` 的第二层（T2）那几行。**没有 T2 就返回空**，别硬凑。"""
+    if not isinstance(t2, dict):
+        return []
+    job = t2.get("job")
+
+    if job == "error":
+        return [f"（第二层没跑起来：{t2.get('err')} —— 下面是第一层的结果）"]
+
+    st = t2.get("status") if isinstance(t2.get("status"), dict) else {}
+
+    if job == "running":
+        pct = st.get("pct")
+        left = ""
+        if isinstance(st.get("ms"), (int, float)) and isinstance(pct, (int, float)) and pct > 1:
+            left = f"，大概还要 {max(1, int(st['ms'] / pct * (100 - pct) / 1000))} 秒"
+        head = "· 第二层（全分辨率）**刚刚开扫**" if t2.get("justStarted") else "· 第二层（全分辨率）**正在后台扫**"
+        return [
+            f"{head}：{_num(pct, 'g')}%{left}。",
+            "  它会找到**没有方块实体的**设施（工作台/铁砧/石切机/织布机/制箭台/堆肥桶/传送门框），"
+            "并数一遍完整的地表方块。**不用等也不用轮询 —— 过一会儿再叫我一次 `mc_around` 就有结果。**",
+        ]
+
+    if not done:
+        return []
+
+    # ---- 扫完了 ----
+    out = ["· 第二层（全分辨率）**扫完了**："]
+    deep_poi = t2.get("poi") or []
+    if deep_poi:
+        out.append(f"  · 找到 **{len(deep_poi)}** 个没有方块实体的设施（按距离）：")
+        for p in deep_poi[:12]:
+            if not isinstance(p, dict):
+                continue
+            out.append(
+                f"    · {p.get('what') or p.get('id')} @ "
+                f"({_num(p.get('x'))},{_num(p.get('y'))},{_num(p.get('z'))}) 距 {_num(p.get('d'))} 格"
+            )
+        if len(deep_poi) > 12:
+            out.append(f"    …（还有 {len(deep_poi) - 12} 个）")
+    else:
+        out.append("  · **一个都没有** —— 这一片确实没有工作台/铁砧/石切机/堆肥桶这类东西")
+
+    # 完整方块计数：**只报"有用的"** —— 石头泥土水这些噪音不占篇幅
+    types = t2.get("types") or []
+    useful = []
+    for t in types:
+        if not isinstance(t, dict):
+            continue
+        sid = str(t.get("id") or "").removeprefix("minecraft:")
+        # 露头的矿 + 木头 —— 这两类是"要不要过去"的依据；具体矿物名一律保留
+        if sid.endswith("_ore") or sid.endswith("_log") or sid.endswith("_wood") or sid.endswith("_stem"):
+            useful.append(t)
+    if useful:
+        out.append("  · 露头的矿和木头（**完整计数，不是抽样**）：")
+        for t in useful[:12]:
+            n = t.get("nearest") or []
+            where = f"({_num(n[0])},{_num(n[1])},{_num(n[2])})" if len(n) == 3 else "?"
+            out.append(f"    · {str(t.get('id')).removeprefix('minecraft:')} ×{_num(t.get('n'))} 最近 {where}")
+    return out
 
 
 # ---- 查玩家位置（mc_where）--------------------------------------------------

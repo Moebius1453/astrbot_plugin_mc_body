@@ -1088,28 +1088,79 @@ class McBodyPlugin(Star):
             n = 20
         return "最近发生的事：\n" + self.events.render(n)
 
+    async def _around_t2(self, data: dict, force: bool = False) -> dict:
+        """`mc_around` 的第二层：T2 跨 tick 全分辨率扫描。
+
+        它是个**后台任务**（服务端每 tick 推进一小块，约 6ms）：第一次调用开一个，
+        之后每次来看进度，扫完就读结果。所以"叫一次拿不全"是正常的 —— **再叫一次**。
+
+        ⚠️ 这一层**失败不影响 T1** —— 它只是"更细的一层"，拿不到就算了，
+        绝不能让整个 `mc_around` 报错。
+        """
+        status, err = await self._call("mcb t2 status")
+        if err or not isinstance(status, dict):
+            return {"job": "error", "err": err or "拿不到状态"}
+        job = status.get("job")
+
+        # 位置挪远了就重扫 —— 缓存是**以某个点为中心**的，人走了就没意义
+        if job == "done" and not force:
+            tried = status.get("center") or []
+            here = data.get("center") or []
+            if len(tried) == 3 and len(here) == 3:
+                d2 = sum((float(tried[i]) - float(here[i])) ** 2 for i in range(3))
+                if d2 > 64 * 64:
+                    job = "none"          # 装成"没扫过"，下面会重开一个
+
+        if job == "none" or force:
+            started, err2 = await self._call("mcb t2 start 6")
+            if err2:
+                return {"job": "error", "err": err2}
+            return {"job": "running", "status": started, "justStarted": True}
+
+        if job == "running":
+            return {"job": "running", "status": status}
+
+        got, err3 = await self._call("mcb t2 get")
+        if err3:
+            return {"job": "done", "status": status, "err": err3}
+        if not isinstance(got, dict):
+            return {"job": "done", "status": status, "err": "结果不是数据"}
+        return got
+
     @filter.llm_tool(name="mc_around")
-    async def mc_around(self, event: AstrMessageEvent):
+    async def mc_around(self, event: AstrMessageEvent, deep: str = ""):
         """Look at what is around you -- a wide overview: terrain + surface
-        composition + nearby chests / machines / facilities.
-        
+        composition + nearby facilities.
+
         WARNING: how it differs from the other two:
         - "what is the environment like", "is there a chest nearby", "is the ground flat" -> THIS
-          (covers ~96 blocks)
         - "what is this block" (the one under the crosshair) -> `mc_lookat` (block-accurate, free)
         - "where is a specific block" (coords of a crafting table / furnace) -> `mc_goto near`
-        
-        WARNING: what it CANNOT see -- it only lists facilities that HAVE a block entity
-        (chest / furnace / barrel / bed / sign / spawner / portal). Crafting tables, anvils,
-        stonecutters and composters are NOT in there -- use `mc_goto near` to find those.
-        
-        WARNING: slow -- about 50ms of server time per call (one tick); do not call it repeatedly."""
+
+        WARNING: it comes in TWO layers and the second one takes time:
+        - The FIRST layer answers right away: terrain + facilities that have a block entity
+          (chest / furnace / barrel / bed / sign / spawner / portal).
+        - The SECOND layer ("deep") is a background scan that also finds things WITHOUT a block
+          entity (crafting table / anvil / stonecutter / loom / fletching table / composter /
+          portal frame) plus a full-resolution block count. It runs at ~6ms per server tick and
+          takes ~36 seconds for the full radius. **Call this tool again later to collect it.**
+          You do NOT have to wait or poll.
+
+        WARNING: slow -- about 50ms of server time per call (one tick); do not call it repeatedly.
+          (The deep layer does NOT add to that; it is spread out in the background.)
+
+        Args:
+            deep(string): Pass "1" to force a FRESH deep scan centered where you stand now.
+                Leave empty normally.
+        """
         if (deny := self._guard(event)):
             return deny
         data, err = await self._call("mcb around")
         if err:
             return f"看不了：{err}"
-        return render.describe_around(data)
+        force = str(deep).strip().lower() in ("1", "true", "yes", "deep", "now")
+        t2 = await self._around_t2(data if isinstance(data, dict) else {}, force)
+        return render.describe_around(data, t2)
 
     @filter.llm_tool(name="mc_where")
     async def mc_where(self, event: AstrMessageEvent, player: str):
