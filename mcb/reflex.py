@@ -127,6 +127,16 @@ _TASK_NAME = "mc_body_reflex"
 #   owner —— **朝主人跑**（"跟着我"本来就是要的效果，人多的地方也通常更安全）
 RETREAT_SAFE = "safe"
 RETREAT_OWNER = "owner"
+# ⭐ `auto` = **按"主人离我多远"自己选**（用户 2026-10-10 定的，也是现在的默认值）。
+#   用户原话："safe 的寻路也许很合理，**慌不择路 实际上怪可爱的**……
+#   我的建议是按照我离她的距离判断是不是应该往我身边跑。"
+RETREAT_AUTO = "auto"
+
+# `auto` 的分界：主人在这个距离内 → 往他那儿跑；超过 → 慌不择路。
+# 取 24 格 ≈ 一个"喊一声就能听见、跑几步就能会合"的距离。
+# ⚠️ 定太大会变成"隔着半个地图也硬要跑过去"（路上更容易死）；
+#    定太小就几乎永远在慌不择路。
+RETREAT_OWNER_RANGE = 24.0
 
 
 class ReflexGuard:
@@ -156,7 +166,12 @@ class ReflexGuard:
         self.scan_range = max(6, int(scan_range))
         self.hunger_low = float(hunger_low)
         self.owner_name = str(owner_name or "").strip()
-        self.flee_toward = flee_toward if flee_toward in (RETREAT_SAFE, RETREAT_OWNER) else RETREAT_SAFE
+        # ⚠️ 白名单外的一律退回 `auto`（不是 `safe`）—— `auto` 才是现在的默认语义。
+        self.flee_toward = (
+            flee_toward
+            if flee_toward in (RETREAT_SAFE, RETREAT_OWNER, RETREAT_AUTO)
+            else RETREAT_AUTO
+        )
         self._notify = notify  # 可选：async callable(str)
 
         # 状态日志（见 mcb/journal.py）—— 反射事件要**让白自己看得见**，
@@ -814,18 +829,21 @@ class ReflexGuard:
 
     # ---- 反射动作 -------------------------------------------------------
 
-    async def retreat(self, toward: str = RETREAT_SAFE) -> str:
+    async def retreat(self, toward: str = RETREAT_AUTO) -> str:
         """**主动脱战** —— 立刻停止战斗，往安全方向 / 主人方向撤。
 
         和"濒死才跑"不同：这个是**主动**的，血量好好的也能用 ——
         打不过、不想打、或者白自己判断该走了，都可以调它。
 
+        `toward` 三选一：`auto`（默认，按主人远近自己选）/ `owner` / `safe`。
+
         返回一句人话（给工具层直接回给白）。
         """
-        t = str(toward or "").strip().lower() or RETREAT_SAFE
-        if t not in (RETREAT_SAFE, RETREAT_OWNER):
+        t = str(toward or "").strip().lower() or RETREAT_AUTO
+        if t not in (RETREAT_SAFE, RETREAT_OWNER, RETREAT_AUTO):
             raise ValueError(
-                f"未知的撤离方向：{toward!r}（只认 {RETREAT_SAFE} / {RETREAT_OWNER}）"
+                f"未知的撤离方向：{toward!r}"
+                f"（只认 {RETREAT_AUTO} / {RETREAT_OWNER} / {RETREAT_SAFE}）"
             )
 
         # 退出战斗态 —— 否则下一次 tick 又会把她拉回去打
@@ -841,31 +859,66 @@ class ReflexGuard:
         return await self._retreat(data, hostiles[0] if hostiles else None, t)
 
     async def _retreat(self, data: dict, nearest: dict | None, toward: str) -> str:
-        """真正下撤离指令。返回一句人话。"""
-        # 优先：往主人那边跑（人多的地方通常更安全，而且"跟着我"本来就是用户要的）
-        if toward == RETREAT_OWNER:
+        """真正下撤离指令。返回一句人话。
+
+        三种方向（`toward`）：
+
+        | 值 | 行为 |
+        |---|---|
+        | `owner` | 往主人那儿跑 |
+        | `safe` | **慌不择路** —— 背离最近的怪、随机偏一点，跑 `flee_distance` 格 |
+        | **`auto`（默认）** | **按"主人离我多远"自己选** —— 见下 |
+
+        ⭐ **`auto` 是用户 2026-10-10 定的**，原话：
+        *"safe 的寻路也许很合理，**慌不择路 实际上怪可爱的**……我的建议是
+        **按照我离她的距离**判断是不是应该往我身边跑。"*
+
+          · 主人在 `RETREAT_OWNER_RANGE` 格内 → 往他那儿跑（会合；人多通常也更安全）
+          · 主人离得远 → **慌不择路**（可爱，而且够得着的忙才帮得上）
+
+        ⚠️ 这条顺带把"抽风挖地板"限住了：慌不择路挑的是**不看地形的随机点**，
+        地下几乎必然落在实心石头里，而 Baritone 的 `allowBreak` 是开的 → 一路凿穿。
+        **原来它是无条件默认，所以看起来像在抽风**；现在只在她离主人远时才用。
+        （治本还得关 `allowBreak`，见 `docs\17` §九 F。）
+        """
+        t = str(toward or "").strip().lower() or RETREAT_AUTO
+        if t not in (RETREAT_SAFE, RETREAT_OWNER, RETREAT_AUTO):
+            t = RETREAT_AUTO
+
+        if t in (RETREAT_OWNER, RETREAT_AUTO):
             owner = await self._where(self.owner_name)
-            if owner is not None and owner.get("dim") == data.get("dim"):
-                try:
-                    tx, tz = int(owner["x"]), int(owner["z"])
-                except (KeyError, TypeError, ValueError):
-                    tx = tz = None
-                if tx is not None:
-                    # ⚠️ 用 **follow** 而不是 goto —— 主人在动，goto 是快照，追不上。
-                    #    follow 跟到几格以内就停，正好是"会合"的语义。
-                    logger.warning(
-                        f"[mc_body] 🏃 脱战 —— 撤向主人 {self.owner_name}"
-                        f"（follow，他当前在 {tx},{tz}）"
-                    )
-                    await self._walk_claim(f"follow player {self.owner_name}", "脱战：撤向主人")
-                    # ⚠️ 这一句别漏：不置位的话 `_fight` 下一 tick 又会**重算一遍**
-                    #    （`_where` 是一次 RCON 往返），而且每 tick 重声明 = TTL 形同虚设。
-                    self._fleeing = True
-                    return "正往你那边跑（会一直跟到你身边）"
-            logger.warning(
-                f"[mc_body] 🏃 脱战时找不到 {self.owner_name}（不在线/不在同维度），"
-                "改往安全方向跑"
-            )
+            same_dim = owner is not None and owner.get("dim") == data.get("dim")
+            if t == RETREAT_AUTO:
+                dist = self._owner_distance(data, owner) if same_dim else None
+                if dist is not None and dist <= RETREAT_OWNER_RANGE:
+                    t = RETREAT_OWNER
+                    logger.info(f"[mc_body] 🏃 脱战 —— 主人在 {dist:g} 格内，往他那儿跑")
+                else:
+                    t = RETREAT_SAFE
+                    where = "?" if dist is None else f"{dist:g}"
+                    logger.info(f"[mc_body] 🏃 脱战 —— 主人离 {where} 格，慌不择路")
+            if t == RETREAT_OWNER:
+                if same_dim:
+                    try:
+                        tx, tz = int(owner["x"]), int(owner["z"])
+                    except (KeyError, TypeError, ValueError):
+                        tx = tz = None
+                    if tx is not None:
+                        # ⚠️ 用 **follow** 而不是 goto —— 主人在动，goto 是快照，追不上。
+                        #    follow 跟到几格以内就停，正好是"会合"的语义。
+                        logger.warning(
+                            f"[mc_body] 🏃 脱战 —— 撤向主人 {self.owner_name}"
+                            f"（follow，他当前在 {tx},{tz}）"
+                        )
+                        await self._walk_claim(f"follow player {self.owner_name}", "脱战：撤向主人")
+                        # ⚠️ 这一句别漏：不置位的话 `_fight` 下一 tick 又会**重算一遍**
+                        #    （`_where` 是一次 RCON 往返），而且每 tick 重声明 = TTL 形同虚设。
+                        self._fleeing = True
+                        return "正往你那边跑（会一直跟到你身边）"
+                logger.warning(
+                    f"[mc_body] 🏃 脱战时找不到 {self.owner_name}（不在线/不在同维度），"
+                    "改往安全方向跑"
+                )
 
         # 安全方向：背离最近的怪
         self._fleeing = True
@@ -929,6 +982,23 @@ class ReflexGuard:
             return None
         data = reply.get("data") or {}
         return data if data.get("online") else None
+
+    @staticmethod
+    def _owner_distance(data: dict, owner: dict | None) -> float | None:
+        """主人离我多远（3D 直线距离）。任一边读不到就回 `None`（**别当成 0**）。
+
+        ⚠️ 拿不到回 `None` 而不是 0 —— 0 会被判成"他就在我身上"，直接选"往他那儿跑"。
+        （`docs/04` 坑 10f 那条："缺失 ≠ 0"。）
+        """
+        if not isinstance(owner, dict):
+            return None
+        try:
+            dx = float(owner["x"]) - float(data.get("x"))
+            dy = float(owner["y"]) - float(data.get("y"))
+            dz = float(owner["z"]) - float(data.get("z"))
+        except (KeyError, TypeError, ValueError):
+            return None
+        return math.sqrt(dx * dx + dy * dy + dz * dz)
 
     async def _check_stuck(self, data: dict) -> None:
         """在寻路但坐标长时间不动 = 卡住了。"""

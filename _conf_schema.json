@@ -124,8 +124,8 @@
   "retreat_toward": {
     "type": "string",
     "description": "自动脱战时往哪跑",
-    "hint": "safe = 背离最近的怪跑（默认）；owner = 朝用户跑（找不到人就自动退化）。注意这只影响**濒死自动逃跑**；白用 mc_retreat 工具时自己指定方向。",
-    "default": "safe"
+    "hint": "auto = **按主人离她多远自己选**（默认）：主人在 24 格内 → 往他那儿跑（会合）；超过 24 格 → 慌不择路（背离最近的怪跑 flee_distance 格）。owner = 永远往主人那儿跑；safe = 永远慌不择路。找不到人/不同维度都自动退化。注意这只影响**濒死自动逃跑**；白用 mc_retreat 工具时自己指定方向。",
+    "default": "auto"
   },
   "enable_craft": {
     "type": "bool",

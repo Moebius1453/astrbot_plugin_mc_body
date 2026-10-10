@@ -44,6 +44,67 @@ _SENTENCE_END = "。！？!?…"
 _SENTENCE_MIN = 8
 
 
+def provider_settings_to_build_kwargs(cfg: dict) -> dict:
+    """把 AstrBot 的全局配置翻成 `MainAgentBuildConfig` 的字段。
+
+    ⚠️⚠️ **必须和 pipeline 的映射逐字对齐**
+    （`pipeline/process_stage/method/agent_sub_stages/internal.py:75-155`）。
+    我们是**绕过 pipeline** 直接 `build_main_agent` 的，
+    **少传一个字段 = 那个字段悄悄退回 dataclass 默认值**，而且**不报错、看不出来**。
+
+    2026-10-10 实测踩到（用户一句"上下文 800 吗"引出来的）：我们原来只传了 4 个字段，
+    其余全在用默认值 —— 于是游戏里那一轮和 QQ 那边**根本不是同一套设置**：
+
+    | 字段 | 我们（默认值） | 用户实际配的 |
+    |---|---|---|
+    | `max_context_length` | 50 轮 | -1（当时不限；现改成 20） |
+    | `kb_agentic_mode` | False | **True** |
+    | `computer_use_runtime` | `"local"` | **`"none"`** |
+    | `llm_safety_mode` | 硬写 False | **True** |
+    | `add_cron_tools` | True（**恰好对**） | True |
+
+    > 📌 和 `req.contexts` 那个 bug **同一类**：**绕过框架时，
+    > "框架会自己处理"是假设，不是事实。** 要么读源码确认，要么自己显式做。
+    """
+    ps = (cfg or {}).get("provider_settings") or {}
+    file_extract = ps.get("file_extract") or {}
+    proactive = ps.get("proactive_capability") or {}
+
+    max_ctx = int(ps.get("max_context_length", 20))
+    # ⚠️ 这段和 pipeline 一模一样（`internal.py:106-112`）—— 包括 `max_ctx - 1` 那个
+    #    在 `max_ctx == -1` 时会算出负数的边角，再被下面那句兜回 1。
+    deq = min(max(1, int(ps.get("dequeue_context_length", 1))), max_ctx - 1)
+    if deq <= 0:
+        deq = 1
+
+    return {
+        "tool_call_timeout": int(ps.get("tool_call_timeout", 120)),
+        "tool_schema_mode": str(ps.get("tool_schema_mode", "full")),
+        "sanitize_context_by_modalities": bool(ps.get("sanitize_context_by_modalities", False)),
+        "kb_agentic_mode": bool((cfg or {}).get("kb_agentic_mode", False)),
+        "file_extract_enabled": bool(file_extract.get("enable", False)),
+        "file_extract_prov": str(file_extract.get("provider", "moonshotai")),
+        "file_extract_msh_api_key": str(file_extract.get("moonshotai_api_key", "")),
+        "context_limit_reached_strategy": str(
+            ps.get("context_limit_reached_strategy", "truncate_by_turns")
+        ),
+        "llm_compress_instruction": str(ps.get("llm_compress_instruction", "") or ""),
+        "llm_compress_keep_recent_ratio": float(ps.get("llm_compress_keep_recent_ratio", 0.15)),
+        "llm_compress_provider_id": str(ps.get("llm_compress_provider_id", "") or ""),
+        "max_context_length": max_ctx,
+        "dequeue_context_length": deq,
+        "fallback_max_context_tokens": int(ps.get("fallback_max_context_tokens", 128000)),
+        "llm_safety_mode": bool(ps.get("llm_safety_mode", True)),
+        "safety_mode_strategy": str(ps.get("safety_mode_strategy", "system_prompt")),
+        "computer_use_runtime": ps.get("computer_use_runtime"),
+        "sandbox_cfg": ps.get("sandbox") or {},
+        "add_cron_tools": bool(proactive.get("add_cron_tools", True)),
+        "subagent_orchestrator": (cfg or {}).get("subagent_orchestrator") or {},
+        "timezone": (cfg or {}).get("timezone"),
+        "max_quoted_fallback_images": int(ps.get("max_quoted_fallback_images", 20)),
+    }
+
+
 class ChatUplink:
     """把游戏内聊天接进白的会话。"""
 
@@ -261,19 +322,52 @@ class ChatUplink:
 
         cfg = self.context.get_config(umo=self.umo) or {}
         provider_settings = cfg.get("provider_settings") or {}
+        # ⚠️ **字段逐个对齐 pipeline** —— 少一个就悄悄退回默认值。
+        #    映射和理由都在 `provider_settings_to_build_kwargs` 里。
         build_cfg = MainAgentBuildConfig(
-            tool_call_timeout=provider_settings.get("tool_call_timeout", 120),
-            streaming_response=False,
-            llm_safety_mode=False,
+            **provider_settings_to_build_kwargs(cfg),
             provider_settings=provider_settings,
+            # 这条和 pipeline 不同、是**故意**的：我们走的是"主动唤醒"那条路，
+            # 流式会让她的话被拆成好几段往公屏上推。
+            streaming_response=False,
         )
 
         req = ProviderRequest()
         req.prompt = prompt
         conv = await _get_session_conv(event=event, plugin_context=self.context)
         req.conversation = conv
-        # 不用手工塞 req.contexts —— build_main_agent 看到 req.conversation 会自己从
-        # 会话历史里取（astr_main_agent.py 里 `if req.conversation: req.contexts = ...`）。
+
+        # ⚠️⚠️ **必须自己把历史读出来塞进 `req.contexts`**（2026-10-10 实测订正）。
+        #
+        #   **原来这里写的是"不用手工塞，build_main_agent 会自己取" —— 那是错的。**
+        #   `build_main_agent` 里填 `contexts` 的两处（`astr_main_agent.py:1442` / `:1575`）
+        #   **都在 `if req is None:` 这个分支里**；**我们直接传了 `req`**，
+        #   所以那两处**一次都不会跑** → `req.contexts` 一直停在
+        #   `ProviderRequest` 的默认值 `[]`（`provider/entities.py:104`）。
+        #
+        #   ⇒ 后果：**游戏里她看不到任何对话历史** —— QQ 那边看得见游戏里发生的事
+        #     （因为都写进同一个会话），**反过来在游戏里却看不见 QQ 说过什么**。
+        #     用户 2026-10-10 指出的就是这个不对称。
+        #
+        # ⚠️⚠️ `conv.history` 是 **JSON 文本（str）**，不是 list —— 必须 `json.loads`。
+        #   **绝对不许写 `list(...)`**：`list("<json文本>")` 不抛异常，
+        #   它把字符串**逐字符**拆开 —— 2026-10-10 那次把 478 条历史炸成 18 万条
+        #   就是这么来的（见 `docs\17` §七）。
+        try:
+            req.contexts = json.loads(conv.history or "[]")
+        except (TypeError, ValueError) as exc:
+            logger.warning(f"[mc_body] 读会话历史失败，这一轮不带历史：{exc}")
+            req.contexts = []
+        if not isinstance(req.contexts, list):
+            logger.warning(
+                f"[mc_body] 会话历史不是 list（拿到 {type(req.contexts).__name__}），"
+                "这一轮不带历史"
+            )
+            req.contexts = []
+        # ⚠️ 这是**截断前**的原始条数 —— 真正发给模型的由
+        #    `provider_settings.max_context_length`（轮数）在 runner 里再削一刀。
+        #    所以这里数字大**不等于**发出去的多，两边要分开看。
+        logger.info(f"[mc_body] 游戏内这一轮读入历史 {len(req.contexts)} 条（截断前）")
 
         result = await build_main_agent(
             event=event,

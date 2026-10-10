@@ -142,7 +142,13 @@ class McBodyPlugin(Star):
             scan_range=int(self._cfg("reflex_scan_range", 24)),
             stance=str(self._cfg("default_stance", "defend")),
             owner_name=str(self._cfg("owner_player_name", "")),
-            flee_toward=str(self._cfg("retreat_toward", "safe")),
+            # ⚠️ 代码兜底默认值要和 `_conf_schema.json` 一致（现在是 auto）。
+            #    `auto` = **按主人远近自己选**（24 格内往他那儿跑，否则慌不择路）。
+            #    一路演化的理由见 `docs\17` §九 F：`safe` 在地下会挑到实心石头里的随机点，
+            #    而 Baritone 的 `allowBreak` 是开的 → 她一路把地板凿穿（"抽风挖地板"）。
+            #    但用户也说了 **"慌不择路 实际上怪可爱的"** —— 所以不是删掉它，
+            #    而是**只在主人离得远时才用**。
+            flee_toward=str(self._cfg("retreat_toward", "auto")),
             notify=self._notify,
             journal=self.journal,
         )
@@ -1111,21 +1117,24 @@ class McBodyPlugin(Star):
         return "战斗姿态已设为 **defend**：我不主动挑事，只在挨打或怪瞄着我时才还手。"
 
     @filter.llm_tool(name="mc_retreat")
-    async def mc_retreat(self, event: AstrMessageEvent, toward: str = "owner"):
+    async def mc_retreat(self, event: AstrMessageEvent, toward: str = "auto"):
         """BREAK OFF combat: stop fighting immediately and back away toward safety.
         Works even at full health (you are losing, do not want to fight, or want to come back and
         find someone).
-        
-        - `owner` (default) run toward the user -- safest reunion; falls back to `safe` if he is
-          offline or in another dimension
-        - `safe` run away from the nearest mob for a while
-        
+
+        - `auto` (default) -- decide by how far the user is: run TO him if he is within ~24
+          blocks, otherwise just run away from the mobs
+        - `owner` -- always run toward the user (falls back to `safe` if he is offline or in
+          another dimension)
+        - `safe` -- always run away from the nearest mob for a while
+
         Args:
-            toward(string): "owner" (run toward the user, default) or "safe" (run away from mobs)."""
+            toward(string): "auto" (default) / "owner" (run toward the user) / "safe"
+                (run away from mobs)."""
         if (deny := self._guard(event)):
             return deny
         try:
-            what = await self.reflex.retreat(str(toward or "owner"))
+            what = await self.reflex.retreat(str(toward or "auto"))
         except ValueError as exc:
             return str(exc)
         return f"已脱战，{what}。她不会再自己冲回去打。"
