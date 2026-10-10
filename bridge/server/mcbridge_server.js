@@ -490,6 +490,101 @@ function mcbPlayerName(pl) {
   return null
 }
 
+const MCB_PLACED_KEY = 'mc_body_placed_v1'
+
+function mcbPlacedTable(level) {
+  var data = level.server.persistentData
+  var $Tag = Java.loadClass('net.minecraft.nbt.CompoundTag')
+  if (!data.contains(MCB_PLACED_KEY, 10)) data.put(MCB_PLACED_KEY, new $Tag())
+  var root = data.getCompound(MCB_PLACED_KEY)
+  var dim = String(level.dimension)
+  if (!root.contains(dim, 10)) root.put(dim, new $Tag())
+  return root.getCompound(dim)
+}
+
+function mcbPlacedKey(pos) {
+  return pos.getX() + ',' + pos.getY() + ',' + pos.getZ()
+}
+
+function mcbPlacedFact(level, pos) {
+  var table = mcbPlacedTable(level)
+  var key = mcbPlacedKey(pos)
+  var state = level.getBlockState(pos)
+  var id = mcbBlockId(state)
+  var record = null
+  if (table.contains(key, 10)) {
+    var stored = table.getCompound(key)
+    if (state.isAir() || String(stored.getString('block')) !== id) {
+      table.remove(key)
+    } else {
+      record = {
+        uuid: String(stored.getString('uuid')),
+        name: String(stored.getString('name')),
+        block: String(stored.getString('block'))
+      }
+    }
+  }
+  return { pos: [pos.getX(), pos.getY(), pos.getZ()], dim: String(level.dimension),
+    block: id, placed: record, blockEntity: level.getBlockEntity(pos) !== null }
+}
+
+function mcbBreakVerdict(fact, uuid) {
+  if (fact.placed !== null && fact.placed.uuid !== uuid) {
+    return { allowed: false, kind: 'needs_consent',
+      detail: '这是 ' + fact.placed.name + ' 放置的方块，尚未获得拆除许可' }
+  }
+  if (fact.blockEntity && fact.placed === null) {
+    return { allowed: false, kind: 'needs_consent',
+      detail: '这是来源未知的容器或设施，不能直接拆除' }
+  }
+  return { allowed: true, kind: 'allowed', detail: '' }
+}
+
+BlockEvents.placed(event => {
+  try {
+    var entity = event.getEntity()
+    if (entity === null || !mcbIsPlayer(entity)) return
+    var block = event.getBlock()
+    var level = event.getLevel()
+    var uuid = String(entity.uuid)
+    if (!mcbIsUsableName(uuid)) throw new Error('放置者 UUID 不可用')
+    var $Tag = Java.loadClass('net.minecraft.nbt.CompoundTag')
+    var record = new $Tag()
+    record.putString('uuid', uuid)
+    record.putString('name', mcbPlayerName(entity) || uuid)
+    record.putString('block', mcbBlockId(block.getBlockState()))
+    mcbPlacedTable(level).put(mcbPlacedKey(block.getPos()), record)
+  } catch (err) {
+    console.error('[mcb] 放置记录失败: ' + err)
+  }
+})
+
+BlockEvents.broken(event => {
+  var deny = null
+  try {
+    var entity = event.getEntity()
+    if (mcbPlayerName(entity) !== MCB_TARGET) return
+    var block = event.getBlock()
+    var fact = mcbPlacedFact(block.getLevel(), block.getPos())
+    var uuid = String(entity.uuid)
+    if (!mcbIsUsableName(uuid)) throw new Error('执行者 UUID 不可用')
+    var verdict = mcbBreakVerdict(fact, uuid)
+    if (!verdict.allowed) {
+      deny = verdict.detail
+      mcbEvAdd('permission', MCB_TARGET,
+        '[mc:permission] error: ' + verdict.kind + '；不能拆 ' + fact.block
+          + ' @ ' + fact.pos.join(',') + '：' + deny
+          + '。请停止这项操作并告诉用户，重复寻路不会获得许可。',
+        { by: fact.pos.join(','), pos: fact.pos, block: fact.block })
+    }
+  } catch (err) {
+    deny = '权限事实读取失败: ' + err
+    console.error('[mcb] ' + deny)
+  }
+  // cancel 通过 EventExit 结束处理，不能被上面的错误处理吞掉。
+  if (deny !== null) event.cancel()
+})
+
 // DamageSource  ->  "谁打的 / 什么打的"。
 //
 // 注意：注意： 2026-10-10 实测结论（一次跑完全部候选访问器得出的，别再猜）：
@@ -2401,6 +2496,26 @@ ServerEvents.basicCommand('mcb', event => {
   var action = parts[0]
   var arg = parts[1]
   console.info('[mcb] 收到命令: action=' + action + ' arg="' + arg + '"')
+
+  if (action === 'placed') {
+    var placedArgs = arg.split(/\s+/)
+    if (placedArgs.length !== 3 || !placedArgs.every(function (v) { return /^-?\d+$/.test(v) })) {
+      mcbErr(event, action, '用法: mcb placed <x> <y> <z>')
+      return
+    }
+    var placedServer = mcbServer(event)
+    if (placedServer === null) { mcbErr(event, action, '服务端不可用'); return }
+    var placedPlayer = mcbFindPlayer(placedServer, MCB_TARGET)
+    if (placedPlayer === null) { mcbErr(event, action, 'Nanako 不在线，无法确定维度'); return }
+    try {
+      var $PlacedPos = Java.loadClass('net.minecraft.core.BlockPos')
+      var placedPos = new $PlacedPos(Number(placedArgs[0]), Number(placedArgs[1]), Number(placedArgs[2]))
+      var fact = mcbPlacedFact(placedPlayer.level, placedPos)
+      fact.verdict = mcbBreakVerdict(fact, String(placedPlayer.uuid))
+      mcbOk(event, action, fact)
+    } catch (errPlaced) { mcbErr(event, action, String(errPlaced)) }
+    return
+  }
 
   if (action === 'ping') {
     mcbOk(event, 'ping', { pong: true })

@@ -81,6 +81,7 @@ _KINDS: dict[str, KindSpec] = {
     "join":  KindSpec("进服", False, Joins.OWN,  False),
     "leave": KindSpec("退服", False, Joins.OWN,  False),
     "inv":   KindSpec("背包", False, Joins.ANY,  False),
+    "permission": KindSpec("权限", False, Joins.ANY, False),
 }
 
 KIND_LABEL = {k: v.label for k, v in _KINDS.items()}
