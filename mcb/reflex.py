@@ -33,6 +33,8 @@ import random
 
 from astrbot.api import logger
 
+from .arbiter import LEVEL_REFLEX
+
 # 战斗态持续多久（秒）。这段时间内持续评估要不要跑。
 COMBAT_WINDOW_SECONDS = 12.0
 
@@ -134,6 +136,8 @@ class ReflexGuard:
         # 任务层（`bind_tasks` 注入）—— 保命要能**抢占**它。
         # ⚠️ 是**挂起**不是停：危险过去她会自己接着做（用户 2026-10-09 拍板的分层）。
         self._tasks = None
+        # 仲裁层（见 mcb/arbiter.py）。没绑就退回直接下发，行为跟以前一样。
+        self.arbiter = None
 
         self._task: asyncio.Task | None = None
 
@@ -160,6 +164,30 @@ class ReflexGuard:
     def bind_tasks(self, runner) -> None:
         """接上任务层 —— 之后挨打/濒死会**挂起**她的任务，而不是让它继续跑。"""
         self._tasks = runner
+
+    def bind_arbiter(self, arbiter) -> None:
+        """接上仲裁层（见 `mcb/arbiter.py`）。`main.py` 在 `__init__` 里调。"""
+        self.arbiter = arbiter
+
+    # ⚠️ **反射的 walk 声明是最高优先级**（保命 > 用户 > 任务）。
+    #    而且它**只在声明、不删别人的** —— 所以脱战一 release，
+    #    任务/用户的路线会**自己恢复**（"挂起不是取消"的落点）。
+    async def _walk_claim(self, cmd: str, note: str) -> None:
+        if self.arbiter is None:
+            await self._cmd(f"mcb baritone {cmd}")
+            return
+        await self.arbiter.claim_walk(LEVEL_REFLEX, "reflex", cmd, note)
+
+    async def _walk_stop(self, note: str) -> None:
+        """保命：顶掉别人的路线并停下。**不是"我不要走了"** —— 见 `claim_walk` 的注释。"""
+        if self.arbiter is None:
+            await self._cmd("mcb stop")
+            return
+        await self.arbiter.claim_walk(LEVEL_REFLEX, "reflex", None, note)
+
+    async def _walk_release(self) -> None:
+        if self.arbiter is not None:
+            await self.arbiter.release_walk("reflex")
 
     def _suspend_tasks(self, reason: str) -> None:
         if self._tasks is not None:
@@ -283,7 +311,7 @@ class ReflexGuard:
                 # 保命优先 —— 把她的任务**挂起**（不是取消），危险过去会自己接着做
                 self._suspend_tasks("战斗中")
                 if hurt:
-                    await self._cmd("mcb stop")   # 别再顺着原路线撞进去
+                    await self._walk_stop("进战：别顺着原路线撞进去")
         else:
             # ⚠️ 脱战要**滞后**（hysteresis）：进战是 ≤5 格，脱战得等拉开到 ~8 格。
             #    否则怪在边界上晃一下就是"进战/脱战"来回刷（用户看到的现象）。
@@ -296,6 +324,9 @@ class ReflexGuard:
                     logger.info("[mc_body] ⚔ 脱战：怪已经拉开或没了")
                     self._log("脱离战斗")
                     self._resume_tasks()
+                    # ⚠️ **还要把 walk 通道还给别人** —— 不 release 的话，
+                    #    她的任务/用户路线永远恢复不了（反射声明优先级最高，一直压着）。
+                    await self._walk_release()
             else:
                 self._no_threat_ticks = 0
                 # 只有 hunt 姿态才**追出去**；defend 姿态够不着就站着等它过来。
@@ -502,7 +533,7 @@ class ReflexGuard:
                 logger.info(
                     f"[mc_body] ⚔ {nearest['name']} 在 {dist:g} 格外，走过去 ({tx},{ty},{tz})"
                 )
-                await self._cmd(f"mcb baritone goto {int(tx)} {int(tz)}")
+                await self._walk_claim(f"goto {int(tx)} {int(tz)}", "打怪：靠近")
             else:
                 self._approach_wait -= 1
         else:
@@ -579,7 +610,7 @@ class ReflexGuard:
                         f"[mc_body] 🏃 脱战 —— 撤向主人 {self.owner_name}"
                         f"（follow，他当前在 {tx},{tz}）"
                     )
-                    await self._cmd(f"mcb baritone follow player {self.owner_name}")
+                    await self._walk_claim(f"follow player {self.owner_name}", "脱战：撤向主人")
                     return "正往你那边跑（会一直跟到你身边）"
             logger.warning(
                 f"[mc_body] 🏃 脱战时找不到 {self.owner_name}（不在线/不在同维度），"
@@ -622,7 +653,7 @@ class ReflexGuard:
         logger.warning(
             f"[mc_body] 🏃 脱战 —— {who}，跑 {self.flee_distance} 格到 ({tx},{tz})"
         )
-        await self._cmd(f"mcb baritone goto {tx} {tz}")
+        await self._walk_claim(f"goto {tx} {tz}", f"脱战：{who}")
         # ⚠️ 只写日志，**不发 QQ** —— 自动反射的状态变化不该占用户的聊天正文
         return f"往安全方向跑（x={tx} z={tz}）"
 
@@ -686,7 +717,7 @@ class ReflexGuard:
                 f"[mc_body] ⚠ 白卡住了：{elapsed:.0f} 秒只挪了 {moved:.1f} 格，已让她停下"
             )
             self._log(f"卡住了：{elapsed:.0f} 秒只挪了 {moved:.1f} 格，停下来了")
-            await self._cmd("mcb stop")
+            await self._walk_stop("卡住了")
             # ⚠️ 只写日志，**不发 QQ**（同上：自动反射不占聊天正文）
 
     # ---- 小工具 ---------------------------------------------------------

@@ -62,6 +62,7 @@ from dataclasses import dataclass, field
 
 from astrbot.api import logger
 
+from .arbiter import LEVEL_TASK
 from .containers import ContainerIO, find_block, wait_baritone, wear
 
 # 任务协程的任务名 —— 用来识别并掐掉重载留下的孤儿任务（同 reflex.py）
@@ -184,7 +185,15 @@ class TaskContext:
         )
 
     async def goto(self, x: float, z: float, timeout: float = 60.0) -> str:
-        await self.call(f"mcb baritone goto {int(x)} {int(z)}")
+        # ⚠️ **走仲裁层，别直接 `mcb baritone`** —— 反射要保命时优先级比任务高，
+        #    由仲裁决定谁生效。**顶掉时任务被挂起、声明不删**，
+        #    所以脱战之后这条路线会**自己恢复**（这正是"挂起不是取消"的落点）。
+        arb = self._runner.arbiter
+        if arb is not None:
+            await arb.claim_walk(LEVEL_TASK, "task",
+                                 f"goto {int(x)} {int(z)}", "任务路线")
+        else:
+            await self.call(f"mcb baritone goto {int(x)} {int(z)}")
         return await self.wait_path(timeout, target=(float(x), float(z)))
 
     async def place_torch_here(self, item_id: str) -> bool:
@@ -456,6 +465,13 @@ class TaskRunner:
         self._index = 0
         self._paused = ""            # 非空 = 被抢占的理由
         self._outcome: dict = {}     # 上一次的结局
+        # 仲裁层（见 mcb/arbiter.py）。**没绑也能跑** —— 那就退回直接下发，
+        # 免得单测/降级路径被这条依赖卡住。
+        self.arbiter = None
+
+    def bind_arbiter(self, arbiter) -> None:
+        """把仲裁层接上。`main.py` 在 `__init__` 里调。"""
+        self.arbiter = arbiter
 
     # ---- 抢占（反射层调）------------------------------------------------
 
@@ -552,6 +568,10 @@ class TaskRunner:
             await task
         except (asyncio.CancelledError, Exception):  # noqa: BLE001
             pass
+        # ⚠️ **真停 = 撤掉自己在 walk 通道的声明** —— 悬着的话，
+        #    下次反射释放时会把这条**早就不要了的**路线又恢复出来。
+        if self.arbiter is not None:
+            await self.arbiter.release_walk("task")
         if not quiet:
             self.journal.add("task", "被叫停")
         return "已经停下了。"
@@ -561,6 +581,15 @@ class TaskRunner:
     async def checkpoint(self) -> None:
         if self._paused:
             raise Paused
+        # ⚠️⚠️ **另一个挂起来源：walk 通道被别人（反射/用户）抢走了。**
+        #    这时"没在移动"是**别人造成的**，不是"走到了" ——
+        #    不判的话 `wait_path` 会把"反射保命时把她叫停"**误判成到达**。
+        #    （这条坑一直记在本文件顶部第 51 行，从来没有真正的解法。）
+        arb = self.arbiter
+        if arb is not None:
+            top = arb.walk_holder()
+            if top is not None and top.owner != "task":
+                raise Paused
 
     def note(self, text: str) -> None:
         self.journal.add("task", text)

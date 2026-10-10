@@ -29,6 +29,7 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
 
 from .mcb.rcon import BridgeError, RconBridge
+from .mcb.arbiter import LEVEL_REFLEX, LEVEL_TASK, LEVEL_USER, Arbiter
 from .mcb import containers as mcb_containers
 from .mcb.containers import ContainerIO
 from .mcb.craft import CraftRunner, Crafter
@@ -102,6 +103,14 @@ class McBodyPlugin(Star):
         self.io = ContainerIO(self.bridge)
         self.tasks = TaskRunner(self.bridge, self.journal, io=self.io)
 
+        # 仲裁层 —— **谁在写 walk 通道**（见 mcb/arbiter.py）。
+        # ⚠️ 从这里开始，**任何模块都不许再直接调 `mcb baritone` / `mcb stop`**。
+        #    反射要保命、任务在走路、用户喊她过来 —— 三方都只能"声明"，
+        #    由这层按优先级（反射 > 用户 > 任务）决定谁生效。
+        #    这条是"解耦功能配合不好"的根上解法（`main/docs/16`）。
+        self.arbiter = Arbiter(self._call)
+        self.tasks.bind_arbiter(self.arbiter)
+
         # 事件流 —— 「刚才都发生了什么」（挨打/死亡/进出服/背包变动）。
         # ⚠️ 和 `uplink.py` 的聊天**分工不同、两张表**：那张管"人说的话"，
         #    这张管"聊天以外的事"。合表就是同一件事记两遍（见 mcb/events.py 头部）。
@@ -122,6 +131,8 @@ class McBodyPlugin(Star):
         )
         # 反射要能**抢占**任务（保命 > 干活）。挂起不是停止 —— 事完会自己接着做。
         self.reflex.bind_tasks(self.tasks)
+        # 反射也要走仲裁层（它的 walk 声明优先级最高）
+        self.reflex.bind_arbiter(self.arbiter)
         # 通知去重（见 _notify）
         self._last_notify_text = ""
         self._last_notify_at = 0.0
@@ -160,7 +171,17 @@ class McBodyPlugin(Star):
 
         await self.context.send_message(umo, MessageChain([Plain(f"[body] {facts}")]))
 
-    # ---- 处境感知：每 N 次 LLM 请求附一次状态数据包 ------------------------
+    async def _claim_walk_user(self, cmd: str, note: str) -> tuple[dict, str | None]:
+        """**用户级**地声明 walk 通道。返回值和 `_call` 同形，方便原地替换。
+
+        ⚠️ 别再直接 `mcb baritone ...` —— 那会绕过仲裁、把任务/反射的路线踩掉。
+        """
+        await self.arbiter.claim_walk(LEVEL_USER, "llm", cmd, note)
+        return {"ok": self.arbiter.last_error is None}, self.arbiter.last_error
+
+    async def _release_walk_user(self) -> None:
+        await self.arbiter.release_walk("llm")
+
 
     @filter.on_llm_request(priority=100)
     async def inject_body_state(self, event: AstrMessageEvent, req) -> None:
@@ -368,12 +389,14 @@ class McBodyPlugin(Star):
 
     @filter.llm_tool(name="mc_state")
     async def mc_state(self, event: AstrMessageEvent):
-        """查自己在 MC 里的状态：在线/坐标/血量/饥饿/维度/**正在做的事**/最近发生了什么。
-
-        返回里有「正在做的事」（你自己的任务进度）和「寻路」（Baritone 走路状态），别搞混。
-        **动作类工具下发后，隔一会儿用它确认结果** —— 那些工具只能报告"已下发"。
-        "不在线"= 角色没连进服务器，什么动作都做不了。
-        """
+        """Your own state in MC: online / coords / health / hunger / dimension /
+        what you are doing / what just happened.
+        
+        The result has both "what you are doing" (your task progress) and "pathing" (Baritone's
+        walking state) -- do not confuse the two.
+        After any ACTION tool, wait a moment and use this to confirm the result: those tools can
+        only report "dispatched", never "it worked".
+        "offline" means the character is not connected to the server -- no action is possible."""
         if (deny := self._guard(event)):
             return deny
         data, err = await self._call("mcb state")
@@ -385,11 +408,11 @@ class McBodyPlugin(Star):
 
     @filter.llm_tool(name="mc_say")
     async def mc_say(self, event: AstrMessageEvent, text: str):
-        """用 Nanako 的身体在**游戏公屏**说话。这是游戏内聊天，不是回 QQ。
-
+        """Say something on the in-game public chat using Nanako's body.
+        This is in-game chat, NOT a reply to QQ.
+        
         Args:
-            text(string): 要说的话。会发到游戏公屏，所有人都看得见。
-        """
+            text(string): What to say. Goes to the public chat; everyone can see it."""
         if (deny := self._guard(event)):
             return deny
         clean = self._clean_text(text, MAX_SAY_LEN)
@@ -402,25 +425,26 @@ class McBodyPlugin(Star):
 
     @filter.llm_tool(name="mc_goto")
     async def mc_goto(self, event: AstrMessageEvent, near: str = "", x: float = 0, z: float = 0):
-        """走到一个地方。**异步** —— 下发后她自己走，过会儿用 mc_state 看坐标确认。
-
-        三种给法，**给其一就行**：
-        · `near="工作台"` / `near="minecraft:furnace"` —— **走到那个东西旁边**。
-          先查**地点簿**（你以前记过的名字），查不到再当**方块注册名**在附近扫。
-          **这是最省事的给法 —— 不用知道坐标。**
-        · `x` + `z` —— 走到指定坐标（你看 F3 或者别人告诉你坐标时才用）
-
-        ⚠️ 按方块名找**只在附近 16 格内**（服务端扫描上限）。太远就找不到 ——
-        那就先走近点，或者**把它记进地点簿**（`mc_place`），以后直接 `near="名字"`。
-
-        常找的方块名：`minecraft:crafting_table` 工作台、`minecraft:furnace` 熔炉、
-        `minecraft:chest` 箱子、`minecraft:farmland` 耕地、`simpletomb:grave_cross` 墓碑。
-
+        """Walk somewhere. ASYNC -- it dispatches and she walks on her own;
+        check coordinates later with mc_state.
+        
+        Three ways to specify; give just one:
+        - `near="crafting_table"` / `near="minecraft:furnace"` -- walk next to that thing.
+          Looks in your PLACE BOOK first (names you recorded), then treats it as a block id and
+          scans nearby. This is the easiest form -- no coordinates needed.
+        - `x` + `z` -- walk to exact coordinates (only when you read F3 or someone told you).
+        
+        WARNING: searching by block name only covers ~16 blocks around her (server scan limit).
+        If it is further away it will not be found -- walk closer first, or record it in the place
+        book (`mc_place`) and then use `near="name"`.
+        
+        Common block ids: `minecraft:crafting_table`, `minecraft:furnace`, `minecraft:chest`,
+        `minecraft:farmland`, `simpletomb:grave_cross`.
+        
         Args:
-            near(string): 地点名（你记过的）或方块注册名，走到最近的那个旁边。
-            x(number): 目标 X 坐标（跟 z 一起用）。
-            z(number): 目标 Z 坐标。
-        """
+            near(string): A place name you recorded, or a block id; walks to the nearest one.
+            x(number): Target X (used together with z).
+            z(number): Target Z."""
         if (deny := self._guard(event)):
             return deny
 
@@ -437,7 +461,7 @@ class McBodyPlugin(Star):
                 status = self.places.check(
                     name, await self._block_at(place.get("x"), place.get("y"), place.get("z"))
                 )
-                _, err = await self._call(f"mcb baritone goto {tx} {tz}")
+                _, err = await self._claim_walk_user(f"goto {tx} {tz}", f"去「{name}」")
                 if err:
                     return f"没能让她出发：{err}"
                 warn = {
@@ -459,7 +483,7 @@ class McBodyPlugin(Star):
                     "要么先过去一趟再用 mc_place 把它记下来。"
                 )
             tx, tz = int(pos[0]), int(pos[2])
-            _, err = await self._call(f"mcb baritone goto {tx} {tz}")
+            _, err = await self._claim_walk_user(f"goto {tx} {tz}", f"扫到的 {block_id}")
             if err:
                 return f"没能让她出发：{err}"
             return (f"附近找到了 {block_id}（{pos[0]},{pos[1]},{pos[2]}），"
@@ -471,7 +495,7 @@ class McBodyPlugin(Star):
                 "要么给 `near`（地点名或方块名），要么给 `x` 和 `z` 坐标 —— "
                 f"现在给的是 near={near!r} x={x} z={z}。"
             )
-        _, err = await self._call(f"mcb baritone goto {tx} {tz}")
+        _, err = await self._claim_walk_user(f"goto {tx} {tz}", "mc_goto x/z")
         if err:
             return f"没能让她出发：{err}"
         return (
@@ -482,29 +506,31 @@ class McBodyPlugin(Star):
     @filter.llm_tool(name="mc_place")
     async def mc_place(self, event: AstrMessageEvent, action: str = "list",
                        name: str = "", what: str = "", note: str = ""):
-        """**地点簿** —— 记住 / 查看 / 自检 / 忘掉「哪儿是什么」。
-
-        你的扫描只有附近 16 格，出了这个圈你就是瞎的。**把重要的地方记下来**，
-        以后 `mc_goto near="名字"` 就能直接过去，不用任何人报坐标。
-
-        · `action="remember"` —— **把你现在站的地方记下来**（要起个 `name`）。
-          顺手写 `what`（这儿是什么），以后翻到能看懂。
-          记的时候会**自动存下你脚下方块的指纹**。
-        · `action="list"` —— 看看记过哪些地方
-        · `action="check"` —— **那地方还是原来的样子吗？** 逐个比对指纹，
-          回「没变 / 变了 / 没了 / 说不准」。给 `name` 就只查那一个。
-          ⚠️ 什么时候该查：**很久没去过的据点、被炸过的地方、别人的地盘**。
-        · `action="forget"` —— 忘掉一个（给 `name`）
-
-        **该记的时候**：造了个据点、发现一块田、放了箱子、找到矿洞入口、
-        墓碑在哪… **走过的路会忘，记下来才不会忘。**
-
+        """PLACE BOOK -- remember / list / self-check / forget "what is where".
+        
+        Your scan only covers ~16 blocks around you; outside that you are blind. Record the
+        important places, and `mc_goto near="name"` will take you there without anyone reporting
+        coordinates.
+        
+        - `action="remember"` -- record where you are standing right now (needs a `name`).
+          Also write `what` (what this place is) so it makes sense when you read it later.
+          It automatically stores a FINGERPRINT of the block under your feet.
+        - `action="list"` -- see what you have recorded
+        - `action="check"` -- is that place still the way it was? Compares fingerprints and answers
+          unchanged / changed / gone / unknown. Give `name` to check only that one.
+          WARNING: worth checking for outposts you have not visited in a long time, places that got
+          blown up, or someone else's territory.
+        - `action="forget"` -- forget one (give `name`)
+        
+        When to record: you built an outpost, found a field, placed a chest, found a cave entrance,
+        where a grave is... The path you walked gets forgotten; what you recorded does not.
+        
         Args:
-            action(string): "remember" / "list" / "check" / "forget"。
-            name(string): 地点名，起个你自己记得住的（"家"、"麦田"、"矿洞口"）。check 时可只给一个。
-            what(string): 这儿是什么（比名字多说一点）。
-            note(string): 备注（可选）。
-        """
+            action(string): "remember" / "list" / "check" / "forget".
+            name(string): The place name, one you will actually remember ("home", "wheat field",
+                "cave mouth"). For `check` you may give just one.
+            what(string): What this place is (a bit more than the name).
+            note(string): Free-form note (optional)."""
         if (deny := self._guard(event)):
             return deny
         act = str(action or "list").strip().lower()
@@ -583,19 +609,19 @@ class McBodyPlugin(Star):
 
     @filter.llm_tool(name="mc_follow")
     async def mc_follow(self, event: AstrMessageEvent, player: str):
-        """跟着某个玩家走。
-
-        ⚠️ 是「跟到几格以内」**不是贴身** —— 目标就在旁边时她不动是正常的。
-
+        """Follow a player.
+        
+        WARNING: this means "stay within a few blocks", NOT "stick to them" -- if the target is
+        right next to her, her not moving is normal.
+        
         Args:
-            player(string): 要跟随的玩家名（游戏 ID，只允许字母数字下划线）。
-        """
+            player(string): The player name to follow (in-game id; letters, digits, underscore)."""
         if (deny := self._guard(event)):
             return deny
         name = self._clean_player(player)
         if name is None:
             return f"玩家名不合法：{player!r}。只允许 1-16 位字母、数字、下划线。"
-        _, err = await self._call(f"mcb baritone follow player {name}")
+        _, err = await self._claim_walk_user(f"follow player {name}", f"跟随 {name}")
         if err:
             return f"没能让她跟随：{err}"
         return (
@@ -605,15 +631,20 @@ class McBodyPlugin(Star):
 
     @filter.llm_tool(name="mc_stop")
     async def mc_stop(self, event: AstrMessageEvent):
-        """急停：**取消当前任务**，并停掉所有寻路/行走/跟随/使用动作。
-
-        ⚠️ 任务会被**丢掉**（取消，不是暂停）。想让她"先去忙别的、回头接着做"，
-        直接给她新指令就行 —— 反射抢占才是挂起。
-        """
+        """Emergency stop: CANCEL the current task, and stop all pathing / walking /
+        following / using actions.
+        
+        WARNING: the task is DISCARDED (cancelled, not paused). If you want her to "do something
+        else first and come back to it later", just give her the new instruction -- suspension is
+        handled by the reflex layer, not by this."""
         if (deny := self._guard(event)):
             return deny
         stopped = await self.tasks.stop()
-        _, err = await self._call("mcb stop")
+        # ⚠️ **不是无脑 `mcb stop`** —— 那会把**反射的逃跑路线也撤了**（保命优先）。
+        #    仲裁层的语义：撤掉**用户级和任务级**的声明，**反射级的不动**。
+        #    （`mc_arbiter` 那条描述里也这么说；见 mcb/arbiter.py）
+        await self.arbiter.clear_user_and_task()
+        err = self.arbiter.last_error
         # 顺手松开"使用键" —— 万一吃东西时出了岔子，按键卡住会让她一直重复动作
         await self._call("mcb release")
         if err:
@@ -622,14 +653,14 @@ class McBodyPlugin(Star):
 
     @filter.llm_tool(name="mc_baritone_raw")
     async def mc_baritone_raw(self, event: AstrMessageEvent, command: str):
-        """应急口：直接给 Baritone 下原始命令。固定工具做不到时才用。
-
-        常用：`mine diamond_ore`（挖矿）、`explore`（探索）、`farm`（种田）、
-        `goto 100 64 -200`（带 Y 的 goto）、`come`、`thisway 100`。
-
+        """Escape hatch: send a raw Baritone command. Only use it when the
+        fixed tools cannot do the job.
+        
+        Common ones: `mine diamond_ore` (mine), `explore`, `farm`, `goto 100 64 -200`
+        (goto with Y), `come`, `thisway 100`.
+        
         Args:
-            command(string): Baritone 命令本体，**不带 `#` 前缀**。
-        """
+            command(string): The Baritone command itself, WITHOUT the leading `#`."""
         if (deny := self._guard(event)):
             return deny
         clean = self._clean_text(command, MAX_RAW_LEN)
@@ -638,7 +669,7 @@ class McBodyPlugin(Star):
         clean = clean.lstrip("#").strip()
         if not clean:
             return "命令是空的。"
-        _, err = await self._call(f"mcb baritone {clean}")
+        _, err = await self._claim_walk_user(clean, "mc_baritone_raw")
         if err:
             return f"没能执行：{err}"
         return f"已把 Baritone 命令下发出去：{clean}。过一会儿用 mc_state 看效果。"
@@ -647,7 +678,8 @@ class McBodyPlugin(Star):
 
     @filter.llm_tool(name="mc_inventory")
     async def mc_inventory(self, event: AstrMessageEvent):
-        """看背包：有什么、手上是哪一格、饥饿度。拿东西/吃东西/合成之前先看它。"""
+        """Look at your inventory: what you have, which hotbar slot is in hand,
+        and your hunger. Check it before taking / eating / crafting anything."""
         if (deny := self._guard(event)):
             return deny
         data, err = await self._call("mcb inventory")
@@ -657,11 +689,11 @@ class McBodyPlugin(Star):
 
     @filter.llm_tool(name="mc_hold")
     async def mc_hold(self, event: AstrMessageEvent, slot: int):
-        """把**快捷栏**第 0~8 格拿到手上。东西在背包里（不知道第几格）就用 mc_equip。
-
+        """Move HOTBAR slot 0-8 into your hand.
+        If the item is somewhere in the backpack (unknown slot), use `mc_equip` instead.
+        
         Args:
-            slot(number): 快捷栏槽位，0 是最左边，8 是最右边。
-        """
+            slot(number): Hotbar slot; 0 is leftmost, 8 is rightmost."""
         if (deny := self._guard(event)):
             return deny
         try:
@@ -677,22 +709,23 @@ class McBodyPlugin(Star):
 
     @filter.llm_tool(name="mc_equip")
     async def mc_equip(self, event: AstrMessageEvent, item: str, where: str = "hand"):
-        """把身上某物品**挪到指定位置** —— 给物品名就行，不用先查它在第几格。
-
-        where 可选：
-        · `hand`（默认）—— 拿到手上。放方块、吃东西、用工具都用它
-        · `off` —— 副手。举盾、放火把当光源
-        · `head` / `chest` / `legs` / `feet` —— 穿护甲
-        · **`hotbar0` ~ `hotbar8`** —— 放进快捷栏**某一格**（跟那格现有的对调）
-        · **`backpack`** —— 从快捷栏**收进背包**（自动找空格）
-
-        ⚠️ 物品名要用**注册名**不是中文名：`minecraft:iron_helmet` ✅ / `"铁头盔"` ❌。
-
+        """Move an item you carry to a specific place -- just give the item name,
+        no need to find which slot it is in first.
+        
+        Possible values of `where`:
+        - `hand` (default) -- hold it. Use this for placing blocks, eating, using tools.
+        - `off` -- offhand. Hold a shield, carry a torch as a light source.
+        - `head` / `chest` / `legs` / `feet` -- wear armor.
+        - `hotbar0` .. `hotbar8` -- put it in a specific HOTBAR slot (swaps with whatever is there).
+        - `backpack` -- move it from the hotbar into the backpack (finds an empty slot).
+        
+        WARNING: use the REGISTRY id, not a translated display name --
+        `minecraft:iron_helmet` is right, a localized name is not.
+        
         Args:
-            item(string): 物品的注册名，例如 "minecraft:iron_helmet"、"minecraft:shield"。
-            where(string): "hand"（默认）/ "off" / "head" / "chest" / "legs" / "feet"
-                / "hotbar0"~"hotbar8" / "backpack"。
-        """
+            item(string): The item's registry id, e.g. "minecraft:iron_helmet", "minecraft:shield".
+            where(string): "hand" (default) / "off" / "head" / "chest" / "legs" / "feet"
+                / "hotbar0"~"hotbar8" / "backpack"."""
         if (deny := self._guard(event)):
             return deny
         name = str(item or "").strip()
@@ -707,10 +740,9 @@ class McBodyPlugin(Star):
 
     @filter.llm_tool(name="mc_use")
     async def mc_use(self, event: AstrMessageEvent):
-        """用**手上**的东西：吃东西、喝药水、放方块、射箭。
-
-        对着**方块**用（开箱子、放地上）请走 mc_use_on。
-        """
+        """Use what is in your HAND: eat food, drink a potion, place a block, shoot a bow.
+        
+        To use something ON A BLOCK (open a chest, place on the ground) use `mc_use_on` instead."""
         if (deny := self._guard(event)):
             return deny
         _, err = await self._call("mcb use")
@@ -722,18 +754,18 @@ class McBodyPlugin(Star):
     async def mc_use_on(
         self, event: AstrMessageEvent, x: float, y: float, z: float, keep_open: bool = False
     ):
-        """对指定坐标的**方块**右键：放方块、按按钮、开箱子/工作台。
-
-        ⚠️ 距离约 4.5 格，够不着先 mc_goto。
-        默认会自动关掉弹出的界面；要**操作界面里的东西**（拿箱子、合成）就设
-        `keep_open=true`，再配 mc_menu + mc_click 用。
-
+        """Right-click the BLOCK at the given coordinates: place a block, press a
+        button, open a chest / crafting table.
+        
+        WARNING: reach is about 4.5 blocks; if it is out of reach, `mc_goto` there first.
+        By default any screen that opens is closed again. To work with things INSIDE the screen
+        (take from a chest, craft), set `keep_open=true`, then use `mc_menu` + `mc_click`.
+        
         Args:
-            x(number): 目标方块的 X 坐标
-            y(number): 目标方块的 Y 坐标
-            z(number): 目标方块的 Z 坐标
-            keep_open(bool): true = 打开后**不关界面**，留着给 mc_menu / mc_click 用。
-        """
+            x(number): X of the target block.
+            y(number): Y of the target block.
+            z(number): Z of the target block.
+            keep_open(bool): true = leave the opened screen open for mc_menu / mc_click."""
         if (deny := self._guard(event)):
             return deny
         coords = self._clean_coords3(x, y, z)
@@ -762,10 +794,11 @@ class McBodyPlugin(Star):
 
     @filter.llm_tool(name="mc_menu")
     async def mc_menu(self, event: AstrMessageEvent):
-        """看**当前打开的界面**里有什么（箱子/工作台/背包合成格）：每格的**格子号**+内容。
-
-        格子号是**这套界面自己的编号**，不是背包格号。用 mc_use_on 开容器时记得 `keep_open=true`。
-        """
+        """See what is inside the CURRENTLY OPEN screen (chest / crafting table /
+        inventory crafting grid): each slot's SLOT NUMBER plus its contents.
+        
+        Those slot numbers belong to THAT screen, not to your backpack.
+        When opening a container with `mc_use_on`, remember `keep_open=true`."""
         if (deny := self._guard(event)):
             return deny
         data, err = await self._call("mcb state")
@@ -775,15 +808,16 @@ class McBodyPlugin(Star):
 
     @filter.llm_tool(name="mc_click")
     async def mc_click(self, event: AstrMessageEvent, slot: int, mode: int = 1):
-        """点当前界面的**第几号格子** —— 从箱子里拿东西、合成都靠它。先用 mc_menu 看格子号。
-
-        · `mode=1`（默认）shift 快速移动：箱子格→背包；或**产物格→直接合成**
-        · `mode=0` 普通左键（拿起/放下）；`mode=6` 双击收同种
-
+        """Click slot number N of the currently open screen -- this is how you take
+        things out of a chest and how crafting happens. Use `mc_menu` first to see the slot numbers.
+        
+        - `mode=1` (default) shift quick-move: chest slot -> backpack, or CRAFT RESULT -> craft immediately
+        - `mode=0` plain left click (pick up / put down); `mode=6` double-click to gather the same kind
+        
         Args:
-            slot(number): 格子号（用 mc_menu 查，不是背包格号）。
-            mode(number): 1=shift 快速移动（默认，最常用）；0=普通左键；6=双击收同种。
-        """
+            slot(number): Slot number (look it up with `mc_menu`; NOT a backpack slot).
+            mode(number): 1=shift quick-move (default, most common); 0=plain left click;
+                6=double-click gather."""
         if (deny := self._guard(event)):
             return deny
         try:
@@ -808,16 +842,19 @@ class McBodyPlugin(Star):
 
     @filter.llm_tool(name="mc_craft")
     async def mc_craft(self, event: AstrMessageEvent, item: str, count: int = 1):
-        """**做东西**：给物品名，她自己算整条链并一步步做出来（含自己找工作台、走过去、打开）。
-
-        例："做把木镐" → 她自己推原木→木板→木棍→木镐。配方来自服务端，**mod 物品也认识**。
-        ⚠️ 材料得她本来就有（缺料不会去挖，会如实说缺什么）；只支持工作台/背包合成，熔炉要烧的用 mc_smelt。
-
+        """MAKE something: give the item name and she works out the whole chain and
+        does it step by step (including finding a crafting table, walking there, opening it).
+        
+        Example: "make a wooden pickaxe" -> she derives log -> planks -> stick -> pickaxe herself.
+        Recipes come from the server, so MOD items work too.
+        WARNING: she must already have the materials (she will NOT go mining for missing ones --
+        she will tell you exactly what is missing). Only crafting table / inventory crafting is
+        supported; anything that needs a furnace goes through `mc_smelt`.
+        
         Args:
-            item(string): 要做的物品，例如 "wooden_pickaxe"、"crafting_table"、
-                "oak_planks"。带不带 `minecraft:` 前缀都行；mod 物品要带前缀。
-            count(number): 要做几个，默认 1。
-        """
+            item(string): What to make, e.g. "wooden_pickaxe", "crafting_table", "oak_planks".
+                The `minecraft:` prefix is optional; MOD items need their prefix.
+            count(number): How many to make, default 1."""
         if (deny := self._guard(event)):
             return deny
         name = str(item or "").strip()
@@ -852,16 +889,19 @@ class McBodyPlugin(Star):
 
     @filter.llm_tool(name="mc_smelt")
     async def mc_smelt(self, event: AstrMessageEvent, item: str):
-        """**烧东西**：原料放进熔炉炼成成品（生铁→铁锭、沙子→玻璃、生肉→熟肉）。
-
-        自己挑配方（同一产物常有多个）、走过去、放料放燃料、**等烧完**、取走。
-        ⚠️ 要有**燃料**（煤/木炭）且熔炉在 16 格内；会把原料**整叠**放进去，出来多少是多少。
-        分不清该用这个还是 mc_craft 就先试 mc_craft —— 它会说"这个得烧"。
-
+        """SMELT something: put raw material into a furnace and get the product
+        (raw iron -> iron ingot, sand -> glass, raw meat -> cooked meat).
+        
+        She picks the recipe herself (the same product often has several), walks over, loads
+        material and fuel, WAITS for it to finish, and takes the result.
+        WARNING: needs FUEL (coal / charcoal) and a furnace within 16 blocks. She loads the WHOLE
+        stack of material -- you get however much comes out.
+        If you are unsure whether to use this or `mc_craft`, try `mc_craft` first: it will say
+        "this has to be smelted".
+        
         Args:
-            item(string): 要炼出来的东西，例如 "iron_ingot"、"glass"、"copper_ingot"。
-                带不带 `minecraft:` 前缀都行。
-        """
+            item(string): The thing to produce, e.g. "iron_ingot", "glass", "copper_ingot".
+                The `minecraft:` prefix is optional."""
         if (deny := self._guard(event)):
             return deny
         if not self._cfg("enable_craft", True):
@@ -873,12 +913,11 @@ class McBodyPlugin(Star):
 
     @filter.llm_tool(name="mc_attack")
     async def mc_attack(self, event: AstrMessageEvent):
-        """攻击你准星正指着的实体（打怪、打动物）。
-
-        会先看看准星指着什么。如果没指着实体，会明确告诉你。
-        想先转向某个目标，可以先调 `mc_use_on` 的同款思路 —— 但目前没有独立的转向工具，
-        通常是先走过去（`mc_goto` / `mc_follow`）让目标进视野。
-        """
+        """Attack whatever entity your CROSSHAIR is on (fight mobs, hit animals).
+        
+        It first checks what the crosshair points at. If that is not an entity, it tells you clearly.
+        To aim at something first, use `mc_aim(x, y, z)` to lock your view onto it.
+        (Usually you walk closer first with `mc_goto` / `mc_follow` to get the target into view.)"""
         if (deny := self._guard(event)):
             return deny
         _, err = await self._call("mcb attack")
@@ -888,10 +927,11 @@ class McBodyPlugin(Star):
 
     @filter.llm_tool(name="mc_threats")
     async def mc_threats(self, event: AstrMessageEvent):
-        """看附近有没有怪、多远、什么怪、多少血、**是不是正瞄着你**（服务端直查世界，很准）。
-
-        想判断"周围安不安全""该不该打""往哪跑"就用它。`targeting=true` 表示它正盯着你。
-        """
+        """See whether there are mobs nearby, how far, what kind, how much health,
+        and **whether they are aiming at you** (the server reads the world directly, so this is accurate).
+        
+        Use it to judge "is it safe around here", "should I fight", "which way do I run".
+        `targeting=true` means that mob is staring at you."""
         if (deny := self._guard(event)):
             return deny
         data, err = await self._call("mcb threats 24")
@@ -901,17 +941,18 @@ class McBodyPlugin(Star):
 
     @filter.llm_tool(name="mc_stance")
     async def mc_stance(self, event: AstrMessageEvent, mode: str):
-        """设**战斗姿态** —— "要不要主动打怪"这件事由你自己决定。
-
-        · `defend`（默认）被动：只在**挨打**或**怪正瞄着你**时才还手，够不着**不追**
-        · `hunt` 主动清怪：5 格内有敌对就上去打，够不着会追过去
-
-        ⚠️ 两种姿态下**挨打都会立刻自动还手**（反射，不经过你），所以 defend 不会被打死。
-        想安静挖矿设 defend；想清场设 hunt。
-
+        """Set your COMBAT STANCE -- whether to hunt mobs is your decision.
+        
+        - `defend` (default) passive: only fights back when HIT or when a mob is AIMING at you;
+          does not CHASE things out of reach
+        - `hunt` actively clear mobs: attacks any hostile within 5 blocks, chases ones out of reach
+        
+        WARNING: under BOTH stances, being hit triggers an immediate automatic counterattack
+        (a reflex, it does not go through you), so `defend` will not get you killed.
+        Set `defend` to mine in peace; set `hunt` to clear an area.
+        
         Args:
-            mode(string): 只能是 "defend"（被动还手）或 "hunt"（主动清怪）。
-        """
+            mode(string): Either "defend" (passive) or "hunt" (actively clear)."""
         if (deny := self._guard(event)):
             return deny
         if not self._cfg("enable_mc_stance_tool", True):
@@ -926,14 +967,16 @@ class McBodyPlugin(Star):
 
     @filter.llm_tool(name="mc_retreat")
     async def mc_retreat(self, event: AstrMessageEvent, toward: str = "owner"):
-        """**主动脱战**：立刻停手往安全方向撤。血量好好的也能用（打不过、不想打、想回来找人）。
-
-        · `owner`（默认）朝用户跑，会合最安全；他不在线/不同维度则自动退化成 safe
-        · `safe` 背离最近的怪跑一段
-
+        """BREAK OFF combat: stop fighting immediately and back away toward safety.
+        Works even at full health (you are losing, do not want to fight, or want to come back and
+        find someone).
+        
+        - `owner` (default) run toward the user -- safest reunion; falls back to `safe` if he is
+          offline or in another dimension
+        - `safe` run away from the nearest mob for a while
+        
         Args:
-            toward(string): "owner"（朝用户跑，默认）或 "safe"（背离怪跑）。
-        """
+            toward(string): "owner" (run toward the user, default) or "safe" (run away from mobs)."""
         if (deny := self._guard(event)):
             return deny
         try:
@@ -946,21 +989,27 @@ class McBodyPlugin(Star):
 
     @filter.llm_tool(name="mc_task")
     async def mc_task(self, event: AstrMessageEvent, task: str, at: str = ""):
-        """派她去做一件**多步的事**，程序自己一步步做完。别的工具是**一个动作**，这个是**一件事**。
-
-        现在能派的：
-        · `torch` 沿途照明 —— 沿一个方向走，路边隔一段插一根火把。需要身上有火把
-        · `farm` 种田 —— 走到田边，收割+补种。有锄头/种子更好，没有也能只收（最多 3 分钟）
-
-        派出去她自己在做，你不用盯着 —— 进度看 mc_state 的「正在做的事」，停用 mc_task_stop。
-        ⚠️ **挨打/濒死会自动打断**她（保命优先），但那是**挂起**不是取消，危险过去她自己接着做。
-
-        ⚠️ 田远了（超过 16 格）她**扫不到**，`farm` 会扑空 —— 那就用 `at` 告诉她田在哪。
-
+        """Send her off to do a MULTI-STEP job; the program carries it out step by step.
+        Other tools are ONE ACTION; this is ONE JOB.
+        
+        Currently available:
+        - `torch` path lighting -- walk in one direction, placing a torch every so often.
+          Needs torches in her inventory.
+        - `farm` farming -- walk to the field, harvest and replant. A hoe / seeds help but are not
+          required (harvest-only takes up to 3 minutes).
+        
+        She does it on her own; you do not have to watch. Progress shows up under "what you are
+        doing" in `mc_state`; stop it with `mc_task_stop`.
+        WARNING: being hit / nearly dying interrupts her (survival first), but that is a SUSPENSION,
+        not a cancellation -- she picks it back up once the danger passes.
+        
+        WARNING: a field further than ~16 blocks is OUT OF SCAN RANGE and `farm` will come up empty --
+        use `at` to tell her where the field is.
+        
         Args:
-            task(string): 任务名。不认得的名字会被拒绝并列出可选项。
-            at(string): 可选，任务的地点，格式 "x z"（例如 "-50 120"）。种田时用它指定田的位置。
-        """
+            task(string): The task name. An unknown name is rejected and the options are listed.
+            at(string): Optional location for the task, format "x z" (e.g. "-50 120").
+                For farming, use it to point at the field."""
         if (deny := self._guard(event)):
             return deny
         if not self._cfg("enable_mc_task", True):
@@ -979,24 +1028,26 @@ class McBodyPlugin(Star):
 
     @filter.llm_tool(name="mc_task_stop")
     async def mc_task_stop(self, event: AstrMessageEvent):
-        """丢掉当前任务，回到闲着。
-
-        ⚠️ 是**取消**不是暂停，进度会丢。"先去做别的、回头接着做"不用这个，直接给新指令即可。
-        """
+        """Throw away the current task and go back to idling.
+        
+        WARNING: this is a CANCEL, not a pause -- progress is lost. To "do something else first and
+        come back to it later" do NOT use this; just give the new instruction."""
         if (deny := self._guard(event)):
             return deny
         return await self.tasks.stop()
 
     @filter.llm_tool(name="mc_journal")
     async def mc_journal(self, event: AstrMessageEvent, count: int = 20):
-        """翻**状态日志**：刚才都发生了什么（分类：任务/反射/合成/身体/出错）。
-
-        用户问"你刚才在干嘛"而你记不清、或想确认某件事成没成时用它。
-        ⚠️ mc_state 里已带最近 10 条，这个是往前多翻。日志**只在内存**，插件重载就清空。
-
+        """Browse the STATE LOG: what just happened, by category
+        (task / reflex / craft / body / error).
+        
+        Use it when the user asks "what were you just doing" and you cannot remember, or to confirm
+        whether something succeeded.
+        WARNING: `mc_state` already carries the last 10 entries; this one goes further back.
+        The log lives IN MEMORY ONLY -- a plugin reload clears it.
+        
         Args:
-            count(number): 往回翻多少条，默认 20，最多 100。
-        """
+            count(number): How many entries back, default 20, max 100."""
         if (deny := self._guard(event)):
             return deny
         try:
@@ -1009,25 +1060,26 @@ class McBodyPlugin(Star):
 
     @filter.llm_tool(name="mc_events")
     async def mc_events(self, event: AstrMessageEvent, count: int = 20):
-        """**刚才都发生了什么** —— 挨打/死亡/谁进服退服/你背包里多了少了什么。
-
-        什么时候用：
-        · 你身上东西突然变了，想知道是**谁给的**（"得到 diamond_sword×1"）
-        · 你掉血了但没看清是谁打的（"挨打 ← zombie -3.5hp 剩 12.7"）
-        · 想知道**谁在线**、刚谁进服了
-        · 用户问"刚才有人来过吗"
-
-        ⚠️ 和 `mc_journal` 的分工：
-        · `mc_events` = **外面发生的事**（别人做了什么、世界发生了什么）
-        · `mc_journal` = **你自己做的事**（插了几根火把、烧成了什么）
-
-        ⚠️ **背包变动是攒过才报的** —— 挖矿时不会一条一块石头地刷屏，
-        而是合成一行"得到 cobblestone×23"。所以你看到的是**聚合后的**，
-        不是逐次的时间线。想要精确的当下状态就 `mc_inventory`。
-
+        """What just happened -- damage taken / deaths / who logged in or out /
+        what appeared in or left your inventory.
+        
+        When to use it:
+        - Your inventory suddenly changed and you want to know WHO gave you something
+          ("got diamond_sword x1")
+        - You lost health but did not see what hit you ("hurt <- zombie -3.5hp left 12.7")
+        - You want to know WHO IS ONLINE, or who just logged in
+        - The user asks "has anyone been around"
+        
+        WARNING: how this differs from `mc_journal`:
+        - `mc_events` = things happening OUT THERE (what others did, what the world did)
+        - `mc_journal` = things YOU did (how many torches you placed, what you smelted)
+        
+        WARNING: inventory changes are BATCHED -- mining does not spam one line per cobblestone, it
+        comes as one line "got cobblestone x23". So what you see is AGGREGATED, not a per-event
+        timeline. For precise current state use `mc_inventory`.
+        
         Args:
-            count(number): 往回看多少条，默认 20，最多 60。
-        """
+            count(number): How many entries back, default 20, max 60."""
         if (deny := self._guard(event)):
             return deny
         try:
@@ -1038,18 +1090,20 @@ class McBodyPlugin(Star):
 
     @filter.llm_tool(name="mc_around")
     async def mc_around(self, event: AstrMessageEvent):
-        """**看看周围一圈有什么** —— 大范围概览：地势 + 地表成分 + 附近的箱子/机器/设施。
-
-        ⚠️ 和另外两个的**分工**：
-        · 问"**周围环境怎么样**""这附近有箱子吗""地势平不平" → **用这个**（覆盖 ~96 格）
-        · 问"**这一格是什么**"（准星指着的） → 用 `mc_lookat`（精确到方块、零成本）
-        · 问"**某个具体方块在哪**"（工作台/熔炉的坐标） → 用 `mc_goto near`
-
-        ⚠️ **它看不见什么**：只列**有方块实体**的设施（箱子/熔炉/木桶/床/告示牌/
-        刷怪笼/传送门）。**工作台、铁砧、石切机、堆肥桶这些不在里面** —— 找它们用 `mc_goto near`。
-
-        ⚠️ 慢 —— 一次约 50ms 服务端时间（一个 tick），别连着猛调。
-        """
+        """Look at what is around you -- a wide overview: terrain + surface
+        composition + nearby chests / machines / facilities.
+        
+        WARNING: how it differs from the other two:
+        - "what is the environment like", "is there a chest nearby", "is the ground flat" -> THIS
+          (covers ~96 blocks)
+        - "what is this block" (the one under the crosshair) -> `mc_lookat` (block-accurate, free)
+        - "where is a specific block" (coords of a crafting table / furnace) -> `mc_goto near`
+        
+        WARNING: what it CANNOT see -- it only lists facilities that HAVE a block entity
+        (chest / furnace / barrel / bed / sign / spawner / portal). Crafting tables, anvils,
+        stonecutters and composters are NOT in there -- use `mc_goto near` to find those.
+        
+        WARNING: slow -- about 50ms of server time per call (one tick); do not call it repeatedly."""
         if (deny := self._guard(event)):
             return deny
         data, err = await self._call("mcb around")
@@ -1059,18 +1113,18 @@ class McBodyPlugin(Star):
 
     @filter.llm_tool(name="mc_where")
     async def mc_where(self, event: AstrMessageEvent, player: str):
-        """查**某个玩家在哪** —— 你、或者服务器上任何一个人。
-
-        什么时候用：
-        · 想过去找某人 → 先问出坐标，再 `mc_goto` 过去
-        · 想知道自己离对方多远
-
-        ⚠️ 这是**服务端直接读的真值**，不需要对方说话或同意。
-        所以用的时候心里有数：你在问"他在哪"，而不是"他刚才在哪说的"。
-
+        """Look up WHERE a player is -- yourself, or anyone on the server.
+        
+        When to use it:
+        - You want to go find someone -> get their coordinates, then `mc_goto` there
+        - You want to know how far away they are
+        
+        WARNING: this reads the authoritative server value directly. It does not require them to
+        speak or to agree. So be aware of what you are doing: you are asking "where is he", not
+        "where did he say he was".
+        
         Args:
-            player(string): 玩家名（游戏里的 ID）。
-        """
+            player(string): The player name (in-game id)."""
         if (deny := self._guard(event)):
             return deny
         who = " ".join(str(player or "").split())
@@ -1083,19 +1137,21 @@ class McBodyPlugin(Star):
 
     @filter.llm_tool(name="mc_chat_log")
     async def mc_chat_log(self, event: AstrMessageEvent, count: int = 20):
-        """**翻游戏公屏** —— 谁在游戏里说了什么，连他当时站在哪。
-
-        什么时候用：
-        · 用户问"刚才有人在游戏里说话吗""他们聊了什么"
-        · 你在游戏里被叫了名字、想回头看上下文
-        · 想知道某个人**在哪**说的那句话（每条都带他的坐标和离你多远）
-
-        ⚠️ **你本来就听得见公屏** —— 有人叫你的名字会直接把你唤醒；
-        新消息也会自动出现在你每轮收到的 `[chat]` 段里。这个工具是给你**主动往前翻**用的。
-
+        """Browse the IN-GAME PUBLIC CHAT -- who said what, and where they were
+        standing at the time.
+        
+        When to use it:
+        - The user asks "did anyone talk in game", "what were they talking about"
+        - You were called by name in game and want the surrounding context
+        - You want to know WHERE someone was when they said it (every line carries their
+          coordinates and how far they were from you)
+        
+        WARNING: you ALREADY HEAR the public chat -- someone calling your name wakes you directly,
+        and new lines show up automatically in the `[chat]` section you receive each turn. This tool
+        is for actively scrolling BACK.
+        
         Args:
-            count(number): 往回翻多少条，默认 20，最多 50。
-        """
+            count(number): How many entries back, default 20, max 50."""
         if (deny := self._guard(event)):
             return deny
         try:
@@ -1110,30 +1166,77 @@ class McBodyPlugin(Star):
             return "游戏公屏是空的 —— 还没人说过话。"
         return f"游戏公屏最近 {min(n, len(lines))} 条：\n" + render.describe_chat(lines, n)
 
+    @filter.llm_tool(name="mc_aim")
+    async def mc_aim(self, event: AstrMessageEvent, x: float = 0, y: float = 0,
+                     z: float = 0, release: bool = False):
+        """LOCK YOUR LINE OF SIGHT onto something -- keep looking at it even while
+        you are walking.
+        
+        This is the missing half of "walk over there WHILE WATCHING that chest": previously, as soon
+        as you walked, Baritone twisted your head back to the direction of travel, so you could
+        never walk and stare at something at the same time.
+        
+        - `mc_aim(x, y, z)` -- stare at those coordinates (RECOMPUTED EVERY TICK, so it stays on
+          that thing no matter how far you walk)
+        - `mc_aim(release=True)` -- release it and give your view back to the walking logic
+          (REMEMBER to release when you are done)
+        
+        WARNING: when to release -- as soon as you have seen what you came for. If you leave it
+        locked, you will no longer naturally face your direction of travel while walking; you will
+        walk sideways, which looks very odd to other players.
+        
+        WARNING: how it differs from `mc_lookat` (the crosshair):
+        - `mc_lookat` = ASK "what am I looking at" (read-only, instantaneous)
+        - `mc_aim` = COMMAND "keep looking there from now on" (stays in effect until released)
+        
+        Args:
+            x(number): Target X.
+            y(number): Target Y.
+            z(number): Target Z.
+            release(bool): true = release the lock (then x/y/z are not needed)."""
+        if (deny := self._guard(event)):
+            return deny
+        if release:
+            _, err = await self._call("mcb releaseAim")
+            if err:
+                return f"松不开：{err}"
+            return "松开视线了 —— 现在走路时会自然朝向行进方向。"
+        try:
+            tx, ty, tz = int(float(x)), int(float(y)), int(float(z))
+        except (TypeError, ValueError):
+            return "坐标不合法 —— 要么给三个数，要么 release=true。"
+        _, err = await self._call(f"mcb aimAt {tx} {ty} {tz}")
+        if err:
+            return f"锁不住：{err}"
+        return (f"视线锁在 ({tx}, {ty}, {tz}) 了 —— 接下来**就算走路也会一直看着那儿**，"
+                "而且是每 tick 重算，不会因为走远就偏。看完记得 `mc_aim(release=true)` 松开。")
+
     @filter.llm_tool(name="mc_screenshot")
     async def mc_screenshot(self, event: AstrMessageEvent, question: str = ""):
-        """**看一眼你周围** —— 截下你游戏画面，转述成文字告诉你。
-
-        你平时只能"读数据"，看不见画面。这个工具给你**眼睛**。
-        ⚠️ 要"我正看着什么"（准星指的那个方块/生物）请走 `mc_lookat` ——
-        它是即时的、免费的；这个要截图 + 调识图 API，慢得多。
-
-        什么时候用：
-        · 想知道"这儿长什么样""这地方好看吗"（**风景和整体印象**，
-          这是 `mc_lookat` 给不了的）
-        · 数据说不清的时候（`mc_state` 只有坐标，看不见风景）
-        · 想确认某件事成没成（东西放对地方了吗）
-
-        ⚠️ 三件事你得知道：
-        1. **慢** —— 截图 + 传 + 识图，好几秒到十几秒
-        2. **糊** —— 你的画面只有 640×360，看清轮廓和颜色，认不清小字
-        3. **只照到你正对着的，而且远处是雾** —— 第一人称视角，背后的看不见；
-           你的视距只有 32 格，超出就是雾。想换个角度就先走过去或者转头，再调一次
-
+        """TAKE A LOOK AROUND YOU -- capture your game screen and have it
+        described to you in words.
+        
+        Normally you can only "read data" and cannot see the picture. This tool gives you EYES.
+        WARNING: for "what am I looking at" (the block / mob under the crosshair) use `mc_lookat`
+        instead -- that one is instant and free; this one captures a screenshot and calls a vision
+        API, so it is much slower.
+        
+        When to use it:
+        - You want to know "what does this place look like", "is this a nice view" (SCENERY and
+          overall impression -- something `mc_lookat` cannot give you)
+        - The data does not tell you enough (`mc_state` only has coordinates, no scenery)
+        - You want to confirm something worked (did the thing end up in the right place)
+        
+        WARNING: three things to know:
+        1. SLOW -- capture + transfer + vision, several seconds to tens of seconds
+        2. BLURRY -- your screen is only 640x360; you can make out outlines and colors, not small text
+        3. It only shows what you are FACING, and distance fades into fog -- first-person view, you
+           cannot see behind you; your render distance is only 32 blocks, beyond that is fog.
+           To look somewhere else, walk or turn first, then call it again.
+        
         Args:
-            question(string): 你想知道什么（可选），比如"我面前是什么方块""田里熟了没"。
-                不填就是"描述一下你看到的东西"。
-        """
+            question(string): What you want to know (optional), e.g. "what block is in front of me",
+                "are the crops ready". Leave it out for "describe what you see"."""
         if (deny := self._guard(event)):
             return deny
         if not self._cfg("enable_sight", True):
@@ -1142,19 +1245,22 @@ class McBodyPlugin(Star):
 
     @filter.llm_tool(name="mc_lookat")
     async def mc_lookat(self, event: AstrMessageEvent):
-        """**你现在正看着什么** —— 准星指着的那一样东西，立刻就有答案。
-
-        看的是**视线尽头最近的那样东西**：如果是一只生物/掉落物，就回它；
-        否则回你正对着的方块（含它在哪个面）。
-        顺带回你的**朝向**（`facing`：south/northwest…）—— 你讲方位时能用上。
-
-        ⚠️ 和 `mc_screenshot` 的分工：
-        · 问"**这一格是什么**""我看的是鸡还是石头" → **用这个**（即时、免费）
-        · 问"**这儿长什么样**""周围环境如何" → 用 `mc_screenshot`（慢、要调 API）
-
-        ⚠️ 你的视线只有约 4.5 格。`target=none` 说明你在看空气/看天 ——
-        想看远处的东西得先 `mc_goto` 走过去，或者调 `mc_screenshot` 看全景。
-        """
+        """WHAT ARE YOU LOOKING AT RIGHT NOW -- the single thing under your
+        crosshair, answered instantly.
+        
+        It reports the NEAREST thing at the end of your line of sight: a mob or dropped item if
+        there is one, otherwise the block you are facing (including which face).
+        It also returns your FACING (`facing`: south / northwest ...), which you can use when
+        talking about directions.
+        
+        WARNING: how it differs from `mc_screenshot`:
+        - "what is this block", "am I looking at a chicken or a stone" -> THIS (instant, free)
+        - "what does this place look like", "what is the environment like" -> `mc_screenshot`
+          (slow, calls an API)
+        
+        WARNING: your reach is only about 4.5 blocks. `target=none` means you are looking at air or
+        at the sky -- to see something far away, `mc_goto` closer first, or use `mc_screenshot` for
+        the wide view."""
         if (deny := self._guard(event)):
             return deny
         data, err = await self._call("mcb lookat")

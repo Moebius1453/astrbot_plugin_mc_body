@@ -248,11 +248,16 @@ def _describe(kind: str, who: str, raw: dict, text: str) -> str:
     bits = [f"[{label}]"]
 
     if kind == "hurt":
+        # ⚠️ 服务端给的 `by` 是**伤害类型**（`mob` / `arrow` / `fall`…），不是攻击者名字。
+        #    2026-10-11 实测：KubeJS 递过来的 `DamageSource` **实体访问器一个都没有**
+        #    （`getEntity`/`getDirectEntity` 全 notFn），只有 `String(src)` 能抠出类型。
+        #    **那就报类型 —— 不编造攻击者。** "摔的"和"怪咬的"处理方式完全不同，类型本身就有用。
         by = raw.get("by") or who
         dmg = raw.get("dmg")
         hp = raw.get("hp")
-        bits.append(str(text))
-        if by and str(by) not in ("环境", "?"):
+        victim = str(text).replace(" 挨打", "").strip() or str(text)
+        bits.append(victim)
+        if by and str(by) not in ("环境", "?", ""):
             bits.append(f"← {by}")
         if isinstance(dmg, (int, float)):
             bits.append(f"-{dmg:g}hp")
