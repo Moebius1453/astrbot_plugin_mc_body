@@ -221,6 +221,109 @@ def is_default(menu: dict | None) -> bool:
     return isinstance(menu, dict) and bool(menu.get("def"))
 
 
+# ---- "这一格是谁的" 和 "这一下是不是在拿" ---------------------------------
+#
+# 权限层要判"她从容器拿东西"，就得先知道点的那一格属于谁。
+# 这是第 3 批 3.2 的槽位角色标记解锁的能力 —— 在那之前判不出来，
+# 所以 take(*) 那条规则写好了却一直没接线。
+
+
+def slot_side(menu: dict | None, slot: int) -> str | None:
+    """这一格属于谁那边。
+
+    'mine'      她自己的背包
+    'bench'     合成台的产物格 / 材料格 —— 那是"用手上的东西做东西"，不是谁的东西
+    'container' 容器侧（箱子格、机器产出格）
+    None        判不出来
+
+    注意： 'bench' 单独分出来是必须的 —— 合成产物格（R）和材料格（G）如果算成
+    "容器侧"，那 mc_craft 里点产物格取成品就会被权限门拦下，合成整个用不了。
+    用她自己的材料做出来的东西，不该问主人。
+
+    两条来源，按可靠程度排：
+      1 客户端的每格角色串 —— 认的是槽位对象本身（Y = 她的背包）
+      2 CONTAINERS 表的 inv_base/hot_base —— 老路子，只对进过表的容器有用
+    都判不出来回 None。调用方按"不知道"处理，别猜。
+    """
+    if not isinstance(menu, dict):
+        return None
+    try:
+        idx = int(slot)
+    except (TypeError, ValueError):
+        return None
+    roles = str(menu.get("roles") or "")
+    if roles and 0 <= idx < len(roles):
+        r = roles[idx]
+        if r == "Y":
+            return "mine"
+        if r in ("R", "G"):
+            return "bench"
+        if r in ("C", "O"):
+            return "container"
+        # '?' 认不出来 —— 往下走，试试表
+    lay = layout_for(menu)
+    if isinstance(lay, dict):
+        inv_base = lay.get("inv_base")
+        hot_base = lay.get("hot_base")
+        if isinstance(inv_base, int) and isinstance(hot_base, int):
+            # 背包段 27 格 + 快捷栏 9 格，快捷栏在最后
+            if inv_base <= idx < hot_base + 9:
+                return "mine"
+            # 合成格和产物格在表里是 grid / result，单独认一下
+            for key in ("grid", "result"):
+                got = lay.get(key)
+                if isinstance(got, int) and got == idx:
+                    return "bench"
+                if isinstance(got, list) and idx in got:
+                    return "bench"
+            return "container"
+    return None
+
+
+def _slot_has_item(menu: dict, slot: int) -> bool:
+    for it in (menu.get("items") or []):
+        if not isinstance(it, dict):
+            continue
+        try:
+            if int(it.get("i")) != int(slot):
+                continue
+            return float(it.get("c") or 0) > 0
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
+def takes_from_container(menu: dict | None, slot: int, mode: int,
+                         hand_empty: bool) -> bool:
+    """这一下点格子，是不是"从容器里拿东西出来"。
+
+    判据（保守优先）：
+      格子得在容器侧，而且那格上有东西 —— 空格子上拿不到任何东西。
+      然后看这一下往哪边搬：
+        mode=1（shift 快速移动）  -> 容器 到 她那儿，是拿
+        mode=0/6（普通点 / 双击） -> 空手点算拿，手上有东西算往里放
+        其余（交换 2 / 创造复制 3 / 丢 4 / 拖拽 5）-> 说不清，有东西就按拿算
+
+    注意： 这条只管 mc_click 那条路。合成和冶炼走的是 ContainerIO 自己的点格子，
+    不在这一层 —— 那是在做主人让她做的事，不是在翻主人的箱子（见 docs\\22 §3 第 5 条承认的差距）。
+    """
+    if not isinstance(menu, dict):
+        return False
+    if slot_side(menu, slot) != "container":
+        return False
+    if not _slot_has_item(menu, slot):
+        return False
+    try:
+        m = int(mode)
+    except (TypeError, ValueError):
+        return True
+    if m == 1:
+        return True
+    if m in (0, 6):
+        return bool(hand_empty)
+    return True
+
+
 # ---- 原语 -----------------------------------------------------------------
 
 class ContainerIO:

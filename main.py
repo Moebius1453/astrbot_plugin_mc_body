@@ -1305,6 +1305,20 @@ class McBodyPlugin(Star):
                 hint="不确定就用默认的 mode=1，别自己填数字",
             )
         before = await self._menu_snapshot()
+        # 权限门：从容器里拿东西要先过闸（take(*) 走 ask，用户 2026-10-11 早先定的）。
+        # 注意： 判"这一下是不是在拿"要用到"她手上空不空"，所以得先读一次手。
+        #    读不到就按"空手"算 —— 这一门是保护性的，宁可多问一次，
+        #    也别让一次读不到变成"她默默把主人的东西拿走了"。
+        _, held_n = await self._held_stack()
+        hand_empty = True if held_n is None else (held_n == 0)
+        if mcb_containers.takes_from_container(before, n, m, hand_empty):
+            refusal = await self._permit_or_refuse(
+                permission.Action(permission.Kind.TAKE),
+                f"从容器第 {n} 格拿东西",
+                facts=permission.Facts(),
+            )
+            if refusal:
+                return refusal
         _, err = await self._call(f"mcb clickSlot {n} 0 {m}")
         if err:
             return render.reword(err, "点格子失败", kind=render.Kind.REFUSED,
