@@ -310,12 +310,16 @@ var mcbLastUsePos = null
 // 形状不规则的模组方块，拿"上表面中心"去点会放错面或者直接失败。
 //
 // 三档，取第一个"看得见且够得着"的：
-//   1 轮廓中心 —— 整块轮廓盒的中心（大多数方块第一档就成了）
-//   2 各面中心 —— 朝向她的那几个面的中心
-//   3 面上离眼最近点 —— 把眼睛投影到那个面上
+//   1 朝她的那一面的中心 —— 人和箱子打交道都是从朝着自己的那面伸手
+//   2 各面中心 —— 其余几个面的中心
+//   3 面上离眼最近点 —— 把眼睛投影到朝她的那一面上
 //
 // 返回 { point: Vec3, face: Direction, via: 哪一档, blocked: 挡住它的方块还是 null }。
-// 全都不行时退回"上表面中心" —— 保持老行为，不让它比以前更差。
+// 全都不行时退回"顶面中心" —— 保持能用的老行为，不让它比以前更差。
+//
+// 注意： 返回的 point 一定落在 face 上。这条是硬要求 ——
+//    点和面不一致（比如"方块中心 + UP"）会让服务端不认这一下，
+//    表现是开容器没反应（见下面第 1 档的注释）。
 function mcbPickHit(mc, bp, state) {
   var $V3 = null, $DIR = null
   try {
@@ -324,10 +328,9 @@ function mcbPickHit(mc, bp, state) {
   } catch (e0) {
     return { point: null, face: null, via: 'unavailable', blocked: null }
   }
-  var fallback = {
-    point: $V3.atCenterOf(bp), face: $DIR.UP, via: 'fallback-top', blocked: null
+  if ($V3 === null || $DIR === null) {
+    return { point: null, face: null, via: 'unavailable', blocked: null }
   }
-  if ($V3 === null || $DIR === null) return fallback
 
   var p = mc.player
   var ex = Number(p.x), ey = Number(p.y) + Number(p.eyeHeight), ez = Number(p.z)
@@ -335,14 +338,20 @@ function mcbPickHit(mc, bp, state) {
   try { reach = Number(p.blockInteractionRange) } catch (eR) { }
 
   // 方块的轮廓盒；读不到就按整格算
-  var minX = bp.getX(), minY = bp.getY(), minZ = bp.getZ()
-  var maxX = minX + 1, maxY = minY + 1, maxZ = minZ + 1
+  //
+  // 重点： shape.bounds() 给的是**方块局部坐标**（0~1），不是世界坐标。
+  //    忘了加方块原点，点会算到世界原点附近 —— 2026-10-11 实测日志就是
+  //    "点=0,0.5,0.5"，离目标方块一百多格，服务端当然不认。
+  //    而且这个错会**静默**：距离判定拿到非数字时 NaN > reach 是 false，会当成"够得着"放过。
+  var bx = Number(bp.getX()), by = Number(bp.getY()), bz = Number(bp.getZ())
+  var minX = bx, minY = by, minZ = bz
+  var maxX = bx + 1, maxY = by + 1, maxZ = bz + 1
   try {
     var shape = state.getShape(mc.level, bp)
     var bb = shape.bounds()
     if (bb !== null && bb !== undefined) {
-      minX = Number(bb.minX); minY = Number(bb.minY); minZ = Number(bb.minZ)
-      maxX = Number(bb.maxX); maxY = Number(bb.maxY); maxZ = Number(bb.maxZ)
+      minX = bx + Number(bb.minX); minY = by + Number(bb.minY); minZ = bz + Number(bb.minZ)
+      maxX = bx + Number(bb.maxX); maxY = by + Number(bb.maxY); maxZ = bz + Number(bb.maxZ)
     }
   } catch (eShape) { }
 
@@ -364,7 +373,11 @@ function mcbPickHit(mc, bp, state) {
   })
 
   function ok(pt) {
-    var ddx = pt.x - ex, ddy = pt.y - ey, ddz = pt.z - ez
+    // 显式转数字：读不到就判这一档不行，别让 NaN 静默通过
+    // （NaN > reach 是 false，会被当成"够得着"）
+    var px = Number(pt.x), py = Number(pt.y), pz = Number(pt.z)
+    if (isNaN(px) || isNaN(py) || isNaN(pz)) return false
+    var ddx = px - ex, ddy = py - ey, ddz = pz - ez
     if (Math.sqrt(ddx * ddx + ddy * ddy + ddz * ddz) > reach) return false
     return mcbVisible(mc, ex, ey, ez, pt, bp)
   }
@@ -372,17 +385,32 @@ function mcbPickHit(mc, bp, state) {
   // 1 轮廓中心
   var cand = $V3.atCenterOf(bp)
   try { cand = new $V3(cxm, cym, czm) } catch (eC) { }
-  if (ok(cand)) return { point: cand, face: $DIR.UP, via: 'outline-center', blocked: null }
+  // 1 朝她的那一面的中心。
+  //
+  // 注意： 这里**不能**用"方块中心 + 写死 UP"。那在几何上自相矛盾：
+  //    中心点在方块内部，UP 面在顶面，两者差半格。
+  //    2026-10-11 实测（闲逛关掉、位置朝向全固定的 A/B 对照）：
+  //      构造命中带这个矛盾 -> 开容器服务端不认，menu 一直是 id=0
+  //      同一格同一朝向换准星那条（面=west，点落在朝她那面上）-> 立刻开
+  //    放方块时这个矛盾没暴露（方块能放到相邻格，服务端不太较真），所以一直没发现。
+  //    点和面必须一致，而且面要取朝她的那一个 —— 人也都是从朝着自己的那面伸手。
+  var facing = faces.length > 0 ? faces[0] : $DIR.UP
+  var c1 = mcbFacePoint(facing, minX, minY, minZ, maxX, maxY, maxZ, 0.5)
+  if (ok(c1)) return { point: c1, face: facing, via: 'facing-center', blocked: null }
 
-  // 2 各面中心 / 3 面上离眼最近点
-  for (var k = 0; k < faces.length; k++) {
-    var f = faces[k]
-    var fc = mcbFacePoint(f, minX, minY, minZ, maxX, maxY, maxZ, 0.5)
-    if (ok(fc)) return { point: fc, face: f, via: 'face-center', blocked: null }
-    var fp = mcbFacePoint(f, minX, minY, minZ, maxX, maxY, maxZ, null, ex, ey, ez)
-    if (ok(fp)) return { point: fp, face: f, via: 'face-nearest', blocked: null }
+  // 2 其余各面的中心
+  for (var k = 1; k < faces.length; k++) {
+    var fc = mcbFacePoint(faces[k], minX, minY, minZ, maxX, maxY, maxZ, 0.5)
+    if (ok(fc)) return { point: fc, face: faces[k], via: 'face-center', blocked: null }
   }
-  return fallback
+
+  // 3 朝她的那一面上离眼最近的点
+  var c3 = mcbFacePoint(facing, minX, minY, minZ, maxX, maxY, maxZ, null, ex, ey, ez)
+  if (ok(c3)) return { point: c3, face: facing, via: 'facing-nearest', blocked: null }
+
+  // 兜底：顶面中心。注意也要落在面上 —— 别再退回"方块中心 + UP"那个矛盾组合。
+  var fb = mcbFacePoint($DIR.UP, minX, minY, minZ, maxX, maxY, maxZ, 0.5)
+  return { point: fb, face: $DIR.UP, via: 'fallback-top', blocked: null }
 }
 
 // 取一个面上的点。ratio 给了就是"按比例取中心"（0.5 = 正中心）；
@@ -1165,9 +1193,16 @@ function mcbHandle(action, arg) {
       //    MCB_LOOK_PITCH_MAX 再把角度夹住（人不会为看脚边的方块把脖子折成 90°）。
       mcbLookTempAt(pick.point.x, pick.point.y, pick.point.z, MCB_LOOK_PITCH_MAX)
       mcbLastUsePos = { x: qx, y: qy, z: qz }      // clickSlot 要用它转头（3.5）
-      mcX.gameMode.useItemOn(mcX.player, $Hand.MAIN_HAND, thit)
+      // useItemOn 有返回值（InteractionResult）—— 打出来。
+      // 注意： 2026-10-11 排查"开容器没反应"时发现，光看"已发出"是没用的：
+      //    客户端可能自己就判了不干（返回 PASS/FAIL），包根本没发出去。
+      var res = mcX.gameMode.useItemOn(mcX.player, $Hand.MAIN_HAND, thit)
       console.info('[mcbridge] 已 useItemOn -> (' + qx + ',' + qy + ',' + qz + ')'
-        + ' 面=' + pick.face + ' 取点=' + pick.via)
+        + ' 面=' + pick.face + ' 取点=' + pick.via
+        + ' 点=' + Math.round(pick.point.x * 100) / 100 + ','
+        + Math.round(pick.point.y * 100) / 100 + ','
+        + Math.round(pick.point.z * 100) / 100
+        + ' 结果=' + String(res))
     } catch (eU) {
       console.error('[mcbridge] useOnAt 失败: ' + eU)
     }
@@ -1413,8 +1448,8 @@ function mcbHandle(action, arg) {
     try { diag += ' rot=' + Math.round(Number(mcB.player.yRot)) + '/' + Math.round(Number(mcB.player.xRot)) } catch (eR2) { }
     console.info('[mcbridge] useOn 诊断: ' + diag)
 
-    mcB.gameMode.useItemOn(mcB.player, $Hand.MAIN_HAND, hit)
-    console.info('[mcbridge] 已 useItemOn')
+    var resB = mcB.gameMode.useItemOn(mcB.player, $Hand.MAIN_HAND, hit)
+    console.info('[mcbridge] 已 useItemOn 结果=' + String(resB))
     return
   }
 

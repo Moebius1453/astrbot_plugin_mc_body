@@ -94,10 +94,14 @@ class EventFeed:
     """轮询服务端事件流，写进状态日志，并留一份给 mc_events 查。"""
 
     def __init__(self, bridge, journal=None, *, poll_interval: float = POLL_INTERVAL,
-                 keep: int = KEEP, on_permission=None) -> None:
+                 keep: int = KEEP, on_permission=None, on_event=None, on_tick=None) -> None:
         self.bridge = bridge
         self.journal = journal
         self.on_permission = on_permission
+        # 每收到一条**新**事件叫一下（熟度拿它攒"叫醒她的条目"，见 mcb/ripeness.py）
+        self.on_event = on_event
+        # 每轮拉取完叫一下 —— 熟度那条"躺够多久"需要一个心跳，借这个节拍走
+        self.on_tick = on_tick
         self.poll_interval = max(0.5, float(poll_interval))
         self.keep = max(4, int(keep))
 
@@ -171,14 +175,25 @@ class EventFeed:
         for raw in (data.get("lines") or []):
             fresh = isinstance(raw, dict) and _as_int(raw.get("seq")) > self._last_seq
             self._absorb(raw)
-            if fresh and raw.get("kind") == "permission" and self.on_permission is not None:
+            if not fresh:
+                continue
+            if raw.get("kind") == "permission" and self.on_permission is not None:
                 await self.on_permission(raw)
+            if self.on_event is not None:
+                with contextlib.suppress(Exception):
+                    self.on_event(raw)
         max_seq = _as_int(data.get("max"))
         if max_seq > self._last_seq:
             self._last_seq = max_seq
 
         # 背包 diff 跟着同一个循环走 —— 多一次 RCON 调用而已（服务端不读方块，很便宜）
         await self._poll_inventory()
+
+        # 熟度的心跳（见 mcb/ripeness.py）—— 借这个 2 秒一次的节拍，
+        # 不另起循环：那条"最老一条躺够多久"总得有人过问一下。
+        if self.on_tick is not None:
+            with contextlib.suppress(Exception):
+                await self.on_tick()
 
     # ---- 背包 diff（"谁给了我东西"）--------------------------------------
 
