@@ -151,11 +151,13 @@ class Smelter:
         self._note(f"开始烧 {name}（原料 {cands[0]}，燃料 {fuel[0]}）")
 
         io = ContainerIO(self.bridge)
-        if not await open_block(self.bridge, FURNACE_BLOCK, io, FURNACE_CLS,
-                                radius=FURNACE_RADIUS):
+        ok, why = await open_block(self.bridge, FURNACE_BLOCK, io, FURNACE_CLS,
+                                   radius=FURNACE_RADIUS)
+        if not ok:
+            # ⚠️ **报具体哪一步断的**，别混成一句 —— 见 containers.open_block 的说明
             return (
-                "附近没找到熔炉（或者开不出来）。"
-                f"⚠️ 服务端扫描半径上限 16 格 —— 站远了她就看不见。"
+                f"开不了熔炉：{why}。"
+                f"（服务端扫描半径上限 {FURNACE_RADIUS} 格 —— 站远了她就看不见）"
             )
 
         layout = await io.layout()

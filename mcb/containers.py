@@ -499,16 +499,22 @@ async def find_block(bridge, block_id: str, radius: int = 16) -> list[int] | Non
 
 
 async def open_block(bridge, block_id: str, io: "ContainerIO",
-                     want_cls: str, radius: int = 16) -> bool:
+                     want_cls: str, radius: int = 16) -> tuple[bool, str]:
     """**走过去 + 右键打开**指定方块，并确认开出来的界面类型对得上。
 
-    `want_cls` 是期望的界面类型关键字（比如 `"CraftingMenu"`）——
-    用来确认"真的开对了"，而不是"发了右键就当成功"。
+    返回 `(成功?, 原因)` —— ⚠️ **原因必须具体到是哪一步断的**。
+
+    踩过（2026-10-10）：调用方原来只拿到一个 bool，于是只能说
+    "要么附近没工作台/走不过去/容器顶不掉" —— **三种原因混成一句，她分不清该干什么**。
+    （她复述的原话："熔炉和石剑报同一个错：附近没工作台走不过去，或者手上开着别的容器顶不掉"。）
+
+    ⚠️⚠️ 而且原来 **`wait_baritone` 的返回值压根没被检查** —— 走不过去也照样右键，
+    然后报"界面不对"，于是"走不过去"和"容器顶不掉"在外部**看起来一模一样**。已修。
     """
     pos = await find_block(bridge, block_id, radius)
     if pos is None:
         logger.warning(f"[mc_body] 附近 {radius} 格内没有 {block_id}")
-        return False
+        return False, f"附近 {radius} 格内没找到 {block_id}"
     x, y, z = pos
     logger.info(f"[mc_body] 走向 {block_id} ({x},{y},{z})")
     await bridge.call("mcb closeGui")
@@ -519,15 +525,20 @@ async def open_block(bridge, block_id: str, io: "ContainerIO",
     got = await wait_baritone(bridge, timeout=30.0, target=(float(x), float(z)))
     logger.info(f"[mc_body] 走到 {block_id} 附近：{got}")
     await bridge.call("mcb stop")
+    if got != "arrived":
+        return False, f"{block_id} 在 ({x},{y},{z})，但**走不过去**（寻路超时）"
     await asyncio.sleep(0.5)
     await bridge.call(f"mcb useOnAt {x} {y} {z}")
     await asyncio.sleep(1.2)
     menu = await io.menu()
     cls = str((menu or {}).get("cls") or "")
     if want_cls in cls:
-        return True
+        return True, ""
     logger.warning(f"[mc_body] 开了 {cls}，不是期望的 {want_cls}")
-    return False
+    return False, (
+        f"走到 ({x},{y},{z}) 也右键了，但开出来的是 `{cls or '(空)'}`、不是 {want_cls}"
+        f" —— 多半是**手上还开着别的容器顶不掉**"
+    )
 
 
 async def run_process(io: "ContainerIO", layout: dict, inputs: list[list[str]],

@@ -45,6 +45,23 @@ from .mcb import render
 
 PLUGIN_NAME = "mc_body"
 
+# ---- 自主心跳（没人叫她的时候自己醒来）--------------------------------------
+#
+# ⚠️ **这会花钱** —— 每次唤醒都是一整轮 agent。见 `_start_self_loop` 的说明。
+SELF_LOOP_JOB = "mc_body_self_loop"
+
+# 唤醒时喂给她的那条"给未来自己的指令"。
+#
+# ⚠️ 它是**她的输入**，会以 user 消息的身份进会话 —— 所以：
+#   · 前缀用 `[mc:alert]`，按 `docs/12` §1.4 那条规范（从游戏来的数据必须自报家门）
+#   · 话要短、要中性，写清"该干什么"**和"可以不干"** ——
+#     不给她"必须做点什么"的压力，否则她会为了交差而瞎折腾（还白烧 token）。
+SELF_LOOP_NOTE = (
+    "[mc:alert] 自主心跳：现在没人叫你。看一眼自己现在的处境"
+    "（mc_state 看身体、mc_around 看周围），想接着做什么就去做；"
+    "**没事可做就什么都别做，也别发消息** —— 沉默是允许的，不用每次都汇报。"
+)
+
 # Minecraft 的世界边界
 COORD_LIMIT = 30_000_000
 PLAYER_NAME_RE = re.compile(r"^[A-Za-z0-9_]{1,16}$")
@@ -169,7 +186,10 @@ class McBodyPlugin(Star):
         from astrbot.core.message.components import Plain
         from astrbot.core.message.message_event_result import MessageChain
 
-        await self.context.send_message(umo, MessageChain([Plain(f"[body] {facts}")]))
+        # ⚠️ 前缀必须是 `[mc:...]` —— 规范：**凡是从 Minecraft 来的数据都带 `[mc:*]` 标签**。
+        #    这样她（和模型）一眼能分清"游戏世界"和"现实对话"，不会把游戏里的下雨
+        #    当成用户现实里在下雨（2026-10-10 实际发生过，见 docs/17 P2）。
+        await self.context.send_message(umo, MessageChain([Plain(f"[mc:alert] {facts}")]))
 
     async def _claim_walk_user(self, cmd: str, note: str) -> tuple[dict, str | None]:
         """**用户级**地声明 walk 通道。返回值和 `_call` 同形，方便原地替换。
@@ -282,6 +302,15 @@ class McBodyPlugin(Star):
         if self._cfg("enable_reflex", True):
             self.events.start()
 
+        # 自主心跳 —— **默认关**，因为它按轮烧 token（见 _start_self_loop）
+        if self._cfg("enable_self_loop", False):
+            await self._start_self_loop()
+        else:
+            logger.info(
+                f"[{PLUGIN_NAME}] 自主心跳已关闭（enable_self_loop=false）—— "
+                "她自己那个 future_task 工具仍然可用"
+            )
+
         logger.info(
             f"[{PLUGIN_NAME}] 已加载，RCON 目标 {self.bridge.host}:{self.bridge.port}"
         )
@@ -293,8 +322,68 @@ class McBodyPlugin(Star):
         await self.reflex.stop()
         await self.events.stop()
         await self.uplink.stop()
+        await self._drop_self_loop()
         await self.bridge.close()
         logger.info(f"[{PLUGIN_NAME}] 已卸载，RCON 连接已关闭")
+
+    # ---- 自主心跳 --------------------------------------------------------
+    #
+    # ⚠️⚠️ **这个会花钱，默认关着。**
+    #     每次唤醒 = **一整轮 agent**（30 个工具描述 + 记忆注入 + 状态包），
+    #     一次几千到上万 token。每 20 分钟醒一次 ≈ 一天 72 轮。
+    #
+    # 机制用的是 **AstrBot 原生的 `CronJobManager` 的 `active_agent` 任务**
+    # （`astrbot/core/cron/manager.py:172` → `_woke_main_agent`）——
+    # 它会重新构造事件跑满一轮 agent，并注入 `SendMessageToUserTool` 让她能开口。
+    # **别自己造轮子**（`asyncio` 定时器伪造唤醒那条路，框架已经替我们做好了）。
+    #
+    # ⚠️ 另一条**免费**的路：她自己的 `future_task` 工具（AstrBot 默认就注入给她了）。
+    #     接线说明里已经交代过。**先试那条** —— 她自己排的班比我们替她排的更合身。
+
+    async def _drop_self_loop(self) -> None:
+        """删掉同名的自主心跳任务。**加载和卸载都要调** —— 反复重载不能越积越多。"""
+        mgr = getattr(self.context, "cron_manager", None)
+        if mgr is None:
+            return
+        try:
+            for job in await mgr.list_jobs():
+                if getattr(job, "name", "") == SELF_LOOP_JOB:
+                    await mgr.delete_job(job.job_id)
+                    logger.info(f"[{PLUGIN_NAME}] 已清掉旧的自主心跳任务")
+        except Exception as exc:  # noqa: BLE001
+            logger.info(f"[{PLUGIN_NAME}] 清理自主心跳时出错（可忽略）：{exc}")
+
+    async def _start_self_loop(self) -> None:
+        """注册"没人叫她的时候自己醒来接着玩"的定时任务。**失败不影响插件其它部分。**"""
+        umo = str(self._cfg("white_session", "") or "")
+        if not umo:
+            logger.warning(
+                f"[{PLUGIN_NAME}] 开了自主心跳但没配 white_session —— **不启动**。"
+                "（cron 唤醒必须知道把消息投到哪个会话，缺了它发不出去）"
+            )
+            return
+        mgr = getattr(self.context, "cron_manager", None)
+        if mgr is None:
+            logger.warning(
+                f"[{PLUGIN_NAME}] 这个 AstrBot 版本没有 context.cron_manager —— 自主心跳不可用"
+            )
+            return
+
+        minutes = int(self._cfg("self_loop_minutes", 20) or 20)
+        minutes = max(5, min(240, minutes))
+        await self._drop_self_loop()          # ⚠️ 先删同名的，别越积越多
+        try:
+            await mgr.add_active_job(
+                name=SELF_LOOP_JOB,
+                cron_expression=f"*/{minutes} * * * *",
+                payload={"session": umo, "note": SELF_LOOP_NOTE, "origin": "plugin"},
+                description="自主心跳：没人叫她的时候自己醒来看看该做什么",
+                # ⚠️ 不带进 DB —— 插件每次加载自己重建，避免她删了插件还留着孤儿任务
+                persistent=False,
+            )
+            logger.info(f"[{PLUGIN_NAME}] 自主心跳已开：每 {minutes} 分钟唤醒一次")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[{PLUGIN_NAME}] 自主心跳注册失败：{exc}")
 
     # ---- 配置与授权 -----------------------------------------------------
 

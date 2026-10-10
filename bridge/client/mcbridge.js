@@ -50,7 +50,7 @@ let $Minecraft = null
 
 // ---- 朝向锁（aim）----------------------------------------------------------
 //
-// ⚠️⚠️ **必须每 tick 重设，设一次只生效一个 tick**（2026-10-11 读 Baritone 源码后修正）。
+// ⚠️⚠️ **必须每 tick 重设，设一次只生效一个 tick**（2026-10-10 读 Baritone 源码后修正）。
 //    原来我以为调一次 `updateTarget` 就一直生效 —— **错了**。
 //    `LookBehavior` 在 `PlayerUpdateEvent.POST` 的末尾无条件清空：
 //        // The target is done being used for this game tick, so it can be invalidated
@@ -132,7 +132,7 @@ function mcbAimApply() {
   } catch (e2) { }
 }
 
-// ⭐⭐ **`antiCheatCompatibility` 就是"移动 vs 转头"的总开关**（2026-10-11 实测出来）
+// ⭐⭐ **`antiCheatCompatibility` 就是"移动 vs 转头"的总开关**（2026-10-10 实测出来）
 //
 // `Target.Mode.resolve` 里：freeLook=true + blockInteract=false 时返回
 //     antiCheat ? SERVER : NONE
@@ -355,7 +355,7 @@ function mcbSnapshot() {
       snap.posZ = mcbNum(mc.player.z)
       // ⚠️⚠️ **客户端自己的朝向** —— 和服务端读到的**可能不是一回事**，必须分开看。
       //
-      //    2026-10-11 加：调试"aim 到底有没有生效"时发现，服务端读到的朝向
+      //    2026-10-10 加：调试"aim 到底有没有生效"时发现，服务端读到的朝向
       //    （`mcb lookat` 依赖它）和客户端本地视角**可能不一致** ——
       //    Baritone 的 `SERVER` 模式就是"**静默转**"：只有发给服务器的包带正确朝向，
       //    **本地画面不动**。所以只看服务端的数，会误判成"aim 没生效"。

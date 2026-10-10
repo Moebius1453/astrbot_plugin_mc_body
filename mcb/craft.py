@@ -196,10 +196,34 @@ class Crafter:
             return False
 
         first_missing = len(sim.missing)
-        last_missing: list[str] = []
+        # ⚠️⚠️ **要报「最接近能做的那条配方」的缺口，不是最后一条。**
+        #
+        #    2026-10-10 实际踩到（她在游戏里报"基础配方被枪炮模组截胡了"）：
+        #    `minecraft:stick` 有 **3 条**配方 ——
+        #      ① `stick_from_bamboo_item`（竹子×2）
+        #      ② `minecraft:stick`（任意木板×2）
+        #      ③ `mynethersdelight:crafting/stick_alt`（**powder_cannon** + 竹子）
+        #    原来每条循环都覆盖 `last_missing`，于是**最后试的第③条的
+        #    "缺 powder_cannon"被报了出来** —— 明明 ①② 才是正常路子，
+        #    看上去却像"基础配方被 mod 截胡"。**根因是"报错了配方"，不是"选错了配方"。**
+        #
+        #    排序判据（依次比较）：
+        #      ① **她手上已经有料的那条优先** —— 有木板时"用木板做木棍"显然比
+        #         "用竹子做木棍"更接近能做。这条最有用，放最前面。
+        #      ② 缺口条目数少的优先（离能凑齐更近）
+        #      ③ **原版优先**（`minecraft:` 命名空间）—— 基础东西走原版路子，
+        #         别让一个 mod 的冷门配方顶掉它
+        best_missing: list[str] | None = None
+        best_rank: tuple[int, int, int, int] | None = None
         for recipe in recipes:
             snap = sim.snapshot()
             cells = _cells_of(recipe)
+            # ⚠️ 必须在 `_apply` **之前**算 —— 它会把材料扣掉
+            partial = 1
+            for cell in cells:
+                if any(not str(c).startswith("#") and sim.have.get(_id(c), 0) > 0 for c in cell):
+                    partial = 0
+                    break
             per = max(1, int(recipe.get("outN") or 1))
             times = math.ceil(need_more / per)
             if cells and await self._apply(cells, times, sim, depth, chain | {item}):
@@ -208,9 +232,17 @@ class Crafter:
                 return True
             # ⚠️ 记下这一轮新加的"缺什么"，然后回滚 ——
             #    报**根因**（缺原木）比报"缺木镐"有用得多
-            last_missing = list(sim.missing[first_missing:])
+            got = list(sim.missing[first_missing:])
+            rank = (partial, len(got),
+                    # ⚠️ 同样接近时**优先不需要工作台的** —— 背包 2×2 就能做，
+                    #    不用跑去找台子、也不会撞上"容器顶不掉"那堆破事。
+                    0 if not recipe.get("needsTable") else 1,
+                    0 if str(recipe.get("id") or "").startswith("minecraft:") else 1)
+            if best_rank is None or rank < best_rank:
+                best_rank = rank
+                best_missing = got
             sim.restore(snap)
-        sim.missing.extend(last_missing or [f"{_short(item)} ×{need_more}"])
+        sim.missing.extend(best_missing if best_missing else [f"{_short(item)} ×{need_more}"])
         return False
 
     async def _apply(self, cells: list[list[str]], times: int, sim: _Sim,
@@ -255,7 +287,7 @@ class CraftRunner:
         self.bridge = bridge
         self.io = ContainerIO(bridge, delay=delay)
 
-    async def _open_table(self) -> bool:
+    async def _open_table(self) -> tuple[bool, str]:
         return await open_block(self.bridge, "minecraft:crafting_table",
                                 self.io, want_cls="CraftingMenu")
 
@@ -323,12 +355,13 @@ class CraftRunner:
             logger.info("[mc_body] 她开着别的容器 —— 改用工作台来做（3×3 也能做 2×2）")
             needs_table = True
 
-        if needs_table and not await self._open_table():
-            return (
-                "做不了：要么附近没工作台/走不过去，要么她手上开着别的容器顶不掉。"
-                "（`closeGui` 目前只能把画面藏起来、**容器还开着** —— "
-                "最稳的办法是让她手动按一下 Esc。见 docs/04 坑 10s。）"
-            )
+        if needs_table:
+            ok, why = await self._open_table()
+            if not ok:
+                # ⚠️ **报具体哪一步断的**，不要三种原因混一句 ——
+                #    她原来复述的是"要么附近没工作台/走不过去/容器顶不掉"，
+                #    分不清该去搬个工作台、还是该先按 Esc 关掉手上的界面。
+                return f"做不了：{why}。"
 
         out = []
         try:

@@ -370,12 +370,37 @@ PlayerEvents.chat(event => {
 //    **整个脚本会加载失败**（KubeJS 脚本是加载期执行的）。宁可少一个钩子，不能全挂。
 const MCB_EV_MAX = 600
 
+// ⚠️⚠️ **同类事件必须合并** —— 这是 2026-10-10 实测踩出来的。
+//
+//    她淹在水里时 `drown` **每秒产生一条 hurt 事件**，实测堆了 **253+ 条** ——
+//    环形缓冲只有 600 条，于是**真正要看的（死亡 / 进服 / 给东西）全被挤出去了**。
+//    `mcb events` 拉回来的东西几乎全是同一句噪声。
+//
+//    规则：**连续**同 `(kind, who, by)` 且间隔小于这个窗口的，合并成一条并累加 `n`。
+//    * 为什么要求"连续"：中间夹了别的事件就不该合并，否则会打乱先后顺序。
+//    * 为什么刷新窗口（用 `lastT` 而不是 `t`）：溺水是**持续性**的，
+//      不刷新的话每 3 秒又开一条新的，10 分钟照样 200 条。刷新 → 整段只留一条。
+const MCB_EV_MERGE_MS = 3000
+
 var mcbEvBuf = []
 var mcbEvSeq = 0
 
 function mcbEvAdd(kind, who, text, extra) {
+  var t = mcbNowMs()
+  var by = null
+  if (extra !== null && extra !== undefined && extra.by !== undefined) by = extra.by
+
+  var last = mcbEvBuf.length > 0 ? mcbEvBuf[mcbEvBuf.length - 1] : null
+  if (last !== null && last.kind === kind && last.who === who
+      && (last.by === undefined ? null : last.by) === by
+      && (t - (last.lastT !== undefined ? last.lastT : last.t)) < MCB_EV_MERGE_MS) {
+    last.n = (last.n || 1) + 1
+    last.lastT = t
+    return last
+  }
+
   mcbEvSeq = mcbEvSeq + 1
-  var e = { seq: mcbEvSeq, t: mcbNowMs(), kind: kind, who: who, text: text }
+  var e = { seq: mcbEvSeq, t: t, kind: kind, who: who, text: text, n: 1 }
   if (extra !== null && extra !== undefined) {
     for (var k in extra) {
       if (Object.prototype.hasOwnProperty.call(extra, k)) e[k] = extra[k]
@@ -467,7 +492,7 @@ function mcbPlayerName(pl) {
 
 // `DamageSource` → "谁打的 / 什么打的"。
 //
-// ⚠️⚠️ **2026-10-11 实测结论（一次跑完全部候选访问器得出的，别再猜）**：
+// ⚠️⚠️ **2026-10-10 实测结论（一次跑完全部候选访问器得出的，别再猜）**：
 //
 //     str              = "DamageSource (arrow)"   ← ✅ **唯一可靠的一条**
 //     getMsgId         = notFn      ┐
@@ -2273,10 +2298,48 @@ function mcbPlayerState(player) {
   } catch (e4) {
     out.sleeping = null
   }
+  // 🌊 **氧气 / 在水里** —— 2026-10-10 加，起因是她淹在水里出不来。
+  //
+  //    为什么必须单独报这一维：**溺水是"会慢慢死、但血量不一定掉"的情形**。
+  //    实测现场：她卡在水里 253 秒，事件流里 `drown` 每秒一条，
+  //    但 `dmg: 0`（身上挂着抗性 V）→ **反射只看 hp，于是永远不触发**，她就一直泡着。
+  //    ⭐ 教训：**凡是要"保命"的判据，都得从"状态"判，不能只从"伤害"判。**
+  try {
+    var air = null
+    try { air = mcbNumOrNull(player.airSupply) } catch (eA1) {
+      try { air = mcbNumOrNull(player.getAirSupply()) } catch (eA2) { air = null }
+    }
+    out.air = air
+  } catch (eA) {
+    out.air = null
+  }
+  try {
+    out.inWater = !!player.isInWater()
+  } catch (eW1) {
+    try { out.inWater = !!player.isInWater } catch (eW2) { out.inWater = null }
+  }
+  try {
+    out.underWater = !!player.isUnderWater()
+  } catch (eU) {
+    out.underWater = null
+  }
+  // 她自己那一列的地表高度 —— **一次 heightmap 调用，几乎免费**。
+  // 用途：溺水反射要一个"往上浮到哪"的目标（`baritone goto <x> <地表y> <z>`）。
+  // ⚠️ 只查她脚下这一列，不做邻域 —— 反射是每秒跑的，不能扫一片。
+  // ⚠️ `mcbT2Height` 要 `mcbT2Setup()` 跑过才有值（它俩是共用的缓存），
+  //    不然传进去的是 null，getHeight 会抛 —— 这条路上必须显式补一次。
+  try {
+    mcbT2Setup()
+    var lv = player.level
+    var bx = Math.floor(Number(player.x)), bz = Math.floor(Number(player.z))
+    out.surfY = Number(lv.getHeight(mcbT2Height, bx, bz))
+  } catch (eSY) {
+    out.surfY = null
+  }
+
   out.task = mcbTaskSnapshot()
   return out
 }
-
 function mcbChatData(since, me) {
   var lines = []
   for (var i = 0; i < mcbChatBuf.length; i++) {

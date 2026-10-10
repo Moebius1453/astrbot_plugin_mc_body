@@ -42,6 +42,11 @@ COMBAT_WINDOW_SECONDS = 12.0
 STUCK_SECONDS = 18.0
 STUCK_MIN_MOVE = 1.5
 
+# 溺水判定 —— ⚠️ **判据是氧气，不是血量**（见 _check_drowning 的说明）
+DROWN_AIR = 180.0        # 氧气（满 300）低于它就管
+DROWN_TICKS = 3          # 连续几次才算，防抖（刚扎个猛子不该触发）
+DROWN_RETRY_TICKS = 10   # 上浮没成功就多久再试一次（别每 tick 重发命令）
+
 # 怪贴到这个距离内就进入战斗（不等到挨打）—— 抄 Kindred 的修复思路
 NEAR_HOSTILE_RANGE = 5.0
 
@@ -146,6 +151,8 @@ class ReflexGuard:
         self._last_sample: tuple[float, float, float, float] | None = None
         self._stuck_reported = False
         self._fail_streak = 0
+        self._drown_ticks = 0
+        self._drown_cool = 0
 
         # 战斗状态机
         self._stance = stance if stance in STANCES else STANCE_DEFEND
@@ -340,8 +347,53 @@ class ReflexGuard:
         # 卡住判定
         await self._check_stuck(data)
 
+        # 溺水 —— **判据是氧气，不是血量**（见方法说明）
+        await self._check_drowning(data)
+
         # 吃饭 —— 抄女仆 MaidHealSelfTask：饿了就吃，不经过 LLM
         await self._maybe_eat(data)
+
+    async def _check_drowning(self, data: dict) -> None:
+        """溺水反射 —— ⚠️⚠️ **判据是氧气，不是血量。**
+
+        2026-10-10 实测：她卡在水里 **253 秒**，事件流里 `drown` 每秒一条，
+        但 `dmg: 0`（身上挂着抗性 V）→ **只看 hp 的反射永远不触发**，她就一直泡着。
+
+        ⭐ **教训：凡是要"保命"的判据，都得从「状态」判，不能只从「伤害」判。**
+        （抗性、水肺药水、吸收伤害……任何一个都能让"受伤"这条线失效。）
+
+        动作：往**她自己那一列的地表**发一条 3D goto（服务端顺带报 `surfY`），
+        让她想办法浮上去。
+
+        ⚠️ **这条动作没在真实溺水场景里验过** —— 拿不到 `surfY` 时退回"停 + 记一笔"，
+        至少别让她继续往下沉。
+        """
+        air = data.get("air")
+        in_water = data.get("inWater") is True or data.get("underWater") is True
+
+        if not in_water or not isinstance(air, (int, float)):
+            self._drown_ticks = 0
+            return
+        if air >= DROWN_AIR:
+            self._drown_ticks = 0
+            return
+
+        self._drown_ticks += 1
+        if self._drown_ticks < DROWN_TICKS:
+            return
+        if self._drown_cool > 0:
+            self._drown_cool -= 1
+            return
+        self._drown_cool = DROWN_RETRY_TICKS
+
+        surf = data.get("surfY")
+        x, z = data.get("x"), data.get("z")
+        if isinstance(surf, (int, float)) and isinstance(x, (int, float)) and isinstance(z, (int, float)):
+            self._log(f"快淹死了（氧气 {air:g}/300），往上浮到地表 y={surf:g}")
+            await self._walk_claim(f"goto {float(x):.1f} {float(surf) + 1:.1f} {float(z):.1f}", "溺水上浮")
+        else:
+            self._log(f"快淹死了（氧气 {air:g}/300），但拿不到地表高度")
+            await self._walk_stop("溺水但不知道往哪浮")
 
     async def _maybe_eat(self, data: dict) -> None:
         """自己吃东西。**两个触发条件**（用户 2026-10-10 拍板）：

@@ -545,7 +545,7 @@ def state_packet(data: dict, stance: str = "defend", work: dict | None = None,
         [know] 家(-10,88,-9) 麦田(-51,65,-7)
     """
     if not isinstance(data, dict) or not data.get("online"):
-        return "[body] offline"
+        return "[mc:body] offline"
 
     lines: list[str] = []
 
@@ -571,10 +571,19 @@ def state_packet(data: dict, stance: str = "defend", work: dict | None = None,
     else:
         weather = "?"          # 读不到 ≠ 晴天（docs/04 坑 10f）
     body.append(f"w={weather}")
+    # 氧气 / 在水里 —— **只在"值得说"的时候才占字数**（没在水里就不写 `water=no`）。
+    # ⚠️ 为什么要这一维：溺水是"会慢慢死、但血量不一定掉"的情形。
+    #    实测她卡在水里 253 秒、`drown` 每秒一条，但 `dmg=0`（身上挂着抗性 V），
+    #    **反射只看 hp 就永远不触发**。→ 凡是要保命的判据，都得从"状态"判。
+    air = data.get("air")
+    in_water = data.get("inWater")
+    under = data.get("underWater")
+    if under is True or in_water is True:
+        body.append(f"water={_num(air, 'g')}/300")
     using = data.get("using")
     if isinstance(using, dict) and using.get("isUsing"):
         body.append(f"using={using.get('item')}({_num(using.get('remain'), 'g')}t)")
-    lines.append("[body] " + " ".join(body))
+    lines.append("[mc:body] " + " ".join(body))
 
     # ---- 在干什么 ----
     act = [f"stance={stance}"]
@@ -587,17 +596,17 @@ def state_packet(data: dict, stance: str = "defend", work: dict | None = None,
     path = data.get("task") if isinstance(data.get("task"), dict) else {}
     if path.get("available"):
         act.append(f"path={path.get('status') or '?'}")
-    lines.append("[act]  " + " | ".join(act))
+    lines.append("[mc:act] " + " | ".join(act))
 
     # ---- 最近发生了什么 ----
     if journal is not None and len(journal) > 0:
         rows = journal.tail(log_lines)
-        lines.append("[log]  " + " · ".join(f"{r['t'][:5]} {r['text']}" for r in rows))
+        lines.append("[mc:log] " + " · ".join(f"{r['t'][:5]} {r['text']}" for r in rows))
 
     # ---- 知道的地方 ----
     if places is not None and len(places) > 0:
         top = places.list()[:5]
-        lines.append("[know] " + " ".join(
+        lines.append("[mc:know] " + " ".join(
             f"{r['name']}({r['x']:g},{r['y']:g},{r['z']:g})" for r in top
         ))
 
@@ -629,11 +638,17 @@ def state_packet(data: dict, stance: str = "defend", work: dict | None = None,
 # ⚠️ 用**英文**：实测同等内容英文省 1.5~2.2 倍 token，而这段每次注入都要重发。
 #    详见 `_AI工作区\mc-brain\plugin-check\token_check.py`。
 WIRING_NOTE = (
-    "[wiring] The lines above are readouts, not someone speaking to you — "
-    "say what you want, or nothing. \"?\" means unreadable, not zero. "
-    "In-game public chat reaches you under [chat]; when someone calls your name you are "
+    "[wiring] Everything tagged [mc:*] is the state of the MINECRAFT WORLD — a game. "
+    "It is NOT the real world and not your user's real surroundings: if [mc:body] says "
+    "rain or night, that is the GAME's weather and the GAME's clock, and it tells you "
+    "nothing about the real weather or real time where your user is. Never mix the two up. "
+    "These are readouts, not someone speaking to you — say what you want, or nothing; "
+    "\"?\" means unreadable, not zero. "
+    "In-game public chat reaches you under [mc:chat]; when someone calls your name you are "
     "woken with that line directly, and your reply is then posted to the public chat "
-    "automatically (do not call mc_say). You can also pull chat yourself with mc_chat_log."
+    "automatically (do not call mc_say). You can also pull chat yourself with mc_chat_log. "
+    "You have a `future_task` tool: use it (action=create + note) to schedule your OWN next "
+    "wake-up when you want to keep doing something later without waiting to be called."
 )
 
 # [chat] 段最多带几条 —— 每次注入都要重发，别贪
@@ -666,7 +681,7 @@ def chat_section(lines, *, limit: int = CHAT_LINES) -> str:
                 bit += f",d={d:g}"
             bit += ")"
         parts.append(bit)
-    return ("[chat]  " + " · ".join(parts)) if parts else ""
+    return ("[mc:chat] " + " · ".join(parts)) if parts else ""
 
 
 def describe_chat(lines, count: int = 20) -> str:

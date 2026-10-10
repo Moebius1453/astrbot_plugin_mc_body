@@ -198,5 +198,17 @@
     "description": "那台机器上 docker 的 sudo 密码",
     "hint": "⚠️ docker 需要 sudo。密码**走 stdin 不走命令行**（命令行会被 ps 看见）。留空 = 假设免密 sudo。",
     "default": ""
+  },
+  "enable_self_loop": {
+    "type": "bool",
+    "description": "自主心跳：没人叫她的时候，定时唤醒她自己玩",
+    "hint": "⚠️ **这个会花钱** —— 每次唤醒都是一整轮 agent（30 个工具描述 + 记忆注入 + 状态包），一次几千到上万 token。开之前先估好量。\n\n开了之后插件会往 AstrBot 原生的定时任务里注册一条 active_agent 任务，每 N 分钟让她自己醒过来看一眼处境、决定接下来做什么。\n\n⚠️ **其实有更省的一条路**：她自己有一个 future_task 工具（AstrBot 默认就给她了），可以让**她自己**排下一次行动 —— 她自己排的班比我们替她排的更合身。接线说明里已经交代过。**建议先试那条**，不行再开这个。",
+    "default": false
+  },
+  "self_loop_minutes": {
+    "type": "int",
+    "description": "自主心跳间隔（分钟）",
+    "hint": "多久自己醒一次。太小会烧钱、而且她会为了交差瞎折腾；20~60 比较合理。只在 enable_self_loop 打开时有效。",
+    "default": 20
   }
 }

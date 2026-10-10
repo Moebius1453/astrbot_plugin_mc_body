@@ -249,7 +249,7 @@ def _describe(kind: str, who: str, raw: dict, text: str) -> str:
 
     if kind == "hurt":
         # ⚠️ 服务端给的 `by` 是**伤害类型**（`mob` / `arrow` / `fall`…），不是攻击者名字。
-        #    2026-10-11 实测：KubeJS 递过来的 `DamageSource` **实体访问器一个都没有**
+        #    2026-10-10 实测：KubeJS 递过来的 `DamageSource` **实体访问器一个都没有**
         #    （`getEntity`/`getDirectEntity` 全 notFn），只有 `String(src)` 能抠出类型。
         #    **那就报类型 —— 不编造攻击者。** "摔的"和"怪咬的"处理方式完全不同，类型本身就有用。
         by = raw.get("by") or who
@@ -277,6 +277,12 @@ def _describe(kind: str, who: str, raw: dict, text: str) -> str:
         bits.append(str(text))
     else:
         bits.append(str(text))
+
+    # ⚠️ **合并过的事件要把次数说出来** —— 服务端会把"连续同类"的事件并成一条并累加 `n`。
+    #    不说的话，一次 253 连击看起来跟"发生了一次"一模一样（溺水那次实测就是 253 条）。
+    n = raw.get("n")
+    if isinstance(n, (int, float)) and n > 1:
+        bits.append(f"×{n:g}")
 
     return " ".join(bits)
 

@@ -180,8 +180,10 @@ class ChatUplink:
             await self._say_in_game(reply_text)
 
     def _build_prompt(self, trigger: str) -> str:
+        # ⚠️ 统一用 `[mc:*]` 前缀（规范见 `docs\12`）：**凡是从 Minecraft 来的数据都带这个标签**，
+        #    好和现实对话分开。这些是**游戏里**发生的事，和用户现实中的处境无关。
         parts = [
-            "【来自 Minecraft 游戏内聊天】",
+            "[mc:chat] 来自 Minecraft 游戏内聊天（是游戏世界里的事，与用户现实处境无关）",
             "",
             f"游戏里有人对你说话了（你在游戏里的名字是 {self.self_name}）：",
             trigger,
