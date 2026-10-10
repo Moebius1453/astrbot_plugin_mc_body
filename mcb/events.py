@@ -30,6 +30,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import time
+from dataclasses import dataclass
 
 from astrbot.api import logger
 
@@ -42,14 +44,49 @@ KEEP = 60
 # 指数退避上限（隧道断了别刷屏）
 MAX_BACKOFF_SECONDS = 30.0
 
-KIND_LABEL = {
-    "hurt": "挨打",
-    "hit": "出手",
-    "death": "死亡",
-    "join": "进服",
-    "leave": "退服",
-    "inv": "背包",
+class Joins:
+    """一条事件**随哪次调用**进上下文（抄 Numen `EventTypes.Delivery.joins`）。"""
+
+    ANY = "any"      # 随便哪次请求都捎上
+    OWN = "own"      # 只在"点名她"的那一轮捎上
+    NONE = "none"    # 从不随请求走（只躺在 `mc_events` 里等人查）
+
+
+@dataclass(frozen=True)
+class KindSpec:
+    """一种事件的**四列声明**（抄 Numen `EventTypes`：**投递方式写进类型表**）。
+
+    ⚠️ **为什么要有这张表**（`docs\\21` §1.4）：
+        Numen 的 `EventQueue` 里**没有一处按档名 `switch`** ——
+        "这条急不急、要不要叫醒她、进不进聊天流"**全查声明**。
+        我们原来是散落的字符串判断，改一条要动好几处。
+    """
+
+    label: str                    # 中文标签（**现在就在用**）
+    wakes: bool                   # 要不要因此叫醒她跑一轮 agent
+    joins: str                    # 随哪次调用进上下文
+    cleared_by_interrupt: bool    # 她被打断时，这条要不要清掉
+    to_model: bool = True         # 进不进"发给模型看的内容"
+
+
+# ⚠️⚠️ **本轮只加列、不改行为**（`docs\25` §三 1.7）——
+#     后三列现在是**文档**，还没有任何代码读它们。
+#     真要接线（把 `wakes` 接进 `uplink._is_wake`）是另一件事，要先过"她凭什么自己醒"那道判据
+#     （`docs\21` §7.1.1），**别顺手改了**。
+_KINDS: dict[str, KindSpec] = {
+    #                      标签     叫醒   随谁走           打断清  进模型
+    "hurt":  KindSpec("挨打", False, Joins.ANY,  False),
+    "hit":   KindSpec("出手", False, Joins.ANY,  False),
+    "death": KindSpec("死亡", False, Joins.ANY,  False),
+    "join":  KindSpec("进服", False, Joins.OWN,  False),
+    "leave": KindSpec("退服", False, Joins.OWN,  False),
+    "inv":   KindSpec("背包", False, Joins.ANY,  False),
 }
+
+KIND_LABEL = {k: v.label for k, v in _KINDS.items()}
+
+# 躺超过这个秒数的旧事件，在正文前标一句"这是多久以前的"
+STALE_AFTER = 600.0
 
 
 class EventFeed:
@@ -65,6 +102,10 @@ class EventFeed:
         self._task: asyncio.Task | None = None
         self._last_seq = 0
         self._recent: list[dict] = []
+        # ⚠️ 挤掉的条数**要记账**（抄 Numen `EventQueue.flushDropped`）——
+        #    原来是 `pop(0)` 一扔了事，**一声不吭**。
+        #    后果：她看到的是"最近 60 条"，但**不知道中间漏了**，会把不连续的两件事当因果。
+        self._dropped = 0
         self._fail_streak = 0
         # 背包快照（物品 id → 总数）。None = 还没建基线。
         self._inv_snap: dict[str, int] | None = None
@@ -221,9 +262,11 @@ class EventFeed:
             return
 
         line = _describe(kind, who, raw, text)
-        self._recent.append({"seq": seq, "kind": kind, "who": who, "text": text, "line": line})
+        self._recent.append({"seq": seq, "kind": kind, "who": who, "text": text,
+                             "line": line, "t": time.monotonic()})
         while len(self._recent) > self.keep:
             self._recent.pop(0)
+            self._dropped += 1
         if self.journal is not None:
             self.journal.add("body", line)
 
@@ -236,7 +279,13 @@ class EventFeed:
         rows = self.recent(n)
         if not rows:
             return "（还没有任何事件 —— 没人挨打、没人进出、背包也没动过）"
-        return "\n".join(f"· {r['line']}" for r in rows)
+        now = time.monotonic()
+        lines = [f"· {_age_note(r, now)}{r['line']}" for r in rows]
+        if self._dropped:
+            # ⭐ **丢弃不许无声** —— 不说的话，她会把"最近 60 条"当成全部，
+            #    把中间漏掉的那段当成"什么都没发生"。
+            lines.insert(0, f"（更早的约 {self._dropped} 条已经挤掉了，这只是最近的一段）")
+        return "\n".join(lines)
 
 
 # ---- 小工具 -------------------------------------------------------------
@@ -291,6 +340,23 @@ def _g(v: object) -> str:
     if isinstance(v, (int, float)) and not isinstance(v, bool):
         return f"{v:g}"
     return "?"
+
+
+def _age_note(row: dict, now: float) -> str:
+    """躺太久的旧事件前面标一句"多久以前"（抄 Numen `EventQueue.annotateAge`）。
+
+    ⚠️ 为什么要有：跨重载/断线补发的旧消息，**不标的话会被当成"刚刚发生"**，
+    她会去回应十分钟前就结束的事。
+    """
+    t = row.get("t")
+    if not isinstance(t, (int, float)) or isinstance(t, bool):
+        return ""
+    age = now - float(t)
+    if age < STALE_AFTER:
+        return ""
+    if age < 3600:
+        return f"[{age / 60:.0f} 分钟前] "
+    return f"[{age / 3600:.1f} 小时前] "
 
 
 def _as_int(value, default: int = 0) -> int:

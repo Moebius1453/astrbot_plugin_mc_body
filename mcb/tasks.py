@@ -64,13 +64,10 @@ from astrbot.api import logger
 
 from .arbiter import LEVEL_TASK
 from .containers import ContainerIO, find_block, wait_baritone, wear
+from . import render
 
 # 任务协程的任务名 —— 用来识别并掐掉重载留下的孤儿任务（同 reflex.py）
 _TASK_NAME = "mc_body_work"
-
-# 启动一个任务后等这么久再回报。**够第一步的前置检查跑完**（那一步都是本地判断），
-# 这样"切过去但缺东西"能立刻告诉模型，而不是让它过一会儿自己发现。
-START_PROBE_SECONDS = 1.5
 
 
 class Paused(Exception):
@@ -96,6 +93,15 @@ class Task:
     name: str
     summary: str          # 给模型看的一句话 —— 描述写得含糊模型就会用错
     steps: list[Step] = field(default_factory=list)
+    # ⭐ **受理前检查**（抄 Numen `Task.prepare` / `TaskDispatch.setTask`）。
+    #
+    #    契约和 `Step.run` 一样：返回 `None` = 可以开工；返回字符串 = 失败原因。
+    #    ⚠️ **它在 `create_task` 之前跑，判不过就"不换进槽"** ——
+    #    手上的旧活**一点不受影响**。
+    #
+    #    原来没有这一层，`TaskRunner.start` 是"**先 stop() 掐掉旧活、再看新活行不行**" ——
+    #    新活一失败她就**闲着**，而旧活已经没了。
+    precheck: StepFn | None = None
 
 
 # ===== 上下文 ===============================================================
@@ -237,8 +243,19 @@ def _register(task: Task) -> Task:
     return task
 
 
-async def _step_have_torch(ctx: TaskContext) -> str | None:
-    """第一步永远是**前置检查** —— 缺东西要立刻说，别跑到一半才发现。"""
+async def _precheck_online(ctx: TaskContext) -> str | None:
+    """所有任务共用的一条：**身体不在，什么任务都开不了工。**
+
+    ⚠️ 放"受理前"而不是第 0 步 —— 她不在线时**旧任务不该被掐掉**。
+    """
+    st = await ctx.state()
+    if not st.get("online"):
+        return "她的身体不在服务器上（客户端没连）—— 等上线再派活"
+    return None
+
+
+async def _precheck_have_torch(ctx: TaskContext) -> str | None:
+    """受理前检查 —— **缺东西要立刻说，且不打断手上的活。**"""
     for tid in TORCH_IDS:
         if await ctx.count_item(tid) > 0:
             ctx.data["torch"] = tid
@@ -247,10 +264,14 @@ async def _step_have_torch(ctx: TaskContext) -> str | None:
     return "身上没有火把（torch / soul_torch 都没有）—— 先给我火把"
 
 
+async def _precheck_torch(ctx: TaskContext) -> str | None:
+    return await _precheck_online(ctx) or await _precheck_have_torch(ctx)
+
+
 async def _step_hold_torch(ctx: TaskContext) -> str | None:
     tid = ctx.data.get("torch")
     if not tid:
-        return "不知道要用哪种火把（上一步没成）"
+        return "不知道要用哪种火把（受理前的检查没跑成）"
     if await ctx.ensure_held(tid) is None:
         return f"火把（{tid}）不在快捷栏，也没能挪过去"
     return None
@@ -295,8 +316,8 @@ _register(Task(
     id="torch",
     name="沿途照明",
     summary="沿一个方向走，路边隔一段插一根火把。需要身上有火把。",
+    precheck=_precheck_torch,
     steps=[
-        Step("备火把", _step_have_torch),
         Step("拿到手上", _step_hold_torch),
         Step("沿路插火把", _step_light_along),
     ],
@@ -441,6 +462,7 @@ _register(Task(
     id="farm",
     name="种田",
     summary="找块田走过去，收割+补种（靠 Baritone 的 farm）。有锄头/种子更好，没有也能只收。",
+    precheck=_precheck_online,
     steps=[
         Step("找田", _step_find_field),
         Step("看看有什么工具", _step_check_farm_tools),
@@ -530,28 +552,44 @@ class TaskRunner:
         task = TASKS.get(str(task_id or "").strip())
         if task is None:
             known = "、".join(f"{t.id}（{t.name}）" for t in TASKS.values()) or "（一个都没有）"
-            return f"没有「{task_id}」这个任务。认得的是：{known}"
+            return render.fail(
+                render.Kind.NOT_FOUND, f"没有「{task_id}」这个任务",
+                detail=f"认得的是：{known}",
+                hint="从上表里挑一个 id 原样传；**别自己编名字**",
+            )
+
+        if self.busy and self._job is not None and self._job.id == task.id:
+            # 抄 TLM 的 `Already on task %s`
+            return f"已经在做「{task.name}」了 —— 没换。"
+
+        # ⭐ **受理前先判，判不过不换进槽**（`docs\25` §三 1.3）。
+        #    ⚠️ 顺序要紧：**先判、后停旧活**。反过来的话，新活一失败她就两手空空。
+        ctx = TaskContext(self, params)
+        if task.precheck is not None:
+            try:
+                why = await task.precheck(ctx)
+            except Exception as exc:  # noqa: BLE001 - 检查自己炸了也要说人话
+                logger.exception("[mc_body] 任务受理前检查炸了")
+                why = f"受理前检查出错：{exc}"
+            if why:
+                still = f"（「{self._job.name}」还在做，没被打断）" if self.busy else ""
+                return render.fail(
+                    render.Kind.NO_MATERIAL, f"「{task.name}」现在还开不了工{still}",
+                    detail=str(why),
+                    hint="照上面的说法凑齐，再调一次 `mc_task`；**别换个任务名硬试**",
+                )
 
         if self.busy and self._job is not None:
-            if self._job.id == task.id:
-                # 抄 TLM 的 `Already on task %s`
-                return f"已经在做「{task.name}」了 —— 没换。"
             await self.stop(quiet=True)
 
         self._job = task
         self._index = 0
         self._paused = ""
         self._outcome = {}
-        self._ctx = TaskContext(self, params)
+        self._ctx = ctx
         self.journal.add("task", f"开始「{task.name}」")
 
         self._task = asyncio.create_task(self._run(task), name=_TASK_NAME)
-
-        # 等一小会儿 —— 够第一步的前置检查跑完。缺东西要**立刻**说，
-        # 别让模型过一会儿自己发现（抄 TLM 的 `MISSING_REQUIRED_ITEM` 语义）。
-        await asyncio.sleep(START_PROBE_SECONDS)
-        if self._outcome.get("state") == "failed":
-            return f"切到「{task.name}」了，但干不了：{self._outcome.get('detail')}"
         return f"「{task.name}」开始了。想知道进度用 mc_state 看「正在做的事」。"
 
     async def stop(self, *, quiet: bool = False) -> str:

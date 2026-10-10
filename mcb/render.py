@@ -81,6 +81,79 @@ def reword(err, what: str, kind: str = Kind.FAILED, detail: str = "",
 
 # ---- 界面 -----------------------------------------------------------
 
+def _menu_items(menu) -> dict[int, tuple[str, int]] | None:
+    """菜单 → `{格号: (物品名, 数量)}`。读不到返回 None（**不是空 dict**）。"""
+    if not isinstance(menu, dict):
+        return None
+    out: dict[int, tuple[str, int]] = {}
+    for it in (menu.get("items") or []):
+        if not isinstance(it, dict):
+            continue
+        try:
+            idx = int(it.get("i"))
+        except (TypeError, ValueError):
+            continue
+        try:
+            cnt = int(float(it.get("c") or 0))
+        except (TypeError, ValueError):
+            cnt = 0
+        out[idx] = (str(it.get("n") or "?"), cnt)
+    return out
+
+
+def describe_click_result(slot, mode, before, after) -> str:
+    """点完一格**当场对账** —— 拿点之前的界面快照和点之后比。
+
+    抄 Numen `ContainerOps.route/place`（点完当场 diff 前后格子并回一句人话），
+    理由（`docs\\25` §三 1.8）：原来只回"过一会儿用 mc_inventory 自己看" ——
+    **那是把验证甩给一个不会去验证的人**（`docs\\17` D3 那条教训）。
+    """
+    a = _menu_items(after)
+    if a is None:
+        return (
+            f"点了第 {slot} 号格（mode={mode}），但**读不到点完之后的界面**，没法确认生效。\n"
+            "hint: 过几秒用 `mc_menu` 看一次；一直读不到就用 `mc_state` 看她在不在线"
+        )
+
+    # 🔴 界面被顶掉了 —— 这一下多半点在**另一个容器**上（`docs\\04` 坑 13）
+    b_id = before.get("id") if isinstance(before, dict) else None
+    a_id = after.get("id")
+    if b_id is not None and a_id is not None and b_id != a_id:
+        return (
+            f"⚠️ **没点成**：点之前是界面 id={b_id}，点之后变成了 id={a_id} —— "
+            "中途被别的容器顶掉了，这一下点在别的界面上了。\n"
+            "error: refused —— 界面 id 变了\n"
+            f"hint: 用 `mc_menu` 重新看一次现在的界面，再决定点哪一格"
+        )
+
+    b = _menu_items(before)
+    if b is None:
+        tail = describe_menu(after)
+        return f"点了第 {slot} 号格（mode={mode}）。**点之前没取到快照**，只能给你现在的界面：\n{tail}"
+
+    changed = []
+    for idx in sorted(set(b) | set(a)):
+        was = b.get(idx)
+        now = a.get(idx)
+        if was == now:
+            continue
+        if was and now:
+            changed.append(f"第 {idx} 号格：{was[0]}×{was[1]} → {now[0]}×{now[1]}")
+        elif now:
+            changed.append(f"第 {idx} 号格：{now[0]}×{now[1]}（原本是空的）")
+        else:
+            changed.append(f"第 {idx} 号格：{was[0]}×{was[1]} → 空了")
+
+    if not changed:
+        return (
+            f"⚠️ **没生效**：点了第 {slot} 号格（mode={mode}），但界面**一个格子都没变**。\n"
+            "error: refused —— 服务端可能把这一下退回了（界面 id 对不上 / 那一格放不下）\n"
+            "hint: 先用 `mc_menu` 看一次当前界面 id，确认还是同一个容器再重点一次"
+        )
+    head = f"✅ 点了第 {slot} 号格（mode={mode}），**界面确实变了**："
+    return head + "".join(f"\n  · {c}" for c in changed[:8])
+
+
 def describe_menu(data: dict) -> str:
     """把上行里的 menu 字段渲染成人话。"""
     task = data.get("task")
@@ -612,7 +685,7 @@ def _num(value, fmt: str = "g") -> str:
 
 def state_packet(data: dict, stance: str = "defend", work: dict | None = None,
                  journal=None, places=None, chat=None, *, log_lines: int = 4,
-                 wiring: bool = True) -> str:
+                 wiring: bool = True, instincts: str = "") -> str:
     """**紧凑的状态数据包** —— 纯数据，给白当处境感知用。
 
     形如：
@@ -708,6 +781,11 @@ def state_packet(data: dict, stance: str = "defend", work: dict | None = None,
     #    它解释的就是上面那几个字段，分开放她会拼不起来（用户 2026-10-10 定：
     #    "提示词交代应该配合上下文注入"）。
     if wiring:
+        # ⭐ **本能名册也在这一档**：反射是"程序替她做的决定"，
+        #    不交代的话她既无法否决、也无法解释（`docs\25` §三 1.2）。
+        #    文本由 `mcb\reflexes.py` 出 —— **本文件保持纯函数，不 import 插件里的别的东西**。
+        if instincts:
+            lines.append(instincts)
         lines.append(WIRING_NOTE)
 
     return "\n".join(lines)

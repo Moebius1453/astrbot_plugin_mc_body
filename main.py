@@ -37,6 +37,7 @@ from .mcb.events import EventFeed
 from .mcb.journal import Journal
 from .mcb.places import PlaceBook
 from .mcb.reflex import ReflexGuard
+from .mcb import reflexes
 from .mcb.sight import Sight
 from .mcb.smelt import Smelter
 from .mcb.tasks import TaskRunner
@@ -113,7 +114,7 @@ MAX_SKILL_CHARS = 24000   # SKILL.md 是给人读的说明书，超长的多半�
     "astrbot_plugin_mc_body",
     "Moebius1453",
     "让 AstrBot 的智能体在 Minecraft 里长出手脚：查询角色状态、说话、移动。",
-    "0.38.0",
+    "0.39.0",
 )
 class McBodyPlugin(Star):
     def __init__(self, context: Context, config: dict | None = None) -> None:
@@ -179,6 +180,8 @@ class McBodyPlugin(Star):
             hp_low=float(self._cfg("hp_low", 12)),
             hp_critical=float(self._cfg("hp_critical", 6)),
             flee_distance=int(self._cfg("flee_distance", 32)),
+            hunger_low=float(self._cfg("hunger_low", 16)),
+            stuck_seconds=float(self._cfg("stuck_seconds", 18)),
             scan_range=int(self._cfg("reflex_scan_range", 24)),
             stance=str(self._cfg("default_stance", "defend")),
             owner_name=str(self._cfg("owner_player_name", "")),
@@ -271,6 +274,19 @@ class McBodyPlugin(Star):
         except (TypeError, ValueError):
             return None
 
+    async def _menu_snapshot(self) -> dict | None:
+        """取一次"她当前开着的界面"。读不到返回 None（**不是空 dict**）。
+
+        ⚠️ 索引类的东西（格号）用之前要**核身份** —— 快照过期/界面被顶掉就会点错格
+        （`docs\\04` 坑 13）。
+        """
+        data, err = await self._call("mcb state")
+        if err or not isinstance(data, dict):
+            return None
+        task = data.get("task")
+        menu = task.get("menu") if isinstance(task, dict) else None
+        return menu if isinstance(menu, dict) else None
+
     async def _claim_walk_user(self, cmd: str, note: str) -> tuple[dict, str | None]:
         """**用户级**地声明 walk 通道。返回值和 `_call` 同形，方便原地替换。
 
@@ -320,6 +336,7 @@ class McBodyPlugin(Star):
                 data, self.reflex.stance, self.tasks.status(), self.journal, self.places,
                 chat_lines if has_new_chat else None,
                 wiring=self._cfg("enable_wiring_note", True),
+                instincts=reflexes.overview(),
             )
             from astrbot.core.agent.message import TextPart
             req.extra_user_content_parts.append(TextPart(text=packet))
@@ -1078,23 +1095,36 @@ class McBodyPlugin(Star):
         try:
             n = int(slot)
         except (TypeError, ValueError):
-            return f"格子号不合法：{slot!r}。"
+            return render.fail(
+                render.Kind.BAD_ARGUMENT, "格子号不合法", detail=f"给的是 {slot!r}",
+                usage="slot=整数（先用 mc_menu 看格号）",
+                hint="先调 `mc_menu`，照着它列出来的格号原样传",
+            )
         if n < 0:
-            return f"格子号不能是负数（给的是 {n}）。"
+            return render.fail(
+                render.Kind.BAD_ARGUMENT, "格子号不能是负数", detail=f"给的是 {n}",
+                usage="slot=0 或更大的整数",
+                hint="先调 `mc_menu` 看真实格号",
+            )
         try:
             m = int(mode)
         except (TypeError, ValueError):
             m = 1
         if m not in (0, 1, 2, 3, 4, 5, 6):
-            return f"mode 只能是 0~6（给的是 {m}）。"
+            return render.fail(
+                render.Kind.BAD_ARGUMENT, "mode 只能是 0~6", detail=f"给的是 {m}",
+                usage="mode=1 是 shift 整体移动（最常用）；0 是普通左键；6 是双击聚拢",
+                hint="不确定就用默认的 mode=1，别自己填数字",
+            )
+        before = await self._menu_snapshot()
         _, err = await self._call(f"mcb clickSlot {n} 0 {m}")
         if err:
             return render.reword(err, "点格子失败", kind=render.Kind.REFUSED,
                                 hint="先用 mc_menu 看一次界面 id，确认还是同一个容器再重点")
         await asyncio.sleep(0.4)
-        data, merr = await self._call("mcb state")
-        after = "" if merr else "\n" + render.describe_menu(data)
-        return f"已点第 {n} 号格（mode={m}）。过一会儿用 mc_inventory / mc_menu 看结果。{after}"
+        # ⭐ **当场对账** —— 点之前那张快照和点之后比（docs\25 §三 1.8）
+        after = await self._menu_snapshot()
+        return render.describe_click_result(n, m, before, after)
 
     @filter.llm_tool(name="mc_craft")
     async def mc_craft(self, event: AstrMessageEvent, item: str, count: int = 1):

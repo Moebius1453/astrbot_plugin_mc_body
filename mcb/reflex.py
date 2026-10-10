@@ -152,6 +152,7 @@ class ReflexGuard:
         flee_distance: int = 32,
         scan_range: int = 24,
         hunger_low: float = HUNGER_LOW,
+        stuck_seconds: float = STUCK_SECONDS,
         stance: str = STANCE_DEFEND,
         owner_name: str = "",
         flee_toward: str = RETREAT_SAFE,
@@ -165,6 +166,7 @@ class ReflexGuard:
         self.flee_distance = max(8, int(flee_distance))
         self.scan_range = max(6, int(scan_range))
         self.hunger_low = float(hunger_low)
+        self.stuck_seconds = max(3.0, float(stuck_seconds))
         self.owner_name = str(owner_name or "").strip()
         # ⚠️ 白名单外的一律退回 `auto`（不是 `safe`）—— `auto` 才是现在的默认语义。
         self.flee_toward = (
@@ -276,7 +278,7 @@ class ReflexGuard:
             f"[mc_body] 防御反射已启动：每 {self.interval:g} 秒看一眼，"
             f"姿态 {self._stance}（挨打必还手）；"
             f"血量 <{self.hp_low:g} 警戒、<{self.hp_critical:g} 逃跑；"
-            f"卡住 {STUCK_SECONDS:g} 秒自动停"
+            f"卡住 {self.stuck_seconds:g} 秒自动停"
         )
 
     async def stop(self) -> None:
@@ -1031,7 +1033,7 @@ class ReflexGuard:
             self._stuck_reported = False
             return
 
-        if elapsed >= STUCK_SECONDS and not self._stuck_reported:
+        if elapsed >= self.stuck_seconds and not self._stuck_reported:
             self._stuck_reported = True
             logger.warning(
                 f"[mc_body] ⚠ 白卡住了：{elapsed:.0f} 秒只挪了 {moved:.1f} 格，已让她停下"

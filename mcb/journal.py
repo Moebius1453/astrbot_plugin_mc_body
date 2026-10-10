@@ -38,6 +38,10 @@ class Journal:
 
     def __init__(self, capacity: int = CAPACITY) -> None:
         self._buf: deque[dict] = deque(maxlen=max(20, int(capacity)))
+        # ⚠️ **挤掉的条数要记账**（抄 Numen `EventQueue.flushDropped`）。
+        #    `deque(maxlen=)` 是**无声丢弃** —— 不说的话，她会把"最近 400 条"
+        #    当成"全部发生过的事"，把中间漏掉的那段当成"什么都没干"。
+        self._dropped = 0
 
     # ---- 写 -------------------------------------------------------------
 
@@ -50,6 +54,8 @@ class Journal:
         }
         if not entry["text"]:
             return
+        if len(self._buf) == self._buf.maxlen:
+            self._dropped += 1
         self._buf.append(entry)
 
     # ---- 读 -------------------------------------------------------------
@@ -65,6 +71,8 @@ class Journal:
         if not rows:
             return "（还没有发生什么事）"
         out = []
+        if self._dropped:
+            out.append(f"（更早的约 {self._dropped} 条已经翻过去了，这只是最近一段）")
         for e in rows:
             label = KIND_LABEL.get(e["kind"], e["kind"])
             out.append(f"[{e['t']}] {label} · {e['text']}")

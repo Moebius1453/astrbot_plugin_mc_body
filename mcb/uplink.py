@@ -43,6 +43,9 @@ _SENTENCE_END = "。！？!?…"
 #    语气词开头的句子在中文里太常见，所以要求"到这里至少凑够 N 个字"才肯截。
 _SENTENCE_MIN = 8
 
+# 一轮跑完发现"期间又被点名了"，最多连着补几轮 —— 防跑飞（每轮都是一整轮 agent，烧 token）
+MAX_FOLLOWUP_WAKES = 3
+
 
 def provider_settings_to_build_kwargs(cfg: dict) -> dict:
     """把 AstrBot 的全局配置翻成 `MainAgentBuildConfig` 的字段。
@@ -132,8 +135,11 @@ class ChatUplink:
         self._task: asyncio.Task | None = None
         self._last_seq = 0
         self._ambient: list[str] = []       # 没被点名、攒着当上下文的话
+        self._ambient_dropped = 0            # 被挤掉了几条（要告诉她，别无声丢弃）
         self._recent_self: list[str] = []   # Nanako 最近说的，最多 2 句
         self._busy = asyncio.Lock()         # 一次只唤醒一个，别叠
+        # 跑着的时候又被点名了 → 记在这儿，这一轮完事立刻补一轮（**不是丢掉**）
+        self._pending: str | None = None
         self._fail_streak = 0
 
     # ---- 生命周期 -------------------------------------------------------
@@ -216,7 +222,9 @@ class ChatUplink:
 
             head = _speaker_line(who, text, line)
             self._ambient.append(head)
-            _trim_head(self._ambient, self.ambient_limit)
+            # ⚠️ 挤掉的**要记账** —— 原来是 `pop(0)` 一扔了事，一声不吭。
+            #    不说的话她会把"还剩的这几条"当成全部聊天记录。
+            self._ambient_dropped += _trim_head(self._ambient, self.ambient_limit)
             if self._is_wake(text):
                 wake_trigger = head
 
@@ -236,23 +244,40 @@ class ChatUplink:
 
     async def _wake(self, trigger: str) -> None:
         if self._busy.locked():
-            logger.info("[mc_body] 上一次唤醒还没跑完，这条先只进上下文")
+            # ⚠️ **不丢这条，记账**（抄 Numen `AgentLoop.pump()` 的 `pumpAgain`）——
+            #    原来直接 `return`，用户连发两句时**第二句永远不会被回应**，
+            #    而且日志里只说"先只进上下文"，看起来像有意为之。
+            self._pending = trigger
+            logger.info("[mc_body] 上一次唤醒还没跑完，这条先记下，跑完补一轮")
             return
         async with self._busy:
-            prompt = self._build_prompt(trigger)
-            try:
-                reply_text = await self._run_white(prompt)
-            except Exception as exc:  # noqa: BLE001
-                logger.error(f"[mc_body] 唤醒白失败：{exc}", exc_info=True)
-                return
+            current: str | None = trigger
+            rounds = 0
+            while current is not None and rounds < MAX_FOLLOWUP_WAKES:
+                self._pending = None
+                await self._one_wake(current)
+                current = self._pending        # 跑的过程中又被点名了 → 再补一轮
+                rounds += 1
+            if self._pending is not None:
+                logger.warning("[mc_body] 连续补唤醒到上限，这条留给下一轮轮询")
 
-            # 跑成功了才清上下文 —— 失败时留着，下次还能带上
-            self._ambient.clear()
+    async def _one_wake(self, trigger: str) -> None:
+        prompt = self._build_prompt(trigger)
+        try:
+            reply_text = await self._run_white(prompt)
+        except Exception as exc:  # noqa: BLE001
+            logger.error(f"[mc_body] 唤醒白失败：{exc}", exc_info=True)
+            return
 
-            if not reply_text:
-                logger.info("[mc_body] 白这次没有输出文本，不往游戏里发")
-                return
-            await self._say_in_game(reply_text)
+        # 跑成功了才清上下文 —— 失败时留着，下次还能带上
+        self._ambient.clear()
+        # 挤掉的条数**已经报给她了**，这一轮就算交代过，别一直挂着
+        self._ambient_dropped = 0
+
+        if not reply_text:
+            logger.info("[mc_body] 白这次没有输出文本，不往游戏里发")
+            return
+        await self._say_in_game(reply_text)
 
     def _build_prompt(self, trigger: str) -> str:
         # ⚠️ 统一用 `[mc:*]` 前缀（规范见 `docs\12`）：**凡是从 Minecraft 来的数据都带这个标签**，
@@ -265,6 +290,8 @@ class ChatUplink:
         ]
         if self._ambient:
             parts += ["", "最近的游戏内聊天（供你参考上下文）："]
+            if self._ambient_dropped:
+                parts += [f"  （更早的约 {self._ambient_dropped} 条聊天已经挤掉了，你只看到最近这几条）"]
             parts += [f"  {line}" for line in self._ambient]
         if self._recent_self:
             parts += ["", "你刚才在游戏里说过："]
@@ -612,9 +639,13 @@ def _as_int(value, default: int = 0) -> int:
         return default
 
 
-def _trim_head(items: list[str], limit: int) -> None:
+def _trim_head(items: list[str], limit: int) -> int:
+    """砍掉头部多余的，**返回砍了几条**（调用方要记账 —— 丢弃不许无声）。"""
+    dropped = 0
     while len(items) > limit:
         items.pop(0)
+        dropped += 1
+    return dropped
 
 
 def _speaker_line(who: str, text: str, raw: dict) -> str:
