@@ -631,6 +631,246 @@ try {
   console.error('[mcb] loggedOut 注册失败: ' + eOutReg)
 }
 
+// ===== T2：跨 tick 增量扫描 ===============================================
+//
+// **它补的是 T1 的缺口。**
+//   T1（`mcb around`）走「方块实体 + heightmap 抽样」，一次 ~50ms 就能给个概览，
+//   但它**拿不到没有方块实体的方块** —— 工作台 / 铁砧 / 石切机 / 织布机 / 制箭台 /
+//   制图台 / 锻造台 / 砂轮 / 堆肥桶 / 营火 / 传送门框… 这些统统不在
+//   `chunk.getBlockEntities()` 那张表里，T1 看不见它们。
+//
+//   全分辨率逐方块扫一遍要几十万次读（Rhino 下每格 ~10µs），**一个 tick 干不完** ——
+//   600 格/tick 就是 6ms，扫 6 chunk 的地表带要跑好几百个 tick。
+//   所以做成**跨 tick 的后台任务**：每 tick 推进一小块，结果进缓存，随时可查。
+//
+// ⚠️ **每 tick 的读数是"预算"，不是"能扫多快扫多快"** —— 这是共用服务器，
+//    用户就在同一个服里玩。预算调大会让 MSPT 直接涨，别乱调。
+//
+// ⚠️ **tick 钩子的第一句必须是纯 JS 判断**（`mcbT2 === null`），不碰任何 Java。
+//    挂 tick 最怕"每 tick 都白跑一遍 Java 调用" —— 那是 20 次/秒的纯浪费。
+
+const MCB_T2_READS_PER_TICK = 600        // 每 tick 最多读多少格（≈6ms，占 50ms tick 的 12%）
+const MCB_T2_BAND_BELOW = 4              // 地表往下扫几格
+const MCB_T2_BAND_ABOVE = 4              // 地表往上扫几格
+const MCB_T2_POI_MAX = 300               // POI 最多留多少条（按距离近的优先）
+const MCB_T2_KEEP_MS = 10 * 60 * 1000    // 扫完之后结果保留多久
+
+// 值得单列出来的方块（键是注册名的**路径部分**，不带命名空间）。
+// 挑的原则：**没有方块实体**，因此 T1 看不见 —— 这正是 T2 存在的理由。
+// 少数有方块实体的（刷怪笼/唱片机）也顺手带上，重复了由下游按坐标去重。
+const MCB_T2_POI_IDS = {
+  'crafting_table': '工作台',
+  'anvil': '铁砧', 'chipped_anvil': '开裂的铁砧', 'damaged_anvil': '损坏的铁砧',
+  'stonecutter': '石切机', 'loom': '织布机', 'fletching_table': '制箭台',
+  'cartography_table': '制图台', 'smithing_table': '锻造台', 'grindstone': '砂轮',
+  'composter': '堆肥桶', 'bell': '钟',
+  'campfire': '营火', 'soul_campfire': '灵魂营火',
+  'cauldron': '炼药锅', 'water_cauldron': '装水的炼药锅',
+  'lava_cauldron': '装岩浆的炼药锅', 'powder_snow_cauldron': '装细雪的炼药锅',
+  'end_portal_frame': '末地传送门框', 'nether_portal': '下界传送门',
+  'scaffolding': '脚手架', 'lightning_rod': '避雷针', 'target': '标靶',
+  'spawner': '刷怪笼', 'jukebox': '唱片机', 'bee_nest': '蜂巢', 'beehive': '蜂箱'
+}
+
+var mcbT2 = null        // 没在跑、也没有结果时是 null
+var mcbT2BP = null      // 缓存的 BlockPos 类
+var mcbT2Height = null  // 缓存的 Heightmap.Types.MOTION_BLOCKING
+
+function mcbT2Setup() {
+  if (mcbT2BP === null) {
+    try { mcbT2BP = Java.loadClass('net.minecraft.core.BlockPos') } catch (eBP) { }
+  }
+  if (mcbT2Height === null) {
+    try {
+      var $T = Java.loadClass('net.minecraft.world.level.levelgen.Heightmap$Types')
+      mcbT2Height = $T.MOTION_BLOCKING
+    } catch (eH) { }
+  }
+  return mcbT2BP !== null && mcbT2Height !== null
+}
+
+// ⚠️ **热路径专用**：`mcbBlockId` 每次调用都按顺序试 4 条路 —— 一次扫描几百万次读，
+//    那个开销会让 10µs/格 直接翻几倍。这里认准**已经探明的那一条**。
+function mcbBlockIdFast(state) {
+  if (mcbBlockIdVia === 'state.id') { try { return String(state.id) } catch (e1) { } }
+  else if (mcbBlockIdVia === 'state.block.id') { try { return String(state.block.id) } catch (e2) { } }
+  else if (mcbBlockIdVia === 'state.block') { try { return String(state.block) } catch (e3) { } }
+  else if (mcbBlockIdVia === 'state.toString') { try { return String(state) } catch (e4) { } }
+  return mcbBlockId(state)     // 还不知道走哪条 —— 走一次慢路把它定下来
+}
+
+function mcbShortId(id) {
+  var i = id.indexOf(':')
+  return i < 0 ? id : id.substring(i + 1)
+}
+
+function mcbT2Start(player, radiusChunks) {
+  if (!mcbT2Setup()) return { err: 'BlockPos / Heightmap 取不到，扫不了' }
+  var level = null
+  try { level = player.level } catch (e0) { return { err: 'level: ' + e0 } }
+
+  var px = Number(player.x), py = Number(player.y), pz = Number(player.z)
+  var pcx = Math.floor(px / 16), pcz = Math.floor(pz / 16)
+
+  var chunks = []
+  for (var dx = -radiusChunks; dx <= radiusChunks; dx++) {
+    for (var dz = -radiusChunks; dz <= radiusChunks; dz++) {
+      chunks.push([pcx + dx, pcz + dz, dx * dx + dz * dz])
+    }
+  }
+  chunks.sort(function (a, b) { return a[2] - b[2] })   // 近的 chunk 先扫
+
+  mcbT2 = {
+    level: level, who: mcbEntityLabel(player),
+    px: px, py: py, pz: pz, cx: pcx, cz: pcz,
+    radiusChunks: radiusChunks,
+    chunks: chunks, ci: 0, col: 0,
+    counts: {}, nearest: {}, poi: [], total: 0, scannedCols: 0, reads: 0,
+    skippedChunks: 0, startedAt: mcbNowMs(), doneAt: 0, ticks: 0, ms: 0, err: []
+  }
+  return mcbT2Status()
+}
+
+function mcbT2Status() {
+  mcbT2Reap()
+  if (mcbT2 === null) return { job: 'none' }
+  var t = mcbT2
+  var totalCols = t.chunks.length * 256
+  var doneCols = t.ci * 256 + t.col
+  return {
+    job: t.doneAt > 0 ? 'done' : 'running',
+    who: t.who,
+    center: [Math.round(t.px), Math.round(t.py), Math.round(t.pz)],
+    radiusChunks: t.radiusChunks,
+    pct: Math.round(doneCols * 1000 / totalCols) / 10,
+    scannedCols: t.scannedCols,
+    reads: t.reads,
+    ticks: t.ticks,
+    ms: t.doneAt > 0 ? t.ms : Math.round(mcbNowMs() - t.startedAt),
+    types: Object.keys(t.counts).length,
+    poi: t.poi.length,
+    skippedChunks: t.skippedChunks,
+    perTick: MCB_T2_READS_PER_TICK,
+    err: t.err.slice(0, 3)
+  }
+}
+
+// 每 tick 推进一小块。**调用方已经确认过 `mcbT2 !== null && doneAt === 0`。**
+function mcbT2Step() {
+  var t = mcbT2
+  if (t === null || t.doneAt > 0) return
+  t.ticks++
+
+  var level = t.level
+  if (level === null || level === undefined) { t.err.push('level 丢了'); mcbT2 = null; return }
+
+  var perCol = MCB_T2_BAND_ABOVE + MCB_T2_BAND_BELOW + 1   // 每列几次**方块**读
+  var colCost = perCol + 1                                  // 再加一次 getHeight
+  var budget = MCB_T2_READS_PER_TICK
+  // ⚠️⚠️ **`used` 是本 tick 的计数器，`t.reads` 是累计的 —— 别混用。**
+  //    第一版拿 `t.reads` 直接当预算判据，于是第一个 tick 就冲到 600，
+  //    之后每 tick 只扫 1 列、再往后 0 列，**任务永远跑不完**（实测 8 秒才 67 列）。
+  var used = 0
+
+  while (used < budget) {
+    if (t.ci >= t.chunks.length) {
+      t.doneAt = mcbNowMs()
+      t.ms = Math.round(t.doneAt - t.startedAt)
+      return
+    }
+
+    var c = t.chunks[t.ci]
+    var ch = null
+    try { ch = level.getChunk(c[0], c[1]) } catch (eC) { ch = null }
+    var skip = (ch === null || ch === undefined)
+    if (!skip) { try { if (ch.isEmpty()) skip = true } catch (eE) { } }
+    if (skip) { t.ci++; t.col = 0; t.skippedChunks++; continue }   // 没加载的 chunk 直接跳
+
+    var colsLeft = 256 - t.col
+    var colsNow = Math.floor((budget - used) / colCost)
+    if (colsNow < 1) colsNow = 1
+    if (colsNow > colsLeft) colsNow = colsLeft
+
+    for (var k = 0; k < colsNow; k++, t.col++) {
+      var wx = c[0] * 16 + (t.col & 15)
+      var wz = c[1] * 16 + ((t.col >> 4) & 15)
+
+      // ⚠️ `getHeight` 收的是**世界坐标**（内部自己 `& 15`），别传 chunk 内局部坐标。
+      var sy = -1
+      try { sy = Number(ch.getHeight(mcbT2Height, wx, wz)) } catch (eH) { sy = -1 }
+      used += colCost
+      t.reads += colCost
+      if (!(sy > -100)) continue          // 拿不到高度就跳过这一列（缺失 ≠ 0）
+      t.scannedCols++
+
+      for (var dy = -MCB_T2_BAND_BELOW; dy <= MCB_T2_BAND_ABOVE; dy++) {
+        var wy = sy + dy
+        var id = null
+        try { id = mcbBlockIdFast(level.getBlockState(new mcbT2BP(wx, wy, wz))) } catch (eS) { id = null }
+        if (id === null) continue
+        var s = mcbShortId(id)
+        if (s === 'air' || s === 'cave_air' || s === 'void_air') continue
+        t.total++
+        t.counts[id] = (t.counts[id] || 0) + 1
+        if (t.nearest[id] === undefined) t.nearest[id] = [wx, wy, wz]
+        if (MCB_T2_POI_IDS[s] !== undefined && t.poi.length < MCB_T2_POI_MAX) {
+          var ddx = wx + 0.5 - t.px, ddy = wy + 0.5 - t.py, ddz = wz + 0.5 - t.pz
+          t.poi.push({
+            id: id, what: MCB_T2_POI_IDS[s], x: wx, y: wy, z: wz,
+            d: Math.round(Math.sqrt(ddx * ddx + ddy * ddy + ddz * ddz) * 10) / 10
+          })
+        }
+      }
+    }
+    if (t.col >= 256) { t.ci++; t.col = 0 }
+  }
+}
+
+function mcbT2Get() {
+  mcbT2Reap()
+  if (mcbT2 === null) return { job: 'none' }
+  var t = mcbT2
+  var arr = []
+  for (var k in t.counts) {
+    if (Object.prototype.hasOwnProperty.call(t.counts, k)) {
+      arr.push({ id: k, n: t.counts[k], nearest: t.nearest[k] })
+    }
+  }
+  arr.sort(function (a, b) { return b.n - a.n })
+  var poi = t.poi.slice(0)
+  poi.sort(function (a, b) { return a.d - b.d })
+  return { job: t.doneAt > 0 ? 'done' : 'running', status: mcbT2Status(), types: arr, poi: poi }
+}
+
+function mcbT2Stop() {
+  var s = mcbT2Status()
+  mcbT2 = null
+  return { stopped: true, was: s }
+}
+
+// 扫完的结果留一会儿好让插件拉到，过期就清掉。
+// ⚠️ **惰性清理，不在 tick 里判过期** —— `mcbNowMs()` 在 Rhino 里是一次 Java 调用，
+//    放进 tick 就是每 tick 白烧一次，而且一烧就是 `MCB_T2_KEEP_MS` 那么久。
+//    这两个入口本来就调用得稀疏，放这儿判最划算。
+function mcbT2Reap() {
+  if (mcbT2 === null) return
+  if (mcbT2.doneAt <= 0) return
+  if (mcbNowMs() - mcbT2.doneAt > MCB_T2_KEEP_MS) mcbT2 = null
+}
+
+try {
+  ServerEvents.tick(event => {
+    // ⚠️ **第一句必须是纯 JS 判断，不碰任何 Java。** 没任务时这个钩子成本接近零 ——
+    //    挂 tick 最怕的就是"每 tick 都白跑一遍 Java 调用"，那是 20 次/秒的纯浪费。
+    if (mcbT2 === null || mcbT2.doneAt > 0) return
+    try { mcbT2Step() } catch (e) {
+      if (mcbT2 !== null) mcbT2.err.push('tick: ' + e)
+    }
+  })
+} catch (eT2Reg) {
+  console.error('[mcb] ServerEvents.tick 注册失败: ' + eT2Reg)
+}
+
 // --- 背包与饥饿（服务端可读，不需要客户端）--------------------------------
 
 // 一个物品槽的信息。每个访问器独立 try —— Rhino 下哪个能用的**是探出来的**，
@@ -2246,6 +2486,33 @@ ServerEvents.basicCommand('mcb', event => {
     if (stp < 1) stp = 1
     if (stp > 16) stp = 16        // 抽样步长，越小越细也越贵
     mcbOk(event, 'around', mcbAround(player, rc, stp))
+    return
+  }
+
+  // T2：跨 tick 全分辨率扫描 —— **补 T1 的缺口**（没有方块实体的 POI：工作台/铁砧/
+  //     石切机/堆肥桶/传送门框…）。它是个后台任务，不阻塞 tick，结果进缓存。
+  //     用法：
+  //       mcb t2 start [chunk数]   开一个任务（默认半径 6 chunk），**以发起者为圆心**
+  //       mcb t2 status            进度（跑没跑完、扫了多少、花了多少 tick）
+  //       mcb t2 get               结果（方块计数 + POI 列表）
+  //       mcb t2 stop              取消
+  if (action === 't2') {
+    var parts2 = String(arg || '').trim().split(' ')
+    var verb2 = parts2[0]
+    if (verb2 === 'start') {
+      var rc2 = 6
+      try {
+        var a2 = parseInt(parts2[1], 10)
+        if (!isNaN(a2) && a2 > 0) rc2 = a2
+      } catch (eR2) { }
+      if (rc2 > 12) rc2 = 12          // 再大就不是"视距内"了，而且后台要跑太久
+      mcbOk(event, 't2', mcbT2Start(player, rc2))
+      return
+    }
+    if (verb2 === 'status') { mcbOk(event, 't2', mcbT2Status()); return }
+    if (verb2 === 'get') { mcbOk(event, 't2', mcbT2Get()); return }
+    if (verb2 === 'stop') { mcbOk(event, 't2', mcbT2Stop()); return }
+    mcbOk(event, 't2', { err: '用法: mcb t2 start [chunk数] | status | get | stop' })
     return
   }
 
