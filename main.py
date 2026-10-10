@@ -35,6 +35,7 @@ from .mcb.containers import ContainerIO
 from .mcb.craft import CraftRunner, Crafter
 from .mcb.events import EventFeed
 from .mcb.journal import Journal
+from .mcb import permission
 from .mcb.places import PlaceBook
 from .mcb.reflex import ReflexGuard
 from .mcb import reflexes
@@ -241,6 +242,34 @@ class McBodyPlugin(Star):
         #    当成用户现实里在下雨（2026-10-10 实际发生过，见 docs/17 P2）。
         await self.context.send_message(umo, MessageChain([Plain(f"[mc:alert] {facts}")]))
 
+    async def _held_stack(self) -> tuple[str | None, int | None]:
+        """手上（快捷栏当前格）那个东西是「什么 + 几个」。读不到回 (None, None)。
+
+        返回的 id 是注册名（不是显示名）—— 权限层按注册名判危险物品，
+        显示名跟语言走、对 mod 物品还会返回本地化 key，不能用。
+
+        注意： 空手是 (None, 0)：那是"手上是空的"，不是"读不到"。读不到才是 (None, None)。
+        """
+        data, err = await self._call("mcb inventory")
+        if err or not isinstance(data, dict):
+            return None, None
+        sel = data.get("held")
+        if not isinstance(sel, (int, float)) or isinstance(sel, bool):
+            return None, None
+        idx = int(sel)
+        hotbar = data.get("hotbar") or []
+        if not 0 <= idx < len(hotbar):
+            return None, None
+        it = hotbar[idx]
+        if not isinstance(it, dict):
+            # 注意： 空槽位是 null（不是缺字段）。见下面 _held_count 的说明。
+            return None, 0
+        item_id = str(it.get("id") or "") or None
+        try:
+            return item_id, int(it.get("c"))
+        except (TypeError, ValueError):
+            return item_id, None
+
     async def _held_count(self) -> int | None:
         """手上（快捷栏当前格）那个东西有几个。读不到回 None，不假装是 0。
 
@@ -255,25 +284,7 @@ class McBodyPlugin(Star):
         真相：held 是快捷栏的序号（0~8），物品是 hotbar[held]。
         实测 "held":2.0, "via":"inv.selected" —— 访问器一直是好的，是我们读错了。
         """
-        data, err = await self._call("mcb inventory")
-        if err or not isinstance(data, dict):
-            return None
-        sel = data.get("held")
-        if not isinstance(sel, (int, float)) or isinstance(sel, bool):
-            return None
-        idx = int(sel)
-        hotbar = data.get("hotbar") or []
-        if not 0 <= idx < len(hotbar):
-            return None
-        it = hotbar[idx]
-        if not isinstance(it, dict):
-            # 注意： 空槽位是 null（不是缺字段）。这是"手上是空的"，不是"读不到" ——
-            #    空手就是 0 个，如实报 0。"读不到"才回 None。
-            return 0
-        try:
-            return int(it.get("c"))
-        except (TypeError, ValueError):
-            return None
+        return (await self._held_stack())[1]
 
     async def _menu_snapshot(self) -> dict | None:
         """取一次"她当前开着的界面"。读不到返回 None（不是空 dict）。
@@ -551,6 +562,94 @@ class McBodyPlugin(Star):
         要加"逐工具开关"之类的公共检查，只改这一个地方。
         """
         return self._authorize(event)
+
+    # ---- 权限门（这个动作能不能改世界）----------------------------------
+    #
+    # 注意： 和 _guard 是并列的两道门，别合并（docs\22 §1 第 9 行）：
+    #     _guard 管"谁有资格下命令"，这道门管"这个动作能不能改世界"。
+    #     裁决逻辑全在 mcb/permission.py，这里只做"取事实 + 调裁决 + 收场"。
+
+    def _owner_rules(self) -> permission.RuleSet:
+        """主人自己写的那一层规则。没配/读不动就是空层（不抛）。
+
+        注意： 规则写错会抛 RuleError —— 那是配置问题，要吵出来，不能静默吞掉
+        （一条永远不会命中的规则比一个报错更糟）。所以这里只吞"文件不存在"。
+        """
+        path = str(self._cfg("permission_rules_file", "") or "").strip()
+        if not path:
+            return permission.EMPTY
+        try:
+            return permission.load_owner_rules(path)
+        except permission.RuleError as exc:
+            logger.warning(f"[{PLUGIN_NAME}] 主人权限规则写错了，这一层按空处理：{exc}")
+            return permission.EMPTY
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[{PLUGIN_NAME}] 主人权限规则读不动，这一层按空处理：{exc}")
+            return permission.EMPTY
+
+    async def _permit(
+        self, action: permission.Action
+    ) -> tuple[permission.Verdict, permission.Facts]:
+        """裁决一个动作。返回 (裁决, 用到的事实)。
+
+        事实读不到时按"问"处理，绝不按"放行" —— 缺失不等于假。
+        """
+        mode = permission.Mode.by_name(self._cfg("permission_mode", permission.Mode.ASK))
+        if mode == permission.Mode.BYPASS:
+            return permission.ALLOWED, permission.Facts()
+        judge = permission.Judge(mode=mode, owner=self._owner_rules())
+        facts = permission.Facts(pos=action.pos)
+        if action.pos is not None:
+            tx, ty, tz = action.pos
+            data, err = await self._call(f"mcb placed {tx} {ty} {tz}")
+            if err or not isinstance(data, dict):
+                return (
+                    permission.Verdict(
+                        permission.VerdictKind.ASK, "读不到这一格的放置记录"
+                    ),
+                    facts,
+                )
+            facts = permission.Facts.from_placed_reply(data)
+        return judge.decide(action, facts), facts
+
+    async def _permit_or_refuse(
+        self, action: permission.Action, what: str
+    ) -> str | None:
+        """要改世界的工具都先过这里。放行回 None，不放行回一条给她的失败回执。
+
+        去问（ask）这一版降级成"停手 + 在公屏说一句"，不做答复回环（docs\22 §6 第 5 步）——
+        光这一步就消灭了"她不问一声就把主人的东西拆了/倒了岩浆"。
+        """
+        verdict, facts = await self._permit(action)
+        if verdict.allowed:
+            return None
+        if verdict.asks:
+            await self._say_in_game("等一下，这个我拿不准，先问问主人再动。")
+            where = ""
+            if facts.pos is not None:
+                where = f"（在 {facts.pos[0]},{facts.pos[1]},{facts.pos[2]} 那一格"
+                where += f"，{facts.block}）" if facts.block else "）"
+            return render.fail(
+                render.Kind.DENIED,
+                f"{what}被权限层拦下了",
+                detail=verdict.reason() + where,
+                usage="停下来告诉主人你想做什么，等他明确说可以做；别换个坐标或换种说法重试同一件事",
+                hint="这是保护主人东西的规则，不是你做错了——但没有许可之前不要绕过它",
+            )
+        return render.fail(
+            render.Kind.DENIED,
+            f"{what}被权限层拒绝了",
+            detail=verdict.reason(),
+            usage="别再试这一下；把它当成「这个动作本身不被允许」",
+            hint="如果确实需要，让主人在插件配置里改 permission_mode 或他那一层规则",
+        )
+
+    async def _say_in_game(self, text: str) -> None:
+        """在公屏说一句。失败不影响调用方 —— 这是附带的通知，不是主流程。"""
+        try:
+            await self._call(f"mcb say {text}")
+        except Exception as exc:  # noqa: BLE001
+            logger.info(f"[{PLUGIN_NAME}] 公屏说一句失败（可忽略）：{exc}")
 
     # ---- 与桥对话 -------------------------------------------------------
 
@@ -1051,7 +1150,16 @@ class McBodyPlugin(Star):
         #    她没看，转头就在公屏上说"熔炉放地上啦！" —— 其实熔炉还在包里。
         #    ⭐ 教训：把验证甩给一个不会去验证的人，等于没有验证。
         #    （和 docs\11 那条"成功判据用世界真的变了，不用命令发出去了"是同一条。）
-        before = await self._held_count()
+        before_item, before = await self._held_stack()
+        # 权限门（docs\22 §6 第 4 步：先只接 PLACE 一个动词，别贪多）。
+        # 理由是这一格真的可能改世界：手上是岩浆桶/打火石/TNT 时，右键就是泼出去、点着。
+        # 注意： 判的是"手上的东西"，所以必须在动作之前读一次手。
+        what = f"对着 ({tx},{ty},{tz}) 放置"
+        if (refusal := await self._permit_or_refuse(
+            permission.Action(permission.Kind.PLACE, pos=(tx, ty, tz), item=before_item),
+            what,
+        )):
+            return refusal
         # 走 useOnAt（直接给坐标构造命中），不依赖准星射线 —— 实测射线经常 MISS
         _, err = await self._call(f"mcb useOnAt {tx} {ty} {tz}")
         if err:

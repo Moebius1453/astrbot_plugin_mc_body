@@ -2520,6 +2520,9 @@ ServerEvents.basicCommand('mcb', event => {
       var $PlacedPos = Java.loadClass('net.minecraft.core.BlockPos')
       var placedPos = new $PlacedPos(Number(placedArgs[0]), Number(placedArgs[1]), Number(placedArgs[2]))
       var fact = mcbPlacedFact(placedPlayer.level, placedPos)
+      // actor = 她自己 —— 插件侧靠它把"我放的"和"别人放的"分成互不相交的两半
+      // （permission.py 的 self_placed / placed 两个信号）。
+      fact.actor = String(placedPlayer.uuid)
       fact.verdict = mcbBreakVerdict(fact, String(placedPlayer.uuid))
       mcbOk(event, action, fact)
     } catch (errPlaced) { mcbErr(event, action, String(errPlaced)) }

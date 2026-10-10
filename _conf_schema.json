@@ -151,6 +151,18 @@
     "hint": "关掉后 mc_task 会拒绝执行。开着的时候白能把多步行为串成一件事（比如沿途插火把），程序一步步做完，她自己知道进度，也能被叫停。",
     "default": true
   },
+  "permission_mode": {
+    "type": "string",
+    "description": "权限模式（白能不能改世界）",
+    "hint": "ask = 按规则表裁决（默认，安全）：日常动作放行，动主人的东西/危险物品先问一句。bypass = 全放行（单机不想被打扰时用）。observe = 只看不动，拒绝一切改世界的动作（等于 plan mode）。\n\n⚠️ 规则表在 mcb/permission.py 的出厂表里（抄 Numen）；你自己写的那一层规则用下面的 permission_rules_file 指定。\n\n目前接进口的是 mc_use_on（放置）—— 手上是岩浆桶/打火石/TNT/水桶这类危险物品时会先问。逐格破坏的裁决在服务端（已部署），不受这个开关影响。",
+    "default": "ask"
+  },
+  "permission_rules_file": {
+    "type": "string",
+    "description": "主人自己写的那一层权限规则（留空=不加载）",
+    "hint": "一个 JSON 文件，形状 {\"deny\": [...], \"allow\": [...], \"ask\": [...]}，三张表都可以缺。规则一行一条，写成 动作(项 & 项 & !项)，例如 break(placed) 或 attack(named)。\n\n动词：break / place / attack / take（或 * 表示任何动作）。\n信号：placed / self_placed / block_entity / contents / near_placed / owned / named / villager / hostile / hazard_item。\n还可以写方块/物品的注册名（minecraft:chest）或 entity:<uuid>。\n\n⚠️ 这一层整体压过出厂表：你写的 ask 行能盖住出厂的 allow 行。\n⚠️ 标签项（#minecraft:beds）这一版不支持——写错会报教学式错误，不会静默不生效。",
+    "default": ""
+  },
   "journal_capacity": {
     "type": "int",
     "description": "状态日志最多攒多少条",
