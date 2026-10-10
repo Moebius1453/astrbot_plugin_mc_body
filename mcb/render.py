@@ -72,6 +72,19 @@ def describe_state(data: dict, stance: str = "defend", work: dict | None = None,
     if dim:
         parts.append(f"维度 {str(dim).removeprefix('minecraft:')}")
 
+    # 朝向 —— 和状态包里同一个理由（2026-10-10）：她自己读不到"头朝哪"，
+    # 用户问她"你怎么一直低头"时她只能编。这里用 `describe_look` 那套措辞，保持一致。
+    facing = data.get("facing")
+    if facing:
+        pitch = data.get("pitch")
+        extra = ""
+        if isinstance(pitch, (int, float)) and not isinstance(pitch, bool):
+            if pitch <= -50:
+                extra = "，基本在往上看"
+            elif pitch >= 50:
+                extra = "，基本在往下看"
+        parts.append(f"面朝{_COMPASS_CN.get(str(facing), str(facing))}{extra}")
+
     # 时间 / 天气 —— "现在几点、下没下雨"。**不做解读**（不写"该收工了"）
     env = data.get("env") if isinstance(data.get("env"), dict) else {}
     hhmm = env.get("hhmm")
@@ -553,6 +566,16 @@ def state_packet(data: dict, stance: str = "defend", work: dict | None = None,
     body = [f"pos={_num(data.get('x'), '.1f')},{_num(data.get('y'), '.1f')},{_num(data.get('z'), '.1f')}"]
     dim = str(data.get("dim") or "").removeprefix("minecraft:")
     body.append(f"dim={dim or '?'}")
+    # 🧭 朝向 —— **她自己看不见自己的头朝哪**（2026-10-10 用户实报："她声称自己没低头，
+    #    但一直是低头状态"，现场服务端读到 `pitch:81.3`）。
+    #    以前只有 `mc_lookat` 吐过这个信息，而她不会去问那个问题 ——
+    #    **状态包里有，才算她"知道"**（律④：能力自我认知 = 工具表 + 状态包）。
+    facing = str(data.get("facing") or "")
+    if facing:
+        body.append(f"face={facing}")
+    pitch = data.get("pitch")
+    if isinstance(pitch, (int, float)) and not isinstance(pitch, bool):
+        body.append(f"pitch={_num(pitch, 'g')}")
     body.append(f"hp={_num(data.get('hp'), '.1f')}/20")
     food = data.get("food") if isinstance(data.get("food"), dict) else {}
     body.append(f"food={_num(food.get('level'), 'g')}/20")

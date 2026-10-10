@@ -73,7 +73,7 @@ MAX_RAW_LEN = 200
     "astrbot_plugin_mc_body",
     "Moebius1453",
     "让 AstrBot 的智能体在 Minecraft 里长出手脚：查询角色状态、说话、移动。",
-    "0.2.0",
+    "0.37.0",
 )
 class McBodyPlugin(Star):
     def __init__(self, context: Context, config: dict | None = None) -> None:
@@ -196,22 +196,34 @@ class McBodyPlugin(Star):
 
         用途：`mc_use_on` 靠"手上的数量少没少"来判定"到底放没放成" ——
         这是唯一能自动验证的实据（见那个工具里的说明）。
+
+        ⚠️⚠️ **2026-10-10 订正（这就是 `docs/18` A2 那个"held 对不上"的真因）**：
+        老代码拿 `data['held']` 去比 `hotbar` 项里的 `slot` 字段 ——
+        而**那个字段在 hotbar 里压根不存在**（服务端只给 `main` 的项加 `slot`），
+        于是循环永远匹配不上、**恒返回 `None`** → `mc_use_on` 永远只会说"确认不了"。
+
+        **真相：`held` 是快捷栏的序号（0~8），物品是 `hotbar[held]`。**
+        实测 `"held":2.0, "via":"inv.selected"` —— 访问器一直是好的，是我们读错了。
         """
         data, err = await self._call("mcb inventory")
         if err or not isinstance(data, dict):
             return None
         sel = data.get("held")
-        if sel is None:
+        if not isinstance(sel, (int, float)) or isinstance(sel, bool):
             return None
-        for it in (data.get("hotbar") or []):
-            if not isinstance(it, dict):
-                continue
-            if it.get("slot") == sel:
-                try:
-                    return int(it.get("c"))
-                except (TypeError, ValueError):
-                    return None
-        return None
+        idx = int(sel)
+        hotbar = data.get("hotbar") or []
+        if not 0 <= idx < len(hotbar):
+            return None
+        it = hotbar[idx]
+        if not isinstance(it, dict):
+            # ⚠️ 空槽位是 `null`（不是缺字段）。**这是"手上是空的"，不是"读不到"** ——
+            #    空手就是 0 个，如实报 0。"读不到"才回 None。
+            return 0
+        try:
+            return int(it.get("c"))
+        except (TypeError, ValueError):
+            return None
 
     async def _claim_walk_user(self, cmd: str, note: str) -> tuple[dict, str | None]:
         """**用户级**地声明 walk 通道。返回值和 `_call` 同形，方便原地替换。

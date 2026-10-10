@@ -54,11 +54,36 @@ NEAR_HOSTILE_RANGE = 5.0
 ENGAGE_RANGE = 3.0
 
 # 连续多少 tick 看不到怪就脱战（抄女仆的 StopAttackingIfTargetInvalid）
-COMBAT_EXIT_TICKS = 5
+COMBAT_EXIT_TICKS = 3
 
 # 脱战滞后：怪要拉开到 NEAR_HOSTILE_RANGE × 这个倍数才算"走了"。
 # 防止怪在边界上晃一下导致"进战/脱战"反复横跳（踩过：刷屏到用户的 QQ 里）。
-COMBAT_EXIT_RATIO = 1.6
+# ⚠️ 2026-10-10 从 1.6 收到 1.25（8.0 格 → 6.25 格）—— 用户："脱战这个看看能不能
+#    条件宽松一点点，因为**跑路绑架移动很蛋疼**"。蠹虫贴着她转，1.6 倍永远脱不了战。
+COMBAT_EXIT_RATIO = 1.25
+
+# 另一个脱战出口：**连续这么久没挨打**、而且**没有任何东西在瞄着她** → 直接脱战。
+# ⚠️ 只看"怪在不在附近"是不够的（原来的判据）：怪站在她旁边发呆，
+#    她也被永久锁在战斗态里出不来。这条是"其实已经安全了"的出口。
+COMBAT_QUIET_SECONDS = 10.0
+
+# ---- 反射的 walk 声明的生存时间（秒）------------------------------------
+#
+# 用户 2026-10-10："**反射肯定有作用时间，加个限制不至于无限触发**"。
+# 到期由 `arbiter.expire_stale()` 自动让位 —— **不再需要一个"释放"的调用点**，
+# 这是"卡住 = 永久锁死"那个 bug 的兜底（见 `mcb/arbiter.py` 的模块注释）。
+FLEE_TTL = 15.0      # 逃跑路线：久一点，逃跑本来要跑一会儿
+STOP_TTL = 8.0       # "停一下"类（进战刹车 / 卡住 / 溺水）
+
+# ---- 进战自动换武器 --------------------------------------------------------
+#
+# 用户 2026-10-10："**战斗依然无法切换武器，经常性不会主动换武器**"。
+# 实测诊断过：她手上攥着一根 `minecraft:string`，钻石斧/钻石剑全在背包里，
+# `mc_attack` 用手上的东西挥 → **伤害 0**（见 `main/docs/13-战斗与物品.md` §2）。
+#
+# ⚠️ 分数**只看真实攻击力**（服务端 `mcbStackInfo` 的 `atk`）—— **绝不按名字认武器**：
+#    显示名不可信（tacz 直接返回本地化 key `item.tacz.modern_kinetic_gun`）。
+WEAPON_MIN_GAIN = 1.0    # 新武器至少比手上这把强这么多才换，免得快捷栏里来回倒腾
 
 # 走向目标的节流：别每 tick 都下发一遍 goto
 APPROACH_EVERY_TICKS = 2
@@ -159,6 +184,10 @@ class ReflexGuard:
         self._in_combat = False
         self._no_threat_ticks = 0
         self._approach_wait = 0
+        # 距离上次挨打过了多久（秒）—— 脱战的第二个出口（COMBAT_QUIET_SECONDS）
+        self._no_hurt_seconds = 0.0
+        # 换武器的冷却：换完先安静几个 tick，别在快捷栏里来回倒腾
+        self._equip_cool = 0
 
         # 吃饭
         self._eat_cool = 0
@@ -179,18 +208,24 @@ class ReflexGuard:
     # ⚠️ **反射的 walk 声明是最高优先级**（保命 > 用户 > 任务）。
     #    而且它**只在声明、不删别人的** —— 所以脱战一 release，
     #    任务/用户的路线会**自己恢复**（"挂起不是取消"的落点）。
-    async def _walk_claim(self, cmd: str, note: str) -> None:
+    #
+    # ⭐ 2026-10-10：**每一条都带 `ttl`** —— 到期由 `expire_stale()` 自动让位。
+    #    这是"卡住把 walk 通道永久锁死"那个真 bug 的兜底，见 `arbiter.py`。
+    async def _walk_claim(self, cmd: str, note: str, ttl: float = FLEE_TTL) -> None:
         if self.arbiter is None:
             await self._cmd(f"mcb baritone {cmd}")
             return
-        await self.arbiter.claim_walk(LEVEL_REFLEX, "reflex", cmd, note)
+        await self.arbiter.claim_walk(LEVEL_REFLEX, "reflex", cmd, note, ttl=ttl)
 
-    async def _walk_stop(self, note: str) -> None:
-        """保命：顶掉别人的路线并停下。**不是"我不要走了"** —— 见 `claim_walk` 的注释。"""
+    async def _walk_stop(self, note: str, ttl: float = STOP_TTL) -> None:
+        """保命：顶掉别人的路线并停下。**不是"我不要走了"** —— 见 `claim_walk` 的注释。
+
+        ⚠️ 默认 **8 秒就自动让位** —— 停一下是为了打断错误寻路，不是永久禁走。
+        """
         if self.arbiter is None:
             await self._cmd("mcb stop")
             return
-        await self.arbiter.claim_walk(LEVEL_REFLEX, "reflex", None, note)
+        await self.arbiter.claim_walk(LEVEL_REFLEX, "reflex", None, note, ttl=ttl)
 
     async def _walk_release(self) -> None:
         if self.arbiter is not None:
@@ -292,6 +327,12 @@ class ReflexGuard:
             self._last_sample = None
             return
 
+        # ⭐ **先扫一遍过期的 walk 声明**（每 tick 都做）。
+        #    反射声明的 TTL 到点就自动让位 —— 这是"永久锁死"的兜底，
+        #    见 `arbiter.expire_stale` 和 `mcb/arbiter.py` 的模块注释。
+        if self.arbiter is not None:
+            await self.arbiter.expire_stale()
+
         hp = data.get("hp")
         hp = float(hp) if isinstance(hp, (int, float)) else None
 
@@ -299,6 +340,12 @@ class ReflexGuard:
         hurt = hp is not None and self._last_hp is not None and hp < self._last_hp
         was_hp = self._last_hp
         self._last_hp = hp
+
+        # 「多久没挨打了」——脱战的一个出口（见 COMBAT_QUIET_SECONDS）
+        if hurt:
+            self._no_hurt_seconds = 0.0
+        else:
+            self._no_hurt_seconds += self.interval
 
         # 一次索敌，两个用途（别再查第二遍 —— 每 tick 一次 RCON 往返已经够了）
         hostiles = await self._hostiles()
@@ -311,6 +358,7 @@ class ReflexGuard:
             if why:
                 self._in_combat = True
                 self._no_threat_ticks = 0
+                self._no_hurt_seconds = 0.0
                 # ⚠️ **只写日志，不发 QQ** —— 战斗是自动跑的，用户不需要在聊天里看到它。
                 #    只有"白主动要告诉用户的事"才走 _notify（比如"我饿了但没吃的"）。
                 logger.warning(f"[mc_body] ⚔ 进入战斗（{why}）")
@@ -319,16 +367,33 @@ class ReflexGuard:
                 self._suspend_tasks("战斗中")
                 if hurt:
                     await self._walk_stop("进战：别顺着原路线撞进去")
+                # ⭐ **进战先看手上拿的是什么** —— 武器在背包里攥着面包打怪是白给。
+                #    （2026-10-10 实测诊断：她手上是 `minecraft:string`，
+                #     钻石斧/钻石剑全在背包里，`mc_attack` 伤害 0。见 docs/13 §2）
+                await self._equip_best_weapon(data)
         else:
-            # ⚠️ 脱战要**滞后**（hysteresis）：进战是 ≤5 格，脱战得等拉开到 ~8 格。
+            # ⚠️ 脱战要**滞后**（hysteresis）：进战是 ≤5 格，脱战得等拉开到
+            #    NEAR_HOSTILE_RANGE × COMBAT_EXIT_RATIO（现在是 6.25 格）。
             #    否则怪在边界上晃一下就是"进战/脱战"来回刷（用户看到的现象）。
-            gone = nearest is None or nearest.get("dist", 1e9) > NEAR_HOSTILE_RANGE * COMBAT_EXIT_RATIO
-            if gone:
+            #
+            # ⭐ 2026-10-10 加**第二个出口**：连续 `COMBAT_QUIET_SECONDS` 秒没挨打、
+            #    而且没有任何东西在瞄着她 → 直接算脱战。
+            #    只看"怪在不在附近"的话，一只站在旁边发呆的蠹虫就能把她永久锁进战斗态
+            #    （实测：21:10–21:19 连续 9 分钟，walk 通道一直被反射占着，
+            #     用户说"跟着我"完全下不去）。
+            gone = (nearest is None
+                    or nearest.get("dist", 1e9) > NEAR_HOSTILE_RANGE * COMBAT_EXIT_RATIO)
+            quiet = (self._stance == STANCE_DEFEND
+                     and self._no_hurt_seconds >= COMBAT_QUIET_SECONDS
+                     and targeting is None)
+            if gone or quiet:
                 self._no_threat_ticks += 1
                 if self._no_threat_ticks >= COMBAT_EXIT_TICKS:
                     self._in_combat = False
                     self._fleeing = False
-                    logger.info("[mc_body] ⚔ 脱战：怪已经拉开或没了")
+                    logger.info(
+                        "[mc_body] ⚔ 脱战：" + ("怪已经拉开或没了" if gone else "安静够久了")
+                    )
                     self._log("脱离战斗")
                     self._resume_tasks()
                     # ⚠️ **还要把 walk 通道还给别人** —— 不 release 的话，
@@ -615,9 +680,19 @@ class ReflexGuard:
         """
         # 濒死优先撤（**自动**脱战，选的方向由配置定）
         if hp is not None and hp <= self.hp_critical:
+            # ⚠️ 先看**我的路线还在不在**：可能已经到期（FLEE_TTL），
+            #    或者被"卡住"判定顶成了"停"（`touch_walk` 刻意不续"停"）。
+            #    丢了就重算一次方向 —— 不然她会站在怪堆里不动。
+            if self.arbiter is not None and not self.arbiter.holds_route("reflex"):
+                self._fleeing = False
             if not self._fleeing:
                 self._log(f"血量危急（{hp:g}），撤")
                 await self._retreat(data, nearest, self.flee_toward)
+            elif self.arbiter is not None:
+                # 还在逃 —— **只续命，不重算方向**。
+                # 重算一次 `_retreat` 要查主人坐标 + 掷随机抖动，每 tick 来一遍既浪费又抖。
+                # ⚠️ 不续命的话 FLEE_TTL 一到，用户/任务的路线会立刻把她从逃跑里拽走。
+                await self.arbiter.touch_walk("reflex", FLEE_TTL)
             return
         self._fleeing = False
 
@@ -637,12 +712,80 @@ class ReflexGuard:
                 logger.info(
                     f"[mc_body] ⚔ {nearest['name']} 在 {dist:g} 格外，走过去 ({tx},{ty},{tz})"
                 )
-                await self._walk_claim(f"goto {int(tx)} {int(tz)}", "打怪：靠近")
+                await self._walk_claim(f"goto {int(tx)} {int(tz)}", "打怪：靠近", ttl=STOP_TTL)
             else:
                 self._approach_wait -= 1
         else:
             # 够得着 —— 挥。冷却由客户端判（抄原版 startAttack 的逻辑）
             await self._cmd(f"mcb attackAt {tx} {ty} {tz}")
+
+    async def _equip_best_weapon(self, data: dict) -> None:
+        """进战时确保手上是**最能打的那件**。判据只看 `atk`（真实攻击力）。
+
+        评分规则：
+          · 分数 = 物品的 `atk`（服务端读 `getAttributeModifiers().modifiers()`；
+            **原版存的是加成，服务端已经 +1 了**，别再加）
+          · 没有 `atk` 字段 = 不是武器，跳过
+          · 只有**明显更好**（差 ≥ `WEAPON_MIN_GAIN`）才换
+
+        ⚠️ 三个不这么干就踩的坑：
+          ① **不按名字认武器** —— 显示名不可信（tacz 返回本地化 key）
+          ② **吃东西时别换手** —— 换手会打断"正在使用"，等于把啃了一半的苹果扔了
+          ③ 换完**冷却几个 tick** —— 快捷栏里来回倒腾比不换还难看
+        """
+        if self._equip_cool > 0:
+            self._equip_cool -= 1
+            return
+        using = data.get("using")
+        if isinstance(using, dict) and using.get("isUsing"):
+            return                      # 正在吃东西/喝药 —— 别打断
+
+        try:
+            reply = await self.bridge.call("mcb inventory")
+        except Exception:
+            return
+        if not reply.get("ok"):
+            return
+        inv = reply.get("data") or {}
+        hotbar = inv.get("hotbar") or []
+
+        best_atk, best_id = 0.0, None
+        for where in ("hotbar", "main"):
+            for it in (inv.get(where) or []):
+                if not isinstance(it, dict):
+                    continue
+                iid = it.get("id")
+                atk = it.get("atk")
+                if not iid or isinstance(atk, bool) or not isinstance(atk, (int, float)):
+                    continue
+                if float(atk) > best_atk:
+                    best_atk, best_id = float(atk), str(iid)
+        if best_id is None or best_atk <= 0:
+            return                      # 身上一件能打的都没有
+
+        # 手上已经是这把（或更好的）就别动
+        # ⚠️ `held` 是**选中格的序号**（0~8），不是物品 —— 物品是 `hotbar[held]`。
+        held = inv.get("held")
+        if isinstance(held, (int, float)) and not isinstance(held, bool):
+            idx = int(held)
+            if 0 <= idx < len(hotbar):
+                cur = hotbar[idx]
+                cur_atk = cur.get("atk") if isinstance(cur, dict) else None
+                if isinstance(cur_atk, (int, float)) and not isinstance(cur_atk, bool):
+                    if best_atk < float(cur_atk) + WEAPON_MIN_GAIN:
+                        return
+                elif best_atk < WEAPON_MIN_GAIN:
+                    return
+
+        from .containers import ContainerIO, wear
+
+        err = await wear(ContainerIO(self.bridge), best_id, "hand")
+        if err:
+            logger.warning(f"[mc_body] ⚔ 换武器失败（{best_id}）：{err}")
+            return
+        self._equip_cool = 3
+        logger.info(f"[mc_body] ⚔ 换上 {best_id}（atk={best_atk:g}）")
+        self._log(f"换上 {best_id}（伤害 {best_atk:g}）")
 
     async def _notify_safe(self, text: str) -> None:
         if self._notify is None:
@@ -715,6 +858,9 @@ class ReflexGuard:
                         f"（follow，他当前在 {tx},{tz}）"
                     )
                     await self._walk_claim(f"follow player {self.owner_name}", "脱战：撤向主人")
+                    # ⚠️ 这一句别漏：不置位的话 `_fight` 下一 tick 又会**重算一遍**
+                    #    （`_where` 是一次 RCON 往返），而且每 tick 重声明 = TTL 形同虚设。
+                    self._fleeing = True
                     return "正往你那边跑（会一直跟到你身边）"
             logger.warning(
                 f"[mc_body] 🏃 脱战时找不到 {self.owner_name}（不在线/不在同维度），"

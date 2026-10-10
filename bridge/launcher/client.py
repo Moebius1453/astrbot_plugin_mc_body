@@ -114,7 +114,7 @@ def command():
         'library_directory': str(ROOT / 'libraries'), 'classpath_separator': ':',
         'classpath': ':'.join(dict.fromkeys(str(p) for p, _ in base_files())),
         'launcher_name': 'mc-brain', 'launcher_version': '1',
-        'quickPlayMultiplayer': os.environ.get('MC_TARGET', '10.107.230.205:25565'),
+        'quickPlayMultiplayer': os.environ.get('MC_TARGET', '127.0.0.1:25565'),
         'resolution_width': '640', 'resolution_height': '360', 'user_properties': '{}',
     }
     def expand(items):

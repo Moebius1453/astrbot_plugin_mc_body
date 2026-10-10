@@ -7,7 +7,7 @@
 // 支持的动作（服务端 `/mcb <action> <arg>`）：
 //   ping              连通性探针，只在客户端日志里回一声
 //   say <text>        让 Nanako 在游戏里说话
-//   baritone <cmd>    原样执行一条 Baritone 命令，例：follow player Moebius1453
+//   baritone <cmd>    原样执行一条 Baritone 命令，例：follow player Steve
 //   stop              取消一切寻路
 //   probe             自检：gameMode / sendData / pick / Baritone 状态能不能拿到
 //   uplink            手动触发一次状态上行（测试用）
@@ -38,6 +38,18 @@ const MCB_UPLINK_EVERY_TICKS = 10   // 客户端 tick ≈20/s → 约 2Hz
 const USE_HOLD_TICKS = 60           // "按住使用"的**保底**上限（见下面按 dur 自适应的逻辑）
 const USE_HOLD_MARGIN = 20          // 在物品自身 dur 之上多留的余量
 
+// ---- 朝向（三层槽）的参数 —— 见 `mcbSlots` 的注释 -------------------------
+const MCB_TEMP_LOOK_TICKS = 30      // 临时注视活多久（1.5 秒）—— **到点自己释放**
+const MCB_LOOK_PITCH_MAX = 45       // 看向一个点时 pitch 的绝对值上限（人不会把脖子折成 90°）
+const MCB_IDLE_YAW_SPAN = 35        // 空闲扫视：左右各多少度
+const MCB_IDLE_PITCH_SPAN = 15      // 空闲扫视：抬头 / 低头各多少度
+const MCB_IDLE_HOLD_MIN = 80        // 一个注视点至少保持 4 秒
+const MCB_IDLE_HOLD_MAX = 140       // 最多 7 秒
+const MCB_IDLE_STEP_YAW = 5         // 每 tick 最多转 5°（≈100°/秒，接近人扭头的速度）
+const MCB_IDLE_STEP_PITCH = 3
+const MCB_IDLE_NEAR_PLAYER = 8      // 这么近有人 → 有机会看他
+const MCB_IDLE_LOOK_AT_PLAYER = 0.6 // 每次抽签"看人"的概率（1.0 = 一直盯着，那又成石像了）
+
 let $BaritoneAPI = null
 try {
   $BaritoneAPI = Java.loadClass('baritone.api.BaritoneAPI')
@@ -48,7 +60,11 @@ try {
 
 let $Minecraft = null
 
-// ---- 朝向锁（aim）----------------------------------------------------------
+// ---- 朝向（三层槽：temp / aim / idle）----------------------------------------
+//
+// 2026-10-10 重做。原来是**一个 `aim` 槽**，空着时谁都不写朝向 —— 结果是
+// ① 交互动作裸 `setXRot` 留下的残值**永远没人收**（她低头低到天荒地老）
+// ② 站着时是一尊石像。三层见 `mcbSlots` 的注释。
 //
 // ⚠️⚠️ **必须每 tick 重设，设一次只生效一个 tick**（2026-10-10 读 Baritone 源码后修正）。
 //    原来我以为调一次 `updateTarget` 就一直生效 —— **错了**。
@@ -79,57 +95,195 @@ try {
 // ⚠️ **`walk` 槽不在这里** —— 那是 Baritone 自己的（`mcb baritone` / `mcb goto`）。
 //    这里只管我们自己要施加的两个。
 var mcbSlots = {
-  // 朝向槽。null = 不管朝向（让 Baritone 自己管）
-  //   { mode:'angle', yaw, pitch }  —— 固定朝向
-  //   { mode:'point', x, y, z }     —— 固定世界坐标，每 tick 用当前位置重算
+  // ---- 朝向：**三层**，每层有自己的所有者，优先级从高到低 ----
+  //
+  //   ① `temp` 临时注视 —— 交互用（右键方块 / 攻击），**带 TTL，到点自动释放**。
+  //      ⭐ 为什么要它（2026-10-10 用户报的 bug）：交互原来是**裸 `setXRot`**、
+  //         用完不还原。而瞄准一个脚边的方块 = pitch 80°，于是她**低头低到天荒地老**。
+  //         实测现场：`mcb lookat` 读到 `pitch:81.3`，命中脚边 1.7 格处的石砖；
+  //         而客户端日志里最后一次写朝向是 **10 分钟前**的一次 `useOnAt`。
+  //         决定性实验：`mcb look 0 0` 掰平后**等 12 秒仍是 0.0**
+  //         → **没有任何东西在压她，就是残值没人收。**
+  //   ② `aim`  持续注视 —— `mc_aim` 用，**要显式 release**（语义不变）。
+  //   ③ `idle` 空闲行为 —— **新增**。没有别的事时她自己会东张西望。
+  //      为什么要有：`aim` 为空时**谁都不写朝向**，Baritone 又只在干活时管朝向，
+  //      所以她站着时是**一尊石像**（还冻在上一次的俯角上）。
+  //
+  //   { mode:'angle', yaw, pitch }   —— 固定朝向
+  //   { mode:'point', x, y, z, pitchMax } —— 固定世界坐标，每 tick 用当前位置重算
   aim: null,
+  temp: null,        // { mode, …, until:<tick> }
+  idle: {            // 空闲扫视 —— **目标 + 缓动**（不是硬切，硬切看着像鬼畜）
+    on: true,
+    tyaw: null, tpitch: 0,   // 目标朝向；tyaw=null 表示"还没起算"
+    cyaw: 0, cpitch: 0,      // 缓动中的当前值
+    nextAt: 0                // 下次换目标的 tick
+  },
   // 「按住使用」槽。**一直是对象**，`ticks > 0` 表示使用键正被我们按着
   use: { ticks: 0, sawUsing: false }
 }
 
-// 算出这一 tick 该用的朝向。
-function mcbAimRotation() {
-  if (mcbSlots.aim === null) return null
-  if (mcbSlots.aim.mode === 'angle') return { yaw: mcbSlots.aim.yaw, pitch: mcbSlots.aim.pitch }
+// ---- 朝向：挑"现在该由谁说话" ---------------------------------------------
+//
+// 优先级：temp（临时，带 TTL）> aim（持续，显式释放）> idle（空闲，默认行为）。
+// 都没有 → 返回 null = **把方向盘还给 Baritone**。
+//
+// ⚠️ **temp 的过期就在这里处理** —— 所以就算调用方再也没碰过它，它也会自己消失。
+//    这就是"低头不残留"的全部秘密：**残值有主人，主人会到期。**
+function mcbLookClaim() {
+  if (mcbSlots.temp !== null) {
+    if ($mcbTick < mcbSlots.temp.until) return mcbSlots.temp
+    mcbSlots.temp = null
+  }
+  if (mcbSlots.aim !== null) return mcbSlots.aim
+  if (mcbSlots.idle.on) return mcbIdleClaim()
+  return null
+}
+
+// 把一个"声明"算成 yaw/pitch。`pitchMax` 是可选的角度上限（见 MCB_LOOK_PITCH_MAX）。
+function mcbRotOf(claim) {
+  if (claim === null) return null
+  if (claim.mode === 'angle') return { yaw: claim.yaw, pitch: claim.pitch }
   var mc = mcbMc()
   if (mc === null || mc.player === null) return null
   var p = mc.player
   var ex = Number(p.x), ey = Number(p.y) + Number(p.eyeHeight), ez = Number(p.z)
-  var dx = mcbSlots.aim.x - ex, dy = mcbSlots.aim.y - ey, dz = mcbSlots.aim.z - ez
+  var dx = claim.x - ex, dy = claim.y - ey, dz = claim.z - ez
   var horiz = Math.sqrt(dx * dx + dz * dz)
-  // MC 的 yaw：0 = +Z，顺时针；atan2(-dx, dz) 是标准换算
-  return {
-    yaw: Math.atan2(-dx, dz) * 180 / Math.PI,
-    pitch: -Math.atan2(dy, horiz) * 180 / Math.PI
+  var pitch = -Math.atan2(dy, horiz) * 180 / Math.PI
+  var cap = claim.pitchMax
+  if (typeof cap === 'number') {
+    if (pitch > cap) pitch = cap
+    if (pitch < -cap) pitch = -cap
   }
+  // MC 的 yaw：0 = +Z，顺时针；atan2(-dx, dz) 是标准换算
+  return { yaw: Math.atan2(-dx, dz) * 180 / Math.PI, pitch: pitch }
 }
 
-// 把当前朝向锁**推给 Baritone 一次**。
-// ⚠️ 单独抽出来是因为它要**每 tick 调**（见 ClientEvents.tick）。
-function mcbAimApply() {
-  if (mcbSlots.aim === null || $RotationCls === null) return
+// 算出这一 tick 该用的朝向。
+function mcbAimRotation() {
+  return mcbRotOf(mcbLookClaim())
+}
+
+// 朝目标转一步。⚠️ 必须走**最短的那边** —— yaw 在 ±180° 处会绕回来，
+// 直接 `cur + (target-cur)` 会让"从 170 转到 -170"绕地球一圈。
+function mcbTurnToward(cur, target, step) {
+  var d = target - cur
+  while (d > 180) d = d - 360
+  while (d < -180) d = d + 360
+  if (d > step) d = step
+  if (d < -step) d = -step
+  return cur + d
+}
+
+// Baritone 在干活吗？**在干活就别抢朝向** —— 它自己会让她看向行进方向。
+// ⚠️ 只看"在不在跑进程"，**不看 follow** —— 跟到人旁边站着不动时应该算"闲"，
+//    不然她跟着你也是一尊石像。（`isPathing()` 已经覆盖了"走着跟"的情形。）
+function mcbBaritoneBusy() {
+  if ($BaritoneAPI === null) return false
   var bar = mcbPrimary()
-  if (bar === null) return
-  var rot = mcbAimRotation()
-  if (rot === null) return
+  if (bar === null) return false
+  try { if (bar.getPathingBehavior().isPathing()) return true } catch (e1) { }
+  try { if (bar.getCustomGoalProcess().isActive()) return true } catch (e2) { }
+  try { if (bar.getMineProcess().isActive()) return true } catch (e3) { }
+  try { if (bar.getFarmProcess().isActive()) return true } catch (e4) { }
+  try { if (bar.getBuilderProcess().isActive()) return true } catch (e5) { }
+  try { if (bar.getExploreProcess().isActive()) return true } catch (e6) { }
+  return false
+}
+
+// 附近有没有别人（8 格内）？有就返回他。**"看向你"是"陪伴"最直白的一条。**
+function mcbNearbyPlayer() {
   try {
-    // 第二个参数 true → CLIENT 模式：**本地镜头真的转**（她看得见）。
-    // 传 false 的话默认配置下会走 SERVER 静默模式，本地画面不动。
-    bar.getLookBehavior().updateTarget(new $RotationCls(rot.yaw, rot.pitch), true)
-  } catch (e) {
-    // 每 tick 都跑，**绝不能刷屏** —— 只在第一次报
-    if (mcbSlots.aim.errReported !== true) {
-      mcbSlots.aim.errReported = true
-      console.error('[mcbridge] mcbAimApply 失败（后续不再重复报）: ' + e)
+    var mc = mcbMc()
+    if (mc === null || mc.player === null || mc.level === null) return null
+    var list = mc.level.players()
+    if (list === null || list === undefined) return null
+    var me = mc.player
+    var best = null, bd = MCB_IDLE_NEAR_PLAYER * MCB_IDLE_NEAR_PLAYER
+    var n = list.size()
+    for (var i = 0; i < n; i++) {
+      var e = list.get(i)
+      if (e === null) continue
+      try { if (String(e.uuid) === String(me.uuid)) continue } catch (eUuid) { }
+      var dx = Number(e.x) - Number(me.x)
+      var dy = Number(e.y) - Number(me.y)
+      var dz = Number(e.z) - Number(me.z)
+      var d = dx * dx + dy * dy + dz * dz
+      if (d < bd) { bd = d; best = e }
     }
+    return best
+  } catch (e) { return null }
+}
+
+// 空闲扫视 —— **她"没事时"的脑袋长什么样**。
+//
+//   · Baritone 在干活 → 不抢（交给它，她会自然看向行进方向）
+//   · 否则每隔 4~7 秒**抽一次签**：
+//       - 多半（`MCB_IDLE_LOOK_AT_PLAYER`）→ 看向 8 格内的人（"陪伴"最直白的一条）
+//       - 否则 → **相对当前朝向** ±35°、俯仰 ±15° 随便挑一个
+//     然后**慢慢转过去**（每 tick 最多 5°）
+//
+// ⚠️ 两个刻意的选择：
+//   ① 用缓动而不是硬切 —— 硬切看着像鬼畜，缓动才像人在扭头。
+//   ② 看人是**抽签**、不是"一直盯着" —— 一直盯就又是一尊石像了（换个方向而已）。
+function mcbIdleClaim() {
+  var id = mcbSlots.idle
+  if (mcbBaritoneBusy()) { id.tyaw = null; return null }
+
+  var me = mcbPlayerYawPitch()
+  var curYaw = me === null ? 0 : me.yaw
+  var curPitch = me === null ? 0 : me.pitch
+
+  if (id.tyaw === null) {
+    // 刚开始空闲（或刚从"忙"里退出来）—— **从当前朝向起算**，别跳
+    id.cyaw = curYaw
+    id.cpitch = curPitch
   }
-  // 顺手把朝向也真写到玩家身上 —— `updateTarget` 只走 Baritone 那条路，
-  // 客户端本地视角不一定会立刻跟（实测 `setXRot/setYRot` 之后准星不一定马上转）。
-  try {
-    var p = mcbMc().player
-    p.setYRot(rot.yaw)
-    p.setXRot(rot.pitch)
-  } catch (e2) { }
+  if (id.tyaw === null || $mcbTick >= id.nextAt) {
+    var who = mcbNearbyPlayer()
+    if (who !== null && Math.random() < MCB_IDLE_LOOK_AT_PLAYER) {
+      var t = mcbRotOf({
+        mode: 'point',
+        x: Number(who.x), y: Number(who.y) + 1.6, z: Number(who.z),
+        pitchMax: MCB_IDLE_PITCH_SPAN
+      })
+      if (t !== null) { id.tyaw = t.yaw; id.tpitch = t.pitch }
+    } else {
+      id.tyaw = curYaw + (Math.random() * 2 - 1) * MCB_IDLE_YAW_SPAN
+      id.tpitch = (Math.random() * 2 - 1) * MCB_IDLE_PITCH_SPAN
+    }
+    // 兜底：上面两条路都没算出角度（比如没进世界）时**别留 null**，
+    // 否则下面 `mcbTurnToward(cur, null, …)` 会算出 NaN、朝向直接报废。
+    if (id.tyaw === null) { id.tyaw = curYaw; id.tpitch = 0 }
+    id.nextAt = $mcbTick + MCB_IDLE_HOLD_MIN +
+      Math.floor(Math.random() * (MCB_IDLE_HOLD_MAX - MCB_IDLE_HOLD_MIN))
+  }
+  id.cyaw = mcbTurnToward(id.cyaw, id.tyaw, MCB_IDLE_STEP_YAW)
+  id.cpitch = mcbTurnToward(id.cpitch, id.tpitch, MCB_IDLE_STEP_PITCH)
+  return { mode: 'angle', yaw: id.cyaw, pitch: id.cpitch }
+}
+
+// 设一条**临时注视**并立刻生效一次。交互动作走这条，不再裸 `setXRot`。
+function mcbLookTemp(claim) {
+  claim.until = $mcbTick + MCB_TEMP_LOOK_TICKS
+  mcbSlots.temp = claim
+  mcbSlots.idle.tyaw = null      // 空闲那边重新起算，免得松手时跳一下
+  mcbSetAntiCheat(false)
+  mcbAimApply()
+}
+
+function mcbLookTempAt(x, y, z, pitchMax) {
+  mcbLookTemp({ mode: 'point', x: x, y: y, z: z, pitchMax: pitchMax })
+}
+
+// 把当前朝向**算一遍并推出去**一次（给"设完立刻生效"的调用方用）。
+// ⚠️ 每 tick 的维持走 `mcbSlotAim` → `mcbAimPush`，两条路共用一个推送函数。
+function mcbAimApply() {
+  var rot = mcbAimRotation()
+  if (rot === null) return false
+  mcbAimPush(rot)
+  return true
 }
 
 // ⭐⭐ **`antiCheatCompatibility` 就是"移动 vs 转头"的总开关**（2026-10-10 实测出来）
@@ -144,15 +298,26 @@ function mcbAimApply() {
 //     antiCheat=false → 90.0  → 90.0  → 90.0     （纹丝不动）
 //
 // ⚠️ **但不能一直关着** —— 关着的话她**走路时也不会自然朝向行进方向**，
-//    会盯着上次设定的方向横着走。所以只在 **aim 期间**关，`releaseAim` 时开回来。
+//    会盯着上次设定的方向横着走。
+//
+// ⭐ 2026-10-10 起改成**每 tick 由 `mcbSlotAim` 按"有没有人管朝向"自动切**：
+//    有声明（temp / aim / idle）→ 关；没人管（Baritone 在干活）→ 开。
+//    这里做**去重**，值没变就不写 —— 不然每 tick 写一次设置太脏。
+let $mcbAntiCheat = true      // 初始值跟 Baritone 默认一致
 function mcbSetAntiCheat(on) {
   if ($BaritoneAPI === null) return
+  on = !!on
+  if ($mcbAntiCheat === on) return
+  $mcbAntiCheat = on
   try {
-    $BaritoneAPI.getSettings().antiCheatCompatibility.value = !!on
+    $BaritoneAPI.getSettings().antiCheatCompatibility.value = on
   } catch (e) {
     console.error('[mcbridge] antiCheatCompatibility 设不了: ' + e)
   }
 }
+
+// mcbAimApply 的报错去重标记（每 tick 都跑，绝不能刷屏）
+let $mcbAimErrReported = false
 
 // 读**客户端自己**的朝向。三级兜底 —— 和 mcbridge_server.js 里 `mcbYawPitch` 同一个道理：
 // ⚠️ Rhino 下 `player.yRot` **不抛异常只给 undefined**，而且 `getYRot()` 也拿不到；
@@ -194,6 +359,9 @@ function mcbTuneBaritone() {
     var s = $BaritoneAPI.getSettings()
     // ⚠️ 这两个会**每 tick 往朝向里叠随机抖动**（默认 0.01 度和 2 度）——
     //    会让"我要的朝向"和"实际朝向"差几度，很难查。
+    //    ⭐ 2026-10-10："灵动"那一半**我们自己实现**（见 `mcbIdleClaim`：
+    //    有人看人、没人就每 4~7 秒换个方向慢慢转过去），**不靠这两个抖动** ——
+    //    自己实现的好处是"她看哪"是**可解释、可调试**的，抖动不是。
     try { s.randomLooking.value = 0 } catch (e1) { console.error('[mcbridge] randomLooking 设不了: ' + e1) }
     try { s.randomLooking113.value = 0 } catch (e2) { console.error('[mcbridge] randomLooking113 设不了: ' + e2) }
     // 默认 true —— 源码注释自己说"某些情况下会让它卡住"，抱着旧朝向不放
@@ -706,12 +874,9 @@ function mcbHandle(action, arg) {
 
     try {
       // 先转向它（视觉上像人，也让客户端的命中判定自然）
+      // ⭐ 走 **temp 槽**（带 TTL）—— 不再裸 `setXRot` 留下残值（见 `mcbSlots` 的注释）
       var pl3 = mcT.player
-      var vx = Number(target.x) - Number(pl3.x)
-      var vy = Number(target.y) + 0.9 - (Number(pl3.y) + Number(pl3.eyeHeight))
-      var vz = Number(target.z) - Number(pl3.z)
-      pl3.setYRot(Math.atan2(-vx, vz) * 180 / Math.PI)
-      pl3.setXRot(-Math.atan2(vy, Math.sqrt(vx * vx + vz * vz)) * 180 / Math.PI)
+      mcbLookTempAt(Number(target.x), Number(target.y) + 0.9, Number(target.z), MCB_LOOK_PITCH_MAX)
       mcT.gameMode.attack(pl3, target)
       console.info('[mcbridge] 已攻击 -> ' + target)
     } catch (eA2) {
@@ -741,14 +906,10 @@ function mcbHandle(action, arg) {
       var tbp = new $BP(qx, qy, qz)
       var thit = new $BHR($V3.atCenterOf(tbp), $DIR.UP, tbp, false)
       // 先转向它（让人看着自然，也让服务端的视线校验好过）
-      try {
-        var pl2 = mcX.player
-        var ex2 = Number(pl2.x), ey2 = Number(pl2.y) + Number(pl2.eyeHeight), ez2 = Number(pl2.z)
-        var dx2 = qx + 0.5 - ex2, dy2 = qy + 0.5 - ey2, dz2 = qz + 0.5 - ez2
-        var hz2 = Math.sqrt(dx2 * dx2 + dz2 * dz2)
-        pl2.setYRot(Math.atan2(-dx2, dz2) * 180 / Math.PI)
-        pl2.setXRot(-Math.atan2(dy2, hz2) * 180 / Math.PI)
-      } catch (eRot) { console.error('[mcbridge] useOnAt 转向失败: ' + eRot) }
+      // ⭐ 走 **temp 槽**（带 TTL）—— 不再裸 `setXRot` 留下残值。
+      //    实测过的病：瞄准脚边的方块 = pitch 80°，用完不还原 → **低头低到天荒地老**。
+      //    `MCB_LOOK_PITCH_MAX` 再把角度夹住（人不会为看脚边的方块把脖子折成 90°）。
+      mcbLookTempAt(qx + 0.5, qy + 0.5, qz + 0.5, MCB_LOOK_PITCH_MAX)
       mcX.gameMode.useItemOn(mcX.player, $Hand.MAIN_HAND, thit)
       console.info('[mcbridge] 已 useItemOn -> (' + qx + ',' + qy + ',' + qz + ')')
     } catch (eU) {
@@ -894,37 +1055,30 @@ function mcbHandle(action, arg) {
 
   if (action === 'look') {
     // 转头。arg 形如 "90 0"（yaw pitch）
+    // ⚠️ 2026-10-10：改成走 **temp 槽** —— 原来裸 `setXRot` 会留下残值不还原，
+    //    正是"低头不残留"那个 bug 的来源（调试动作也算）。
     var mcL = mcbMc()
     if (mcL === null || mcL.player === null) { console.error('[mcbridge] look: 没进世界'); return }
     var parts = arg.split(' ')
     var yaw = Number(parts[0])
     var pitch = parts.length > 1 ? Number(parts[1]) : 0
     if (isNaN(yaw) || isNaN(pitch)) { console.error('[mcbridge] look 参数非法: ' + arg); return }
-    mcL.player.setYRot(yaw)
-    mcL.player.setXRot(pitch)
-    console.info('[mcbridge] 转头 -> yaw=' + yaw + ' pitch=' + pitch)
+    mcbLookTemp({ mode: 'angle', yaw: yaw, pitch: pitch })
+    console.info('[mcbridge] 转头 -> yaw=' + yaw + ' pitch=' + pitch + '（临时，' + MCB_TEMP_LOOK_TICKS + ' tick 后自动释放）')
     return
   }
 
   if (action === 'lookAt') {
     // 转向一个世界坐标。arg 形如 "21 98 5"。
     // 比裸 yaw/pitch 好用得多 —— 交互前要先"看向"目标。
+    // ⚠️ 同样走 **temp 槽**（见 `look` 的注释）。
     var mcLA = mcbMc()
     if (mcLA === null || mcLA.player === null) { console.error('[mcbridge] lookAt: 没进世界'); return }
     var p3 = arg.split(' ')
     var tx = Number(p3[0]), ty = Number(p3[1]), tz = Number(p3[2])
     if (isNaN(tx) || isNaN(ty) || isNaN(tz)) { console.error('[mcbridge] lookAt 参数非法: ' + arg); return }
-    var pl = mcLA.player
-    // 从眼睛位置算方向
-    var ex = Number(pl.x), ey = Number(pl.y) + Number(pl.eyeHeight), ez = Number(pl.z)
-    var dx = tx - ex, dy = ty - ey, dz = tz - ez
-    var horiz = Math.sqrt(dx * dx + dz * dz)
-    // MC 的 yaw：0 = +Z，顺时针；atan2(-dx, dz) 是标准换算
-    var yawA = Math.atan2(-dx, dz) * 180 / Math.PI
-    var pitchA = -Math.atan2(dy, horiz) * 180 / Math.PI
-    pl.setYRot(yawA)
-    pl.setXRot(pitchA)
-    console.info('[mcbridge] 转向 (' + tx + ',' + ty + ',' + tz + ') -> yaw=' + Math.round(yawA) + ' pitch=' + Math.round(pitchA))
+    mcbLookTempAt(tx, ty, tz, MCB_LOOK_PITCH_MAX)
+    console.info('[mcbridge] 转向 (' + tx + ',' + ty + ',' + tz + ')（临时）')
     return
   }
 
@@ -974,14 +1128,18 @@ function mcbHandle(action, arg) {
   }
 
   if (action === 'releaseAim') {
-    // 松开朝向锁，把控制权还给 Baritone。
+    // 松开朝向锁。
     //
     // ⚠️ Baritone 的 `ILookBehavior` **没有"清除目标"的方法**（只有 `updateTarget`
     //    和 `getAimProcessor`）—— 但目标反正**每 tick 自己会过期**，
     //    所以这里只要**不再重设**就行。
+    //
+    // ⚠️ 2026-10-10：这里**不再**强行 `mcbSetAntiCheat(true)` ——
+    //    松手之后多半正好轮到 **idle 空闲层**接管（她这会儿还在看别处），
+    //    强行开回去下一 tick 又得关，白白抖一下。
+    //    现在由 `mcbSlotAim` 每 tick 按"有没有人管朝向"统一决定。
     mcbSlots.aim = null
-    mcbSetAntiCheat(true)      // ← 松开：把朝向控制还给 Baritone（她走路时会自然看向行进方向）
-    console.info('[mcbridge] releaseAim: 朝向控制已还给 Baritone')
+    console.info('[mcbridge] releaseAim: 持续注视已松开（接下来交给空闲层 / Baritone）')
     return
   }
 
@@ -1080,12 +1238,15 @@ NetworkEvents.dataReceived(MCB_CHANNEL_DOWN, event => {
 // ⚠️ 函数体里只能用 var —— 这个回调每 tick 都会跑，用 const/let 会 redeclaration。
 
 let $uplinkTick = 0
+let $mcbTick = 0            // 自己数的 tick（朝向槽的 TTL / 空闲扫视的排班都用它）
 
 // ⚠️ 「按住使用」槽的状态 **定义在上面的 `mcbSlots` 里**（`use.ticks` / `use.sawUsing`）。
 //    别在这儿再声明一遍 —— `let mcbSlots.use.ticks = 0` 是**非法语法**，
 //    而且就算能写也只是遮蔽，槽的语义就散了。
 
 ClientEvents.tick(() => {
+  $mcbTick = $mcbTick + 1
+
   // ⭐ **每 tick 把每个行为槽施加一次。**
   //    ⚠️ 这一句就是"移动 + 转头 + 用东西"能并存的地方 —— 三个槽**互不知道对方存在**，
   //    各自管各自的通道。抄的是**原版 Brain 的 memory 模型**
@@ -1118,9 +1279,38 @@ function mcbTickSlots() {
 // ⚠️⚠️ 这一步不能省：`ILookBehavior.updateTarget` 设的目标**只活一个 tick**，
 //    `PlayerUpdateEvent.POST` 末尾会把它清空。不每 tick 重设 = 只锁一帧，
 //    下一个 tick 就被 Baritone 抢回去（这正是"移动+转头做不到"的根因）。
+//
+// ⭐ 2026-10-10：槽从"一个 `aim`"改成**三层**（temp / aim / idle，见 `mcbSlots`）。
+//    这里顺便按"**有没有人管朝向**"自动开关 `antiCheatCompatibility`：
+//    有人管 → 关（别让 Baritone 抢方向盘）；没人管（它在干活）→ 开（让它正常转）。
+//    ⚠️ 不能把"关"写死 —— 关着她走路时不看行进方向，会横着走。
 function mcbSlotAim() {
-  if (mcbSlots.aim === null) return
-  mcbAimApply()
+  var rot = mcbAimRotation()
+  if (rot === null) {
+    mcbSetAntiCheat(true)
+    return
+  }
+  mcbSetAntiCheat(false)
+  mcbAimPush(rot)
+}
+
+// 只做"把算好的朝向推出去"这一件事（`mcbAimApply` 是"算 + 推"，给一次性调用用）
+function mcbAimPush(rot) {
+  try {
+    var p = mcbMc().player
+    if (p !== null) { p.setYRot(rot.yaw); p.setXRot(rot.pitch) }
+  } catch (e) { }
+  if ($RotationCls === null) return
+  var bar = mcbPrimary()
+  if (bar === null) return
+  try {
+    bar.getLookBehavior().updateTarget(new $RotationCls(rot.yaw, rot.pitch), true)
+  } catch (e2) {
+    if ($mcbAimErrReported !== true) {
+      $mcbAimErrReported = true
+      console.error('[mcbridge] updateTarget 失败（后续不再重复报）: ' + e2)
+    }
+  }
 }
 
 // 「按住使用」槽 —— 到点、或者她自己用完了，就**松手**。

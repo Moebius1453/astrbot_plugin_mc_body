@@ -2337,6 +2337,34 @@ function mcbPlayerState(player) {
     out.surfY = null
   }
 
+  // 🧭 **朝向（她自己的头朝哪）** —— 2026-10-10 加。
+  //
+  // 起因（用户实报）："**她声称自己没低头，但一直是低头状态**"。
+  // 现场实测：`mcb lookat` 读到 `pitch:81.3`（几乎垂直朝下），而她嘴里说
+  // "我哪有低头，是靴子沉啦。抬头了抬头了" —— **她连"自己在低头"都读不到**，
+  // 手里是零数据，只能编。
+  //
+  // 落回我们那条律：**能力自我认知 = 工具表 + 状态包** ——
+  // 这条信息以前只有 `mc_lookat` 一个地方吐过（还包装成"你面朝X（基本在往下看）"），
+  // 而她不会去问那个问题。**状态包里有，才算她"知道"。**
+  //
+  // ⚠️ 读法复用 `mcbYawPitch`（字段 → getter → **从视线向量反推**），
+  //    实测走的就是最后那条（`rotVia:"look"`），一定通。
+  try {
+    var lookV = null
+    try { lookV = player.getViewVector(1.0) } catch (eLV) { lookV = null }
+    var angP = mcbYawPitch(player, lookV)
+    out.rotVia = angP.via
+    if (angP.yaw !== null) {
+      out.yaw = mcbR1(angP.yaw)
+      out.facing = mcbCompass(angP.yaw)
+    }
+    if (angP.pitch !== null) out.pitch = mcbR1(angP.pitch)
+  } catch (eVP) {
+    out.yaw = null
+    out.pitch = null
+  }
+
   out.task = mcbTaskSnapshot()
   return out
 }

@@ -30,6 +30,13 @@ MAX_GAME_SAY_LEN = 200
 # 唤醒失败时的退避上限
 MAX_BACKOFF_SECONDS = 30.0
 
+# ⚠️ 游戏内**只回一句短的**（用户 2026-10-10："强制游戏内信息只允许回一条简短的"）。
+#    公屏单条上限约 256，这里再收一道：**先按句号截一句，再按长度硬截**。
+MAX_GAME_SAY_LEN = 120
+
+# 句末标点 —— 撞上第一个就截住（**连同标点**，读起来才自然）
+_SENTENCE_END = "。！？!?…"
+
 
 class ChatUplink:
     """把游戏内聊天接进白的会话。"""
@@ -198,8 +205,13 @@ class ChatUplink:
         parts += [
             "",
             "请用你自己的身份回应。**你的回答会被自动打到游戏公屏上**，"
-            "所以直接说话就行 —— 不需要（也不能）调用 `mc_say`，系统已经替你发了。"
-            "回答要短，像在游戏里聊天那样，不要加旁白或括号说明。",
+            "所以直接说话就行 —— 不需要（也不能）调用 `mc_say`，系统已经替你发了。",
+            # ⚠️ 用户 2026-10-10："**强制游戏内信息只允许回一条简短的**"。
+            #    这条是**软约束**（模型可以不听话），所以 `_clean_for_game_chat` 还有一道
+            #    程序性硬截断 —— 两层一起用才稳。
+            "⚠️ **公屏只发一句话**：一句话、20 字上下，像在游戏里打字聊天那样。"
+            "**不要分点、不要换行、不要旁白、不要括号里加解释、不要一口气说三件事**。"
+            "想说的多就挑最要紧的那一句。",
             "",
             # ⚠️⚠️ 这一段是 2026-10-10 加的，因为实测她**只答应不动手**：
             #    用户在公屏说"放下熔炉"，她回"好嘞，熔炉放地上啦！" —— **其实根本没放**，
@@ -276,10 +288,39 @@ class ChatUplink:
                 with contextlib.suppress(Exception):
                     tool_set.remove_tool("mc_say")
 
+        # ⭐⭐ **补上 `on_llm_request` 钩子** —— 这一步决定"游戏里的她"和"QQ 里的她"
+        #      是不是同一个白。
+        #
+        # ⚠️ 实测（2026-10-10）：`call_event_hook(..., OnLLMRequestEvent, ...)` 在
+        #    **整个 AstrBot 里只有 pipeline 两处调**
+        #    （`pipeline/.../agent_sub_stages/internal.py:269` 和 `third_party.py:335`）——
+        #    `astr_main_agent.py` 里 **grep 零命中**。
+        #    而我们这条路是 `build_main_agent` + `step_until_done`，**绕过了 pipeline**，于是：
+        #        ❌ `livingmemory` 的**回忆注入**不生效
+        #        ❌ 我们自己的**状态数据包**（`main.py` 的 `@filter.on_llm_request`）不生效
+        #    用户 2026-10-10 问"游戏聊天是什么机制……让机器人依然接受那些注入回忆？"
+        #    —— **答案就是这里断了。**
+        #
+        # ⚠️ 位置和 pipeline **一模一样**：`build_main_agent` 之后、`step_until_done` 之前。
+        #    （人格/技能/提示词前缀是 `build_main_agent` 内部的 `_decorate_llm_request` 注的，
+        #      那条路本来就通 —— **缺的只有钩子这一层**。）
+        #
+        # ⚠️ 返回值语义照抄 pipeline：**True = 有钩子把事件终止了** → 不再往下跑。
+        try:
+            from astrbot.core.pipeline.context_utils import call_event_hook
+            from astrbot.core.star.star_handler import EventType
+
+            if await call_event_hook(event, EventType.OnLLMRequestEvent, req):
+                logger.info(
+                    "[mc_body] 有 on_llm_request 钩子终止了这一轮 —— 照 pipeline 的语义不往下跑"
+                )
+                return ""
+        except Exception as exc:  # noqa: BLE001 - 钩子是加分项，不该让整轮挂掉
+            logger.warning(f"[mc_body] 跑 on_llm_request 钩子失败（这一轮当没有它）：{exc}")
+
         runner = result.agent_runner
         async for _ in runner.step_until_done(self.max_steps):
             pass
-
         # ⚠️⚠️ **必须自己把这一轮存下来** —— 否则游戏里的对话**从来不进她的历史**。
         #
         #    会话**不是 agent 自己存的**，是 **pipeline 那一层**存的：
@@ -436,6 +477,20 @@ def _g(v: object) -> str:
 
 
 def _clean_for_game_chat(text: str) -> str:
-    """游戏公屏是单行，且不宜过长。"""
+    """游戏公屏是**单行 + 一句 + 短**。
+
+    用户 2026-10-10："**强制游戏内信息只允许回一条简短的**"。
+
+    ⚠️ **两层一起用才稳**：
+      · **发请求时**（`_build_prompt` 末尾）写死"只准一句话" —— 让它**别生成**
+      · **发出去之前**（这里）程序性截断 —— 生成长了也兜得住
+
+    提示词是**软**的（模型可以不听话），这一步是**硬**的。只靠提示词，
+    迟早会有一条三行带旁白的回复飘到公屏上。
+    """
     flat = " ".join(str(text).split())
+    for i, ch in enumerate(flat):
+        if ch in _SENTENCE_END:
+            flat = flat[: i + 1]
+            break
     return flat[:MAX_GAME_SAY_LEN]

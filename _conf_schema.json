@@ -118,7 +118,7 @@
   "owner_player_name": {
     "type": "string",
     "description": "用户的游戏 ID",
-    "hint": "脱战时「朝用户跑」要用它找人。填用户在 Minecraft 里的 ID（不是 QQ 号），例如 Moebius1453。留空则「朝用户跑」会自动退化成「往安全方向跑」。",
+    "hint": "脱战时「朝用户跑」要用它找人。填用户在 Minecraft 里的 ID（不是 QQ 号），例如 Steve。留空则「朝用户跑」会自动退化成「往安全方向跑」。",
     "default": ""
   },
   "retreat_toward": {
@@ -184,7 +184,7 @@
   "client_ssh_host": {
     "type": "string",
     "description": "游戏客户端在哪台机器上（ssh 目标）",
-    "hint": "格式 user@host，例如 moebius@10.107.230.205。**要配免密 ssh**（这台机器上能直接 ssh 过去）。留空 = mc_screenshot 直接报错。⚠️ mc_lookat（准星）走服务端，**不受这个配置影响**。",
+    "hint": "格式 user@host，例如 user@192.168.1.100。**要配免密 ssh**（这台机器上能直接 ssh 过去）。留空 = mc_screenshot 直接报错。⚠️ mc_lookat（准星）走服务端，**不受这个配置影响**。",
     "default": ""
   },
   "client_container": {
