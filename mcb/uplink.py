@@ -252,7 +252,7 @@ class ChatUplink:
 
     # ---- 唤醒 -----------------------------------------------------------
 
-    async def _wake(self, trigger: str) -> None:
+    async def _wake(self, trigger: str, prompt: str | None = None) -> None:
         if self._busy.locked():
             # 注意： 不丢这条，记账（抄 Numen AgentLoop.pump() 的 pumpAgain）——
             #    原来直接 return，用户连发两句时第二句永远不会被回应，

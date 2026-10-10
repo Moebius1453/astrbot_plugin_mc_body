@@ -30,6 +30,7 @@ import asyncio
 import contextlib
 import math
 import random
+import time
 
 from astrbot.api import logger
 
@@ -66,6 +67,21 @@ COMBAT_EXIT_RATIO = 1.25
 # 注意： 只看"怪在不在附近"是不够的（原来的判据）：怪站在她旁边发呆，
 #    她也被永久锁在战斗态里出不来。这条是"其实已经安全了"的出口。
 COMBAT_QUIET_SECONDS = 10.0
+
+# ---- 打一下就退半步（走位）--------------------------------------------------
+#
+# 用户 2026-10-11："尽可能做走位"。真人近战都是这样：砍一刀往后撤，等冷却好了再上。
+# 站定对撸是"看着蠢"观感里的一大块。
+#
+# 注意： 撤太远会够不着（ENGAGE_RANGE = 3.0），所以只撤到 KITE_BACK_UNDER 之外一点点。
+KITE_BACK_UNDER = 2.0        # 贴到这么近就往后撤
+KITE_STEP = 2.5              # 一次撤多远
+KITE_COOLDOWN_SECONDS = 1.5  # 多久才准再撤一次（用墙钟，别用 tick —— 战斗期节拍不一样）
+KITE_TTL = 2.0               # 这条"撤"的声明活多久
+
+# 战斗期间把反射节拍加快到多少秒。
+# 用户 2026-10-11："反应只有 1 Hz，打架的时候一秒是很长的。" RCON 33ms/条，付得起。
+COMBAT_INTERVAL = 0.25
 
 # ---- 反射的 walk 声明的生存时间（秒）------------------------------------
 #
@@ -156,11 +172,18 @@ class ReflexGuard:
         stance: str = STANCE_DEFEND,
         owner_name: str = "",
         flee_toward: str = RETREAT_SAFE,
+        combat_interval: float = COMBAT_INTERVAL,
         notify=None,
         journal=None,
     ) -> None:
         self.bridge = bridge
         self.interval = max(0.5, float(interval))
+        # 战斗期间用的快节拍（打架时一秒太长了），打完自动回 self.interval
+        self.combat_interval = max(0.1, min(float(combat_interval), self.interval))
+        # 上一次 tick 距现在多久 —— 秒为单位的计数器要按真实间隔累加，
+        # 不然战斗期切到 0.25 秒之后，"安静 10 秒"会变成"安静 40 个 tick"
+        self._last_dt = self.interval
+        self._tick_at = 0.0
         self.hp_low = float(hp_low)
         self.hp_critical = float(hp_critical)
         self.flee_distance = max(8, int(flee_distance))
@@ -203,6 +226,15 @@ class ReflexGuard:
         self._in_combat = False
         self._no_threat_ticks = 0
         self._approach_wait = 0
+        # 这一场战斗里，它到底有没有在打我（或我有没有挨过它的打）。
+        # 用户 2026-10-11："不主动挑事"和"正在打我我也不还手"是两回事 ——
+        # 前者是姿态，后者是蠢。有这条之后 defend 也只在"它真在打我"时才追。
+        self._engaged = False
+        # 她自己的身体在不在线（每 tick 从 mcb state 更新）。
+        # 熟度拿它当第二道闸：身体不在就别叫醒她 —— 那一轮 agent 白烧 token。
+        self.online = False
+        # 上一次走位（打一下退半步）是什么时候，墙钟
+        self._kite_at = 0.0
         # 距离上次挨打过了多久（秒）—— 脱战的第二个出口（COMBAT_QUIET_SECONDS）
         self._no_hurt_seconds = 0.0
         # 换武器的冷却：换完先安静几个 tick，别在快捷栏里来回倒腾
@@ -323,12 +355,18 @@ class ReflexGuard:
         self._in_combat = False
         self._no_threat_ticks = 0
         self._fleeing = False
+        self._engaged = False
         return m
 
     # ---- 主循环 ---------------------------------------------------------
 
     async def _loop(self) -> None:
         while True:
+            # 记一次真实间隔 —— 战斗期节拍会变快，秒为单位的计数器不能按固定值累加
+            now = time.monotonic()
+            if self._tick_at:
+                self._last_dt = min(5.0, max(0.05, now - self._tick_at))
+            self._tick_at = now
             try:
                 await self._tick()
                 self._fail_streak = 0
@@ -343,13 +381,17 @@ class ReflexGuard:
                     )
                 await asyncio.sleep(min(30.0, self.interval * 5))
                 continue
-            await asyncio.sleep(self.interval)
+            # 战斗期间用快节拍 —— 用户 2026-10-11："打架的时候一秒是很长的。"
+            await asyncio.sleep(self.combat_interval if self._in_combat else self.interval)
 
     async def _tick(self) -> None:
         reply = await self.bridge.call("mcb state")
         if not reply.get("ok"):
+            # 桥不通不等于她下线（可能只是隧道断了）—— 保持上一次的判断
             return
         data = reply.get("data") or {}
+        # 记下她的身体在不在（熟度拿它当第二道闸，见 mcb/ripeness.py）
+        self.online = bool(data.get("online"))
         if not data.get("online"):
             self._last_hp = None
             self._last_sample = None
@@ -384,20 +426,27 @@ class ReflexGuard:
         if hurt:
             self._no_hurt_seconds = 0.0
         else:
-            self._no_hurt_seconds += self.interval
+            self._no_hurt_seconds += self._last_dt
 
         # 一次索敌，两个用途（别再查第二遍 —— 每 tick 一次 RCON 往返已经够了）
         hostiles = await self._hostiles()
-        nearest = hostiles[0] if hostiles else None
+        # 注意： 这里要两个不同的东西，别混：
+        #   closest —— 离得最近的那只。进战/脱战的**距离阈值**看它（那是"附近有没有怪"）
+        #   target  —— 最该打的那只。**动手**看它（用户 2026-10-11：不该只按距离选）
+        closest = hostiles[0] if hostiles else None
+        target = self._pick_target(hostiles) if hostiles else None
         targeting = next((h for h in hostiles if h.get("targeting")), None)
+        # 它是不是正在跟我打（正瞄着我，或者我这一 tick 挨了打）
+        engaging = bool(hurt or targeting is not None)
 
         # ---- 战斗状态机（抄女仆：StartAttacking / 走过去 / 挥 / 脱战）----
         if not self._in_combat:
-            why = self._combat_trigger(hurt, nearest, targeting)
+            why = self._combat_trigger(hurt, closest, targeting)
             if why:
                 self._in_combat = True
                 self._no_threat_ticks = 0
                 self._no_hurt_seconds = 0.0
+                self._engaged = engaging
                 # 注意： 只写日志，不发 QQ —— 战斗是自动跑的，用户不需要在聊天里看到它。
                 #    只有"白主动要告诉用户的事"才走 _notify（比如"我饿了但没吃的"）。
                 logger.warning(f"[mc_body] ⚔ 进入战斗（{why}）")
@@ -420,8 +469,11 @@ class ReflexGuard:
             #    只看"怪在不在附近"的话，一只站在旁边发呆的蠹虫就能把她永久锁进战斗态
             #    （实测：21:10–21:19 连续 9 分钟，walk 通道一直被反射占着，
             #     用户说"跟着我"完全下不去）。
-            gone = (nearest is None
-                    or nearest.get("dist", 1e9) > NEAR_HOSTILE_RANGE * COMBAT_EXIT_RATIO)
+            if engaging:
+                # 这一场里它打过我一次，就算"正在打" —— 追出去是还手，不是挑事
+                self._engaged = True
+            gone = (closest is None
+                    or closest.get("dist", 1e9) > NEAR_HOSTILE_RANGE * COMBAT_EXIT_RATIO)
             quiet = (self._stance == STANCE_DEFEND
                      and self._no_hurt_seconds >= COMBAT_QUIET_SECONDS
                      and targeting is None)
@@ -430,6 +482,7 @@ class ReflexGuard:
                 if self._no_threat_ticks >= COMBAT_EXIT_TICKS:
                     self._in_combat = False
                     self._fleeing = False
+                    self._engaged = False
                     logger.info(
                         "[mc_body] ⚔ 脱战：" + ("怪已经拉开或没了" if gone else "安静够久了")
                     )
@@ -440,8 +493,11 @@ class ReflexGuard:
                     await self._walk_release()
             else:
                 self._no_threat_ticks = 0
-                # 只有 hunt 姿态才追出去；defend 姿态够不着就站着等它过来。
-                await self._fight(data, nearest, hp, chase=(self._stance == STANCE_HUNT))
+                # 追不追：hunt 一直追；defend **只在它真在打我时**追。
+                # 用户 2026-10-11："不主动挑事"和"正在打我我也不还手"是两回事 ——
+                # 原来 defend 一律 chase=False，于是骷髅站在 3 格外射她，她原地挨打。
+                chase = (self._stance == STANCE_HUNT) or self._engaged
+                await self._fight(data, target, hp, chase=chase)
 
         # 挨打通知（只在掉血时，不刷屏）
         if hurt:
@@ -703,6 +759,34 @@ class ReflexGuard:
             return f"{targeting.get('name')} 正瞄着我，贴到 {targeting.get('dist'):g} 格"
         return None
 
+    @staticmethod
+    def _threat_score(h: dict) -> float:
+        """威胁度。分越高越该先打。
+
+        用户 2026-10-11："目标选的是'最近的'，不是'最该打的'。"
+        混战里她该先打正在射她的骷髅，而不是脚边那只僵尸。
+
+        判据：
+          正瞄着我  +100  —— 正在打我的最先解决
+          敌对      +30   —— 会主动打人的（僵尸/骷髅）优先于动物
+          离得近    -距离 —— 威胁相同时先打近的
+        """
+        score = 0.0
+        if h.get("targeting"):
+            score += 100.0
+        if h.get("hostile"):
+            score += 30.0
+        dist = h.get("dist")
+        if isinstance(dist, (int, float)):
+            score -= float(dist)
+        return score
+
+    @staticmethod
+    def _pick_target(hostiles: list[dict]) -> dict | None:
+        if not hostiles:
+            return None
+        return max(hostiles, key=ReflexGuard._threat_score)
+
     async def _nearest_targeting(self) -> dict | None:
         """最近的那个正瞄着白的敌对实体。defend 姿态用它当开战判据。"""
         hostiles = await self._hostiles()
@@ -757,6 +841,43 @@ class ReflexGuard:
         else:
             # 够得着 —— 挥。冷却由客户端判（抄原版 startAttack 的逻辑）
             await self._cmd(f"mcb attackAt {tx} {ty} {tz}")
+            # 砍完退半步（见 _kite 的说明）—— 别贴脸对撸
+            await self._kite(data, nearest)
+
+    async def _kite(self, data: dict, target: dict) -> None:
+        """打一下就退半步 —— 别贴脸对撸。
+
+        用户 2026-10-11："尽可能做走位。" 真人近战都是这样：砍一刀往后撤，
+        等攻击冷却好了再上。站定对撸是"看着蠢"观感里的一大块。
+
+        注意： 撤太远会够不着（ENGAGE_RANGE = 3.0），所以只撤到 KITE_BACK_UNDER 之外
+        一点点。冷却用墙钟不用 tick —— 战斗期节拍是 0.25 秒，tick 计数会算错。
+        """
+        now = time.monotonic()
+        if (now - self._kite_at) < KITE_COOLDOWN_SECONDS:
+            return
+        dist = target.get("dist")
+        pos = target.get("pos")
+        if not isinstance(dist, (int, float)) or not isinstance(pos, list) or len(pos) < 3:
+            return
+        if float(dist) > KITE_BACK_UNDER:
+            return          # 已经不算贴脸了，不用退
+        try:
+            x = float(data.get("x"))
+            z = float(data.get("z"))
+            tx = float(pos[0])
+            tz = float(pos[2])
+        except (TypeError, ValueError):
+            return
+        dx, dz = x - tx, z - tz
+        norm = math.hypot(dx, dz)
+        if norm < 0.05:
+            # 完全重合了（贴在她身上）—— 随便挑个方向退
+            dx, dz, norm = 1.0, 0.0, 1.0
+        bx = int(round(x + dx / norm * KITE_STEP))
+        bz = int(round(z + dz / norm * KITE_STEP))
+        self._kite_at = now
+        await self._walk_claim(f"goto {bx} {bz}", "砍完退半步", ttl=KITE_TTL)
 
     async def _equip_best_weapon(self, data: dict) -> None:
         """进战时确保手上是最能打的那件。判据只看 atk（真实攻击力）。
@@ -874,6 +995,7 @@ class ReflexGuard:
         self._in_combat = False
         self._no_threat_ticks = 0
         self._fleeing = False
+        self._engaged = False
         self._approach_wait = 0
 
         data = await self._state()

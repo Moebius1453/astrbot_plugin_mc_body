@@ -79,6 +79,12 @@
     "hint": "多久看一眼她的血量/位置。**默认 1 秒** —— 抄 Kindred 的做法（他们的防御反射每 5 tick = 0.25 秒跑一次，「靠模型反应太慢，她会被打死」）。RCON 实测 33ms/条，1 秒完全付得起。想更灵敏可以调到 0.5。",
     "default": 1
   },
+  "reflex_combat_interval_seconds": {
+    "type": "float",
+    "description": "战斗期间的反射节拍（秒）",
+    "hint": "用户 2026-10-11：\"反应只有 1 Hz，打架的时候一秒是很长的。\"\n打架时把反射节拍从 reflex_interval_seconds 降到这个值，脱战自动回到慢节拍。\nRCON 实测 33ms/条，0.25 秒完全付得起。设成和 reflex_interval_seconds 一样就是不加速。",
+    "default": 0.25
+  },
   "hp_low": {
     "type": "float",
     "description": "血量警戒线",

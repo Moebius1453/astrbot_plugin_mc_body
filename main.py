@@ -211,6 +211,8 @@ class McBodyPlugin(Star):
             #    但用户也说了 "慌不择路 实际上怪可爱的" —— 所以不是删掉它，
             #    而是只在主人离得远时才用。
             flee_toward=str(self._cfg("retreat_toward", "auto")),
+            # 战斗期间用快节拍 —— 用户 2026-10-11："打架的时候一秒是很长的。"
+            combat_interval=float(self._cfg("reflex_combat_interval_seconds", 0.25)),
             notify=self._notify,
             journal=self.journal,
         )
@@ -376,6 +378,10 @@ class McBodyPlugin(Star):
     async def _maybe_wake_by_events(self) -> None:
         """熟度的心跳：借事件流那个 2 秒一次的节拍走，不另起循环。"""
         if not self._cfg("enable_event_wake", True):
+            return
+        # 第二道闸：她的身体不在线就别叫醒 —— 那一轮 agent 白烧 token。
+        # 注意： 这一道和"主人在线"那道是两回事：主人可能在玩，而她客户端没开。
+        if not self.reflex.online:
             return
         why = self.ripeness.why()
         if why is None:
