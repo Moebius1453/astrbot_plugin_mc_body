@@ -113,7 +113,7 @@ MAX_SKILL_CHARS = 24000   # SKILL.md 是给人读的说明书，超长的多半�
     "astrbot_plugin_mc_body",
     "Moebius1453",
     "让 AstrBot 的智能体在 Minecraft 里长出手脚：查询角色状态、说话、移动。",
-    "0.37.0",
+    "0.38.0",
 )
 class McBodyPlugin(Star):
     def __init__(self, context: Context, config: dict | None = None) -> None:
@@ -489,13 +489,18 @@ class McBodyPlugin(Star):
         sender = str(event.get_sender_id())
         allowed = self._allowed_ids()
         if not allowed:
-            return (
-                "MC 工具还没授权任何调用者，所以暂时对所有人关闭。"
-                "（管理员请在 AstrBot 插件配置的 allowed_sender_ids 里填入允许的发送者 ID）"
+            return render.fail(
+                render.Kind.DENIED, "没有配置允许调用者，MC 工具对所有人关闭",
+                usage="管理员在 AstrBot 插件配置的 allowed_sender_ids 里填入允许的发送者 ID",
+                hint="这是我的配置问题，不是你的问题——照实告诉用户，别自己重试",
             )
         if sender not in allowed:
             logger.info(f"[{PLUGIN_NAME}] 拒绝未授权调用 sender={sender}")
-            return f"你没有调用 Minecraft 工具的权限（你的 ID：{sender}）。"
+            return render.fail(
+                render.Kind.DENIED, "你没有调用 Minecraft 工具的权限",
+                detail=f"你的发送者 ID：{sender}",
+                hint="让主人在插件配置的 allowed_sender_ids 里加上这个 ID；别自己重试",
+            )
         return None
 
     def _guard(self, event: AstrMessageEvent) -> str | None:
@@ -570,7 +575,8 @@ class McBodyPlugin(Star):
             return deny
         data, err = await self._call("mcb state")
         if err:
-            return f"查不到 Nanako 的状态：{err}"
+            return render.reword(err, "查不到 Nanako 的状态", kind=render.Kind.BRIDGE,
+                                hint="过几秒重试一次；一直这样就说明桥断了（不是她不在线）")
         return render.describe_state(
             data, self.reflex.stance, self.tasks.status(), self.journal
         )
@@ -589,7 +595,8 @@ class McBodyPlugin(Star):
             return "要说的话是空的，或者只包含换行 —— 没发出去。"
         _, err = await self._call(f"mcb say {clean}")
         if err:
-            return f"没能在游戏里说话：{err}"
+            return render.reword(err, "没能在游戏里说话", kind=render.Kind.BRIDGE,
+                                hint="过几秒重试一次")
         return f"已经用 Nanako 的身体在游戏里说了：{clean}"
 
     @filter.llm_tool(name="mc_goto")
@@ -632,7 +639,8 @@ class McBodyPlugin(Star):
                 )
                 _, err = await self._claim_walk_user(f"goto {tx} {tz}", f"去「{name}」")
                 if err:
-                    return f"没能让她出发：{err}"
+                    return render.reword(err, "没能让她出发", kind=render.Kind.BRIDGE,
+                                        hint="先用 mc_state 看她在哪、在不在线")
                 warn = {
                     "changed": "⚠️ 不过**那地方已经和记的时候不一样了** —— 到那儿先看一眼再说。",
                     "gone": "❌ 而且**那儿已经空了** —— 多半被挖掉或炸没了，可能白跑一趟。",
@@ -654,7 +662,8 @@ class McBodyPlugin(Star):
             tx, tz = int(pos[0]), int(pos[2])
             _, err = await self._claim_walk_user(f"goto {tx} {tz}", f"扫到的 {block_id}")
             if err:
-                return f"没能让她出发：{err}"
+                return render.reword(err, "没能让她出发", kind=render.Kind.BRIDGE,
+                                    hint="先用 mc_state 看她在哪、在不在线")
             return (f"附近找到了 {block_id}（{pos[0]},{pos[1]},{pos[2]}），"
                     "已让她出发。过会儿用 mc_state 看坐标确认。")
 
@@ -666,7 +675,8 @@ class McBodyPlugin(Star):
             )
         _, err = await self._claim_walk_user(f"goto {tx} {tz}", "mc_goto x/z")
         if err:
-            return f"没能让她出发：{err}"
+                return render.reword(err, "没能让她出发", kind=render.Kind.BRIDGE,
+                                    hint="先用 mc_state 看她在哪、在不在线")
         return (
             f"已让她出发前往 x={tx} z={tz}。**她现在还在路上** —— "
             "过一会儿调 mc_state 看坐标，确认她是不是真的到了。"
@@ -713,7 +723,8 @@ class McBodyPlugin(Star):
         if act in ("remember", "save", "mark", "add", "note"):
             data, err = await self._call("mcb state")
             if err:
-                return f"读不到坐标，记不了：{err}"
+                return render.reword(err, "读不到坐标，记不了", kind=render.Kind.BRIDGE,
+                                    hint="先用 mc_state 确认她在哪")
             if not data.get("online"):
                 return "她不在线，拿不到坐标。"
             px, py, pz = data.get("x") or 0, data.get("y") or 0, data.get("z") or 0
@@ -792,7 +803,8 @@ class McBodyPlugin(Star):
             return f"玩家名不合法：{player!r}。只允许 1-16 位字母、数字、下划线。"
         _, err = await self._claim_walk_user(f"follow player {name}", f"跟随 {name}")
         if err:
-            return f"没能让她跟随：{err}"
+            return render.reword(err, "没能让她跟随", kind=render.Kind.BRIDGE,
+                                hint="先用 mc_state 看她在不在线")
         return (
             f"已让她开始跟随 {name}。记住这是「跟到几格以内」不是贴身，"
             "目标就在旁边时她不动是正常的。"
@@ -817,7 +829,8 @@ class McBodyPlugin(Star):
         # 顺手松开"使用键" —— 万一吃东西时出了岔子，按键卡住会让她一直重复动作
         await self._call("mcb release")
         if err:
-            return f"没能让她停下：{err}"
+            return render.reword(err, "没能让她停下", kind=render.Kind.BRIDGE,
+                                hint="过几秒再用 mc_state 看她还在不在走")
         return f"已下发停止指令，她应该会停下来（惯性可能还会滑一小段）。{stopped}"
 
     @filter.llm_tool(name="mc_baritone_raw")
@@ -849,7 +862,8 @@ class McBodyPlugin(Star):
             )
         _, err = await self._claim_walk_user(clean, "mc_baritone_raw")
         if err:
-            return f"没能执行：{err}"
+            return render.reword(err, "没能执行", kind=render.Kind.BRIDGE,
+                                hint="先用 mc_state 看她在不在线")
         return f"已把 Baritone 命令下发出去：{clean}。过一会儿用 mc_state 看效果。"
 
     @filter.llm_tool(name="mc_skill")
@@ -897,7 +911,8 @@ class McBodyPlugin(Star):
             return deny
         data, err = await self._call("mcb inventory")
         if err:
-            return f"读不到背包：{err}"
+            return render.reword(err, "读不到背包", kind=render.Kind.BRIDGE,
+                                hint="先用 mc_state 确认她在线")
         return render.describe_inventory(data)
 
     @filter.llm_tool(name="mc_hold")
@@ -917,7 +932,8 @@ class McBodyPlugin(Star):
             return f"槽位 {n} 超范围。快捷栏只有 0 到 8。"
         _, err = await self._call(f"mcb hotbar {n}")
         if err:
-            return f"切换失败：{err}"
+            return render.reword(err, "切换快捷栏失败", kind=render.Kind.BRIDGE,
+                                hint="先用 mc_state 确认她在线；格号是 0~8")
         return f"已经把手换到快捷栏第 {n} 格。"
 
     @filter.llm_tool(name="mc_equip")
@@ -960,7 +976,8 @@ class McBodyPlugin(Star):
             return deny
         _, err = await self._call("mcb use")
         if err:
-            return f"使用失败：{err}"
+            return render.reword(err, "使用失败", kind=render.Kind.BRIDGE,
+                                hint="先用 mc_state 看她在不在线、手上是什么")
         return "已经用了一次手上的东西。过一会儿用 mc_inventory 或 mc_state 看效果。"
 
     @filter.llm_tool(name="mc_use_on")
@@ -997,15 +1014,17 @@ class McBodyPlugin(Star):
         # 走 useOnAt（直接给坐标构造命中），不依赖准星射线 —— 实测射线经常 MISS
         _, err = await self._call(f"mcb useOnAt {tx} {ty} {tz}")
         if err:
-            return (
-                f"对着 ({tx},{ty},{tz}) 右键没成功：{err}。"
-                "最常见的原因是**够不着**（超过约 4.5 格）—— 先用 mc_goto 走到附近。"
+            return render.reword(
+                err, f"对着 ({tx},{ty},{tz}) 右键没成功",
+                kind=render.Kind.OUT_OF_REACH,
+                hint=f"先 `mc_goto x={tx} z={tz}` 走到 4 格以内，再重试这条",
             )
         if keep_open:
             await asyncio.sleep(0.6)   # 等界面开起来
             data, merr = await self._call("mcb state")
             if merr:
-                return f"已对着 ({tx},{ty},{tz}) 右键，但读不到界面：{merr}"
+                return render.reword(merr, f"已对着 ({tx},{ty},{tz}) 右键，但读不到界面",
+                                     kind=render.Kind.BRIDGE, hint="过几秒再用 mc_menu 看一次")
             return "已对着 ({tx},{ty},{tz}) 右键，界面留着没关。\n" + render.describe_menu(data)
         # 不操作界面 → 关掉，免得她动不了
         await self._call("mcb closeGui")
@@ -1038,7 +1057,8 @@ class McBodyPlugin(Star):
             return deny
         data, err = await self._call("mcb state")
         if err:
-            return f"读不到界面：{err}"
+            return render.reword(err, "读不到界面", kind=render.Kind.BRIDGE,
+                                hint="先用 mc_state 确认她在线")
         return render.describe_menu(data)
 
     @filter.llm_tool(name="mc_click")
@@ -1069,7 +1089,8 @@ class McBodyPlugin(Star):
             return f"mode 只能是 0~6（给的是 {m}）。"
         _, err = await self._call(f"mcb clickSlot {n} 0 {m}")
         if err:
-            return f"点格子失败：{err}"
+            return render.reword(err, "点格子失败", kind=render.Kind.REFUSED,
+                                hint="先用 mc_menu 看一次界面 id，确认还是同一个容器再重点")
         await asyncio.sleep(0.4)
         data, merr = await self._call("mcb state")
         after = "" if merr else "\n" + render.describe_menu(data)
@@ -1157,7 +1178,8 @@ class McBodyPlugin(Star):
             return deny
         _, err = await self._call("mcb attack")
         if err:
-            return f"攻击失败：{err}"
+            return render.reword(err, "攻击失败", kind=render.Kind.BRIDGE,
+                                hint="先用 mc_state 看她在不在线、手上是不是武器")
         return "已攻击准星指着的实体。过一会儿用 mc_state 看血量/效果。"
 
     @filter.llm_tool(name="mc_threats")
@@ -1171,7 +1193,8 @@ class McBodyPlugin(Star):
             return deny
         data, err = await self._call("mcb threats 24")
         if err:
-            return f"查不到周围情况：{err}"
+            return render.reword(err, "查不到周围情况", kind=render.Kind.BRIDGE,
+                                hint="过几秒重试")
         return render.describe_threats(data)
 
     @filter.llm_tool(name="mc_stance")
@@ -1395,7 +1418,8 @@ class McBodyPlugin(Star):
             return deny
         data, err = await self._call("mcb around")
         if err:
-            return f"看不了：{err}"
+            return render.reword(err, "看不了周围", kind=render.Kind.BRIDGE,
+                                hint="过几秒重试")
         force = str(deep).strip().lower() in ("1", "true", "yes", "deep", "now")
         t2 = await self._around_t2(data if isinstance(data, dict) else {}, force)
         return render.describe_around(data, t2)
@@ -1421,7 +1445,8 @@ class McBodyPlugin(Star):
             return "得说清楚找谁。"
         data, err = await self._call(f"mcb where {who}")
         if err:
-            return f"查不到：{err}"
+            return render.reword(err, "查不到这个玩家", kind=render.Kind.NOT_FOUND,
+                                hint="不带参数可以查主人；名字要用她的游戏 ID（不是显示名）")
         return render.describe_where(data, who)
 
     @filter.llm_tool(name="mc_chat_log")
@@ -1449,7 +1474,8 @@ class McBodyPlugin(Star):
             n = 20
         data, err = await self._call("mcb chat 0")
         if err:
-            return f"翻不到：{err}"
+            return render.reword(err, "翻不到聊天记录", kind=render.Kind.BRIDGE,
+                                hint="过几秒重试")
         lines = [x for x in (data.get("lines") or []) if isinstance(x, dict)]
         if not lines:
             return "游戏公屏是空的 —— 还没人说过话。"
@@ -1488,7 +1514,8 @@ class McBodyPlugin(Star):
         if release:
             _, err = await self._call("mcb releaseAim")
             if err:
-                return f"松不开：{err}"
+                return render.reword(err, "松不开朝向", kind=render.Kind.BRIDGE,
+                                    hint="过几秒重试")
             return "松开视线了 —— 现在走路时会自然朝向行进方向。"
         try:
             tx, ty, tz = int(float(x)), int(float(y)), int(float(z))
@@ -1496,7 +1523,8 @@ class McBodyPlugin(Star):
             return "坐标不合法 —— 要么给三个数，要么 release=true。"
         _, err = await self._call(f"mcb aimAt {tx} {ty} {tz}")
         if err:
-            return f"锁不住：{err}"
+                return render.reword(err, "锁不住朝向", kind=render.Kind.BRIDGE,
+                                    hint="先用 mc_state 确认她在线")
         return (f"视线锁在 ({tx}, {ty}, {tz}) 了 —— 接下来**就算走路也会一直看着那儿**，"
                 "而且是每 tick 重算，不会因为走远就偏。看完记得 `mc_aim(release=true)` 松开。")
 
@@ -1554,7 +1582,8 @@ class McBodyPlugin(Star):
             return deny
         data, err = await self._call("mcb lookat")
         if err:
-            return f"看不了：{err}"
+            return render.reword(err, "看不了准星", kind=render.Kind.BRIDGE,
+                                hint="过几秒重试")
         return render.describe_look(data, self.places)
 
     # ---- 调试入口 -------------------------------------------------------

@@ -14,6 +14,71 @@
 from __future__ import annotations
 
 
+# ---- 失败的三段式（抄 Numen，见 docs\25 §三 1.1）----------------------
+#
+# ⚠️ **为什么要统一**：模型收到一句"没能让她出发：桥断了"之后**不知道该干什么** ——
+#    是换个参数？等她上线？还是这条路根本走不通？**它只能瞎猜或者放弃。**
+#
+#    Numen 的做法（`docs\19` §一.3）：失败**不是 JSON，是固定形状的几行文本**。
+#    它试过给结构化 JSON，最后**明确把 `data` 字段删了** —— 原话是"模型会把它
+#    连同文字一起读进去"，反而更乱。所以我们返回**文本**，形状固定：
+#
+#         <第一行：一句话说清发生了什么>
+#         error: <kind> —— 错在哪，点名参数与它的值>
+#         usage: <正确写法>            ← 可省
+#         hint:  <能直接照抄的下一行>   ← 可省
+#
+# ⭐ **`hint` 是最值钱的一行**：它必须是**下一次调用**（`mc_goto x=… z=…`），
+#    不是"你可以试试走过去"这种话。模型照抄就能重试。
+#
+# ⚠️ **`kind` 由调用方显式给，绝不从错误文本里猜** ——
+#    Numen 的 `ToolOutcome` 类注释专门骂过旧实现 `contains("\"error\"")` 的误判：
+#    **拿关键词猜只会误判**。
+
+class Kind:
+    """失败的种类。**抄 Numen `ErrorKind` 的子集**（它 14 个，挑我们真有的）。
+
+    ⚠️ 加新种类前先问：**模型拿到这个种类，能做出不一样的事吗？**
+    不能的话就别加 —— 种类太多等于没有种类。
+    """
+
+    BAD_ARGUMENT = "bad_argument"    # 参数写错了（名字、类型、越界、缺）
+    NOT_FOUND = "not_found"          # 世界里没这个东西
+    OUT_OF_REACH = "out_of_reach"    # 有，但够不着 / 走不过去
+    NO_PATH = "no_path"              # 寻路失败：没有连通的路
+    NO_MATERIAL = "no_material"      # 缺材料 / 缺工具
+    DENIED = "denied"                # 没有权限（我们：调用者不在白名单）
+    TIMEOUT = "timeout"              # 等超时了
+    INTERRUPTED = "interrupted"      # 被更高优先级抢走了（反射保命）
+    OFFLINE = "offline"              # 她的身体不在（客户端没连）—— 我们特有
+    BRIDGE = "bridge"                # 桥断了（RCON/隧道/脚本）—— 我们特有
+    REFUSED = "refused"              # 服务端退回了这一下 —— 我们特有
+    FAILED = "failed"                # 兜底：确实失败了，但归不到上面任何一类
+
+
+def fail(kind: str, what: str, detail: str = "", usage: str = "",
+         hint: str = "") -> str:
+    """拼一条失败回执。**形状固定**，见本段开头的说明。"""
+    lines = [what]
+    lines.append(f"error: {kind}" + (f" —— {detail}" if detail else ""))
+    if usage:
+        lines.append(f"usage: {usage}")
+    if hint:
+        lines.append(f"hint: {hint}")
+    return "\n".join(lines)
+
+
+def reword(err, what: str, kind: str = Kind.FAILED, detail: str = "",
+           usage: str = "", hint: str = "") -> str:
+    """把 `_call` / 仲裁层回来的一句错误，包成三段式。
+
+    `err` 是桥或仲裁层给的**原始错误文本**（可为 None）——
+    没拿到就把 `detail` 换成"桥没说原因"。
+    """
+    return fail(kind, what, detail=str(err or detail or "桥没说原因"),
+                usage=usage, hint=hint)
+
+
 # ---- 界面 -----------------------------------------------------------
 
 def describe_menu(data: dict) -> str:
