@@ -1414,6 +1414,152 @@ function mcbThreats(player, radius) {
   return out
 }
 
+// 准星指着的那只实体 —— 只读，不动手。
+//
+// 为什么要它：mc_attack 是准星制的（客户端 player.pick），而"那只是谁的宠物 / 有没有名字 /
+// 是不是村民"只有服务端答得出来。插件侧要拿它过权限闸（docs\22 §4）：
+// 不然她一刀下去可能砍死主人驯的狼。自动反击（reflex）按设计不过闸，走的是 attackAt。
+//
+// 手法：沿视线采样（和 mcbRayBlock 同一套眼睛/视线），在采样点上找实体；
+// 撞到真遮挡的方块就停 —— 别隔着墙报"看得见"。
+// 注意： 这是近似，不是权威：原版权威是客户端那份 hitResult（见 mcbLookAt 的注释）。
+function mcbAttackTarget(player) {
+  var out = { hit: false, err: [], via: [] }
+  var level = null
+  try { level = player.level } catch (e0) { out.err.push('level: ' + e0); return out }
+  if (level === null || level === undefined) { out.err.push('level 为空'); return out }
+
+  var reach = 3.0
+  try { reach = Number(player.entityInteractionRange) } catch (eR) { }
+  if (isNaN(reach) || reach <= 0) reach = 3.0
+  out.reach = mcbR1(reach)
+
+  var eye = null, look = null
+  try { eye = player.getEyePosition(1.0) } catch (e1) {
+    try { eye = player.getEyePosition() } catch (e2) { out.err.push('eye: ' + e2) }
+  }
+  try { look = player.getViewVector(1.0) } catch (e3) {
+    try { look = player.getLookAngle() } catch (e4) { out.err.push('look: ' + e4) }
+  }
+  if (eye === null || eye === undefined || look === null || look === undefined) {
+    out.err.push('拿不到眼睛位置或视线方向')
+    return out
+  }
+  var ex = Number(eye.x), ey = Number(eye.y), ez = Number(eye.z)
+  var lx = Number(look.x), ly = Number(look.y), lz = Number(look.z)
+
+  var $AABB = null
+  try { $AABB = Java.loadClass('net.minecraft.world.phys.AABB') } catch (eB) {
+    out.err.push('AABB: ' + eB); return out
+  }
+  var $BP = null
+  try { $BP = Java.loadClass('net.minecraft.core.BlockPos') } catch (eB2) { out.err.push('BlockPos: ' + eB2) }
+
+  var STEP = 0.1
+  var t = 0.0
+  var steps = 0
+  while (t <= reach && steps < 200) {
+    steps++
+    var ts = t + STEP * 0.5
+    var sx = ex + lx * ts, sy = ey + ly * ts, sz = ez + lz * ts
+
+    // 方块挡住视线就停 —— 隔着墙不该"看得见"
+    if ($BP !== null) {
+      try {
+        var st = level.getBlockState(new $BP(Math.floor(sx), Math.floor(sy), Math.floor(sz)))
+        if (mcbBlockId(st).indexOf('air') < 0) {
+          var occl = true
+          try { occl = !!st.canOcclude() } catch (eO) { occl = true }
+          if (occl) { out.blockedAt = [Math.floor(sx), Math.floor(sy), Math.floor(sz)]; break }
+        }
+      } catch (eS) { }
+    }
+
+    var list = null
+    try {
+      list = level.getEntities(player, new $AABB(sx - 0.35, sy - 0.35, sz - 0.35,
+                                                sx + 0.35, sy + 0.35, sz + 0.35))
+    } catch (eL) { out.err.push('getEntities: ' + eL); break }
+
+    var n = Number(list.size())
+    for (var i = 0; i < n; i++) {
+      var e = list.get(i)
+      try { if (String(e.uuid) === String(player.uuid)) continue } catch (eU) { }
+      // 判定箱读得到就用它收紧；读不到就算命中（宁可多问一次主人，也别放过）
+      try {
+        var bb = e.boundingBox
+        if (bb !== null && bb !== undefined) {
+          var inBox = (sx >= Number(bb.minX) && sx <= Number(bb.maxX)
+                    && sy >= Number(bb.minY) && sy <= Number(bb.maxY)
+                    && sz >= Number(bb.minZ) && sz <= Number(bb.maxZ))
+          if (!inBox) continue
+        }
+      } catch (eBB) { }
+
+      out.hit = true
+      out.dist = mcbR1(ts)
+      try { out.uuid = String(e.uuid) } catch (eU2) { out.err.push('uuid: ' + eU2) }
+      try { out.type = String(e.type) } catch (eT2) { out.err.push('type: ' + eT2) }
+      try { out.name = mcbEntityName(e) } catch (eN2) { }
+
+      // 有没有名字 —— hasCustomName 所有实体都有，读不到就是读不到
+      try { out.custom = !!e.hasCustomName() } catch (eC1) {
+        try { out.custom = (e.customName !== null && e.customName !== undefined) } catch (eC2) {
+          out.custom = null
+          out.err.push('custom: 读不到')
+        }
+      }
+
+      // 有没有主人 —— 注意： 关键是把"不是可驯服的实体"和"读不到"分开。
+      //   getOwnerUUID 只存在于 OwnableEntity 上；不存在时取属性会抛，
+      //   于是 typeof 判一下就知道是"没有这个概念"（= 没有主人，确定）还是"读不到"。
+      var fnOwner = null
+      try { fnOwner = e.getOwnerUUID } catch (eF) { }
+      var isFn = false
+      try { isFn = (typeof fnOwner === 'function') } catch (eF2) { }
+      if (isFn) {
+        try {
+          var o = fnOwner.call(e)
+          out.ownerVia = 'getOwnerUUID'
+          out.owner = (o === null || o === undefined) ? null : String(o)
+        } catch (eO1) {
+          try {
+            out.owner = (e.ownerUUID === null || e.ownerUUID === undefined) ? null : String(e.ownerUUID)
+            out.ownerVia = 'ownerUUID'
+          } catch (eO2) { out.owner = null; out.ownerVia = ''; out.err.push('owner: 读不到') }
+        }
+      } else {
+        out.owner = null
+        out.ownerVia = 'absent'          // 确定：这类实体没有主人这个概念
+      }
+
+      // 是不是村民 —— 先试 instanceof，不行退回按注册名（对 mod 村民不认，是已知缺口）
+      var $V = null
+      try { $V = Java.loadClass('net.minecraft.world.entity.npc.AbstractVillager') } catch (eV0) { }
+      if ($V !== null) {
+        try {
+          out.villager = (e instanceof $V)
+          out.villagerVia = 'instanceof'
+        } catch (eV1) { out.villager = null; out.villagerVia = '' }
+      } else {
+        out.villager = null
+        out.villagerVia = ''
+      }
+      if (out.villager === null) {
+        var tid = String(out.type || '')
+        if (tid.indexOf(':') >= 0) {
+          out.villager = (tid === 'minecraft:villager' || tid === 'minecraft:wandering_trader')
+          out.villagerVia = 'type-id'
+        }
+      }
+      return out
+    }
+    t += STEP
+  }
+  if (!out.hit) out.err.push('准星没指着实体')
+  return out
+}
+
 // --- 准星注视（服务端射线）------------------------------------------------
 //
 // "我正看着什么" —— 最自然的感知入口。
@@ -2735,12 +2881,17 @@ ServerEvents.basicCommand('mcb', event => {
   }
 
   // 索敌 —— 附近有什么实体、谁离得最近
-  if (action === 'threats') {
-    var tr = 24
+  if (action === 'threats') {    var tr = 24
     try { tr = parseInt(arg, 10) } catch (e) { tr = 24 }
     if (isNaN(tr) || tr < 2) tr = 24
     if (tr > 64) tr = 64
     mcbOk(event, 'threats', mcbThreats(player, tr))
+    return
+  }
+
+  // 准星指着的那只实体（只读，不动手）—— mc_attack 过权限闸要用它
+  if (action === 'attackTarget') {
+    mcbOk(event, 'attackTarget', mcbAttackTarget(player))
     return
   }
 

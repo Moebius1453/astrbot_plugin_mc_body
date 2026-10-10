@@ -152,6 +152,34 @@ class Facts:
             block_entity=bool(reply.get("blockEntity")),
         )
 
+    @classmethod
+    def from_attack_reply(cls, reply: dict, actor: str = "") -> "Facts":
+        """把桥命令 mcb attackTarget 的回执翻成事实（准星指着的那只实体）。
+
+        关键是别把"不是可驯服的实体"和"读不到"混成一件事：
+            ownerVia == "absent"  ->  这类实体没有主人这个概念，确定没主人（owned=False）；
+            ownerVia 有值但 owner 空 ->  确定没主人；
+            ownerVia 空            ->  读不到，留 None（信号按"有"算 -> 会去问）。
+        同理 custom / villager 为 null 就是读不到。
+        """
+        if not isinstance(reply, dict):
+            return cls(actor=actor)
+        owner_via = str(reply.get("ownerVia") or "")
+        if owner_via == "absent":
+            owned: bool | None = False
+        elif owner_via:
+            owned = bool(str(reply.get("owner") or ""))
+        else:
+            owned = None
+        custom = reply.get("custom")
+        villager = reply.get("villager")
+        return cls(
+            actor=str(reply.get("actor") or actor or ""),
+            entity_owned=owned,
+            entity_named=None if custom is None else bool(custom),
+            entity_villager=None if villager is None else bool(villager),
+        )
+
 
 # ---- 信号 -----------------------------------------------------------
 #
@@ -425,8 +453,6 @@ FACTORY_ALLOW = (
     "break(self_placed & !contents)",
     # 放不危险的东西
     "place(!hazard_item)",
-    # 危险物品（岩浆/打火石/TNT/水桶）：附近没有别人放的东西才放
-    "place(hazard_item & !near_placed)",
     # 打没主人、没名字、不是村民的（敌对生物与野生动物）
     "attack(!owned & !named & !villager)",
 )
@@ -440,13 +466,23 @@ FACTORY_ASK = (
     "attack(owned)",
     "attack(named)",
     "attack(villager)",
-    "place(hazard_item & near_placed)",
+    # 危险物品一律问（岩浆/打火石/火焰弹/TNT/水桶）。
+    # 注意： 这里没写 near_placed，理由见下面那段注释。
+    "place(hazard_item)",
     # 注意：注意： 从容器里拿东西一律问 —— 这一条是我们和 Numen 立场不同的地方。
     #     Numen 把 take(*) 放进出厂 allow（它的理由是"相当于 Claude Code 读项目文件"）。
     #     那是它的立场，不是我们的：对我们来说"她翻箱子把东西拿走"恰恰是要防的。
     #     抄机制，不抄这条立场（docs\\22 §3 第 2 条）。
     "take(*)",
 )
+
+# 注意： 出厂表里为什么没有 near_placed（Numen 用的是 place(hazard_item & near_placed)）：
+#     我们**还没有读邻域的通道**，near_placed 只能按"有"算。照抄那一条的话命中它的永远是它，
+#     回执就会写成"附近有别人放的方块" —— 那是在陈述一个我们根本没查过的事实
+#     （"缺失不等于假"那条硬约束）。
+#     所以这里直接写 place(hazard_item)：裁决一样是问，但理由说的是真的。
+#     等哪天有了邻域查询，再照 Numen 收窄成"附近没有别人的东西才放行"。
+#     near_placed 这个信号本身留着 —— 主人自己那层规则可以直接用它。
 
 
 @dataclass

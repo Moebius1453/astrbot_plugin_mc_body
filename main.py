@@ -588,39 +588,48 @@ class McBodyPlugin(Star):
             return permission.EMPTY
 
     async def _permit(
-        self, action: permission.Action
+        self,
+        action: permission.Action,
+        facts: permission.Facts | None = None,
     ) -> tuple[permission.Verdict, permission.Facts]:
         """裁决一个动作。返回 (裁决, 用到的事实)。
+
+        facts 已经拿到就传进来（例如攻击：事实来自 mcb attackTarget，不是 mcb placed）；
+        没传就按 action.pos 去问服务端这一格的放置记录。
 
         事实读不到时按"问"处理，绝不按"放行" —— 缺失不等于假。
         """
         mode = permission.Mode.by_name(self._cfg("permission_mode", permission.Mode.ASK))
         if mode == permission.Mode.BYPASS:
-            return permission.ALLOWED, permission.Facts()
+            return permission.ALLOWED, facts if facts is not None else permission.Facts()
         judge = permission.Judge(mode=mode, owner=self._owner_rules())
-        facts = permission.Facts(pos=action.pos)
-        if action.pos is not None:
-            tx, ty, tz = action.pos
-            data, err = await self._call(f"mcb placed {tx} {ty} {tz}")
-            if err or not isinstance(data, dict):
-                return (
-                    permission.Verdict(
-                        permission.VerdictKind.ASK, "读不到这一格的放置记录"
-                    ),
-                    facts,
-                )
-            facts = permission.Facts.from_placed_reply(data)
+        if facts is None:
+            facts = permission.Facts(pos=action.pos)
+            if action.pos is not None:
+                tx, ty, tz = action.pos
+                data, err = await self._call(f"mcb placed {tx} {ty} {tz}")
+                if err or not isinstance(data, dict):
+                    return (
+                        permission.Verdict(
+                            permission.VerdictKind.ASK, "读不到这一格的放置记录"
+                        ),
+                        facts,
+                    )
+                facts = permission.Facts.from_placed_reply(data)
         return judge.decide(action, facts), facts
 
     async def _permit_or_refuse(
-        self, action: permission.Action, what: str
+        self,
+        action: permission.Action,
+        what: str,
+        facts: permission.Facts | None = None,
     ) -> str | None:
         """要改世界的工具都先过这里。放行回 None，不放行回一条给她的失败回执。
 
         去问（ask）这一版降级成"停手 + 在公屏说一句"，不做答复回环（docs\22 §6 第 5 步）——
         光这一步就消灭了"她不问一声就把主人的东西拆了/倒了岩浆"。
         """
-        verdict, facts = await self._permit(action)
+        verdict, facts = await self._permit(action, facts)
         if verdict.allowed:
             return None
         if verdict.asks:
@@ -1338,11 +1347,38 @@ class McBodyPlugin(Star):
         (Usually you walk closer first with mc_goto / mc_follow to get the target into view.)"""
         if (deny := self._guard(event)):
             return deny
+        # 权限门（docs\22 §4）：准星制的 mc_attack 可能打到主人驯的宠物，所以先问服务端
+        # "准星指着的那只是谁"，再过闸。
+        # 注意： 自动反击（reflex.py 的 attackAt）按设计**不过闸** —— 挨打还手是保命，
+        #    物理优先级高于权限，那一条走的是另一条路。
+        data, err = await self._call("mcb attackTarget")
+        if err or not isinstance(data, dict):
+            return render.reword(err, "看不准星指着什么，这一下没打出去",
+                                 kind=render.Kind.BRIDGE,
+                                 hint="过几秒再试；一直这样的话用 mc_threats 看附近有什么")
+        if not data.get("hit"):
+            why = data.get("err")
+            why = "；".join(str(x) for x in why) if isinstance(why, list) else str(why or "")
+            return render.fail(
+                render.Kind.NOT_FOUND, "准星没指着任何实体，这一下没打出去",
+                detail=why,
+                usage="先用 mc_aim(x=…, y=…, z=…) 把视线锁到目标身上，或者 mc_goto 走近一点再试",
+                hint="要打某只东西，得先让准星对着它；挖方块不走这个工具",
+            )
+        facts = permission.Facts.from_attack_reply(data)
+        who = str(data.get("name") or data.get("type") or "那只")
+        refusal = await self._permit_or_refuse(
+            permission.Action(permission.Kind.ATTACK, entity=str(data.get("uuid") or "") or None),
+            f"攻击 {who}",
+            facts=facts,
+        )
+        if refusal:
+            return refusal
         _, err = await self._call("mcb attack")
         if err:
             return render.reword(err, "攻击失败", kind=render.Kind.BRIDGE,
                                 hint="先用 mc_state 看她在不在线、手上是不是武器")
-        return "已攻击准星指着的实体。过一会儿用 mc_state 看血量/效果。"
+        return f"已攻击 {who}。过一会儿用 mc_state 看血量/效果。"
 
     @filter.llm_tool(name="mc_threats")
     async def mc_threats(self, event: AstrMessageEvent):
