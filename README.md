@@ -233,7 +233,17 @@
 
 ## 服务端侧
 
-本插件依赖 Minecraft 服务端上的 KubeJS 桥接脚本，命令契约（RCON 里发的是**不带斜杠**的裸命令）：
+本插件依赖 Minecraft 那一侧的 KubeJS 桥接脚本 —— **在 [`bridge/`](bridge/) 目录里**：
+
+| 文件 | 去哪 |
+|---|---|
+| `bridge/server/mcbridge_server.js` | Minecraft **服务端**的 `kubejs/server_scripts/` |
+| `bridge/client/mcbridge.js` | 角色**客户端**的 `kubejs/client_scripts/` |
+| `bridge/launcher/` | 客户端启动器 + 容器镜像（重建环境时才用） |
+
+**完整部署步骤（含生效方式和排错）：[`bridge/DEPLOY.md`](bridge/DEPLOY.md)。**
+
+命令契约（RCON 里发的是**不带斜杠**的裸命令）：
 
 | 命令 | 返回 |
 |---|---|
@@ -241,13 +251,11 @@
 | `mcb state` | 玩家坐标 / 血量 / 维度等即时数据 |
 | （桥不可用时） | `MCB_FAIL: <原因>` |
 
-脚本与完整契约见作者自己的整合包项目文档（**本仓库不含服务端脚本**）。
-
 ## 开发
 
 ```
 main.py            插件入口、工具定义、授权（_guard）与调用壳（_call）
-mcb/               所有实现
+mcb/               所有实现（纯 Python，跑在 AstrBot 里）
   rcon.py          RCON 客户端 + 桥的薄封装（自己实现，处理粘包/拆包）
   render.py        把数据变成给模型看的文本（只许纯函数）
   reflex.py        保命反射（不过 LLM）
@@ -261,12 +269,21 @@ mcb/               所有实现
   events.py        事件流 + 背包 diff
   sight.py         截图 → 识图 API → 文字
   uplink.py        聊天上行
+
+bridge/            跑在 Minecraft 那一侧的脚本（**不在 AstrBot 里**）
+  DEPLOY.md        怎么部署、怎么生效、怎么排错
+  server/          服务端桥（KubeJS）
+  client/          客户端桥（KubeJS）
+  launcher/        客户端启动器 + 容器镜像
 ```
 
 工具方法本身仍在 `main.py` 里（拆出去要动 AstrBot `@filter.llm_tool` 的继承行为，风险大，暂时不动）。
 
-> ⚠️ **改完插件记得两件事**：① 先跑打桩自检 ② **把文件复制到 AstrBot 的 `data/plugins/`**
-> —— 开发目录和运行目录是两处，光"重载"不算。
+> ⚠️ **改完记得两件事**：
+> ① 插件 `.py` —— 先跑打桩自检，再**把文件复制到 AstrBot 的 `data/plugins/`**
+> （开发目录和运行目录是两处，光"重载"不算）
+> ② `bridge/` 下的脚本 —— 按 [`bridge/DEPLOY.md`](bridge/DEPLOY.md) 部署，
+> 客户端脚本**先 `node --check`**
 
 ## 许可
 
