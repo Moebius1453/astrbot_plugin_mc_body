@@ -1,16 +1,16 @@
 """冶炼 —— 熔炉那一趟活。
 
-## 这一层是**薄的**（按 docs/11 的硬规矩）
+## 这一层是薄的（按 docs/11 的硬规矩）
 
-真正干活的是 `containers.py` 的通用原语：`open_block`（走过去+开容器）
-和 `ContainerIO`（点格子）。**这里没有发明任何新机制**，只多三件事：
+真正干活的是 containers.py 的通用原语：open_block（走过去+开容器）
+和 ContainerIO（点格子）。这里没有发明任何新机制，只多三件事：
 
-  1. **挑配方** —— 产物有好几个冶炼配方（铁矿/深层铁矿/粉碎矿…），
-     要挑**她身上真的有料**的那一个，而不是报"缺铁矿"却让她身上揣着生铁干瞪眼
-  2. **配燃料** —— 从一组候选里挑一个她有的
-  3. **等烧完** —— 熔炉是**加工类容器**（`wait: True`），跟合成不一样，放进去还得等
+  1. 挑配方 —— 产物有好几个冶炼配方（铁矿/深层铁矿/粉碎矿…），
+     要挑她身上真的有料的那一个，而不是报"缺铁矿"却让她身上揣着生铁干瞪眼
+  2. 配燃料 —— 从一组候选里挑一个她有的
+  3. 等烧完 —— 熔炉是加工类容器（wait: True），跟合成不一样，放进去还得等
 
-⚠️ **没有"冶炼函数"这种东西**：熔炉/高炉/烟熏炉在 `CONTAINERS` 里**各是一行表**，
+注意： 没有"冶炼函数"这种东西：熔炉/高炉/烟熏炉在 CONTAINERS 里各是一行表，
 共用同一套原语。想加高炉，加一行表就行 —— 别在这儿写第二个函数。
 """
 
@@ -22,16 +22,16 @@ from astrbot.api import logger
 
 from .containers import ContainerIO, open_block
 
-# 熔炉类方块 → 期望开出来的界面类型（用来确认"真的开对了"）
+# 熔炉类方块  ->  期望开出来的界面类型（用来确认"真的开对了"）
 FURNACE_BLOCK = "minecraft:furnace"
 FURNACE_CLS = "FurnaceMenu"
 
-# 走到熔炉附近再开。⚠️ 服务端 `mcb scan` 的半径**由预算钳制**（2026-10-10 起），
+# 走到熔炉附近再开。注意： 服务端 mcb scan 的半径由预算钳制（2026-10-10 起），
 # 传 16 实际只扫到约 11 —— 再大就是几百毫秒的 tick 卡顿（实测 Rhino 每格 ~10µs）。
 FURNACE_RADIUS = 16
 
-# 燃料候选。**只放"塞进熔炉燃料格一定能烧"的东西**，并按耐烧程度排序。
-# ⚠️ 木制品的燃烧时间差很多（木板 15 秒 / 木棍 5 秒），排在煤炭后面只是聊胜于无。
+# 燃料候选。只放"塞进熔炉燃料格一定能烧"的东西，并按耐烧程度排序。
+# 注意： 木制品的燃烧时间差很多（木板 15 秒 / 木棍 5 秒），排在煤炭后面只是聊胜于无。
 FUELS = (
     "minecraft:coal",
     "minecraft:charcoal",
@@ -49,7 +49,7 @@ POLL = 2.0
 
 
 class Smelter:
-    """一趟冶炼。**用完就扔**，不持有状态。"""
+    """一趟冶炼。用完就扔，不持有状态。"""
 
     def __init__(self, bridge, journal=None) -> None:
         self.bridge = bridge
@@ -92,12 +92,12 @@ class Smelter:
         return out
 
     async def find_recipe(self, target: str) -> tuple[str, list[str]] | None:
-        """给产物名，找一个**她身上真有料**的冶炼配方。
+        """给产物名，找一个她身上真有料的冶炼配方。
 
-        返回 `(配方id, 候选原料列表)`；没有可做的返回 None。
+        返回 (配方id, 候选原料列表)；没有可做的返回 None。
 
-        ⚠️ 一个产物往往有好几个冶炼配方（`iron_ingot` 就有：铁矿 / 深层铁矿 /
-        粉碎矿 / 生铁…）。**必须挑她有的那个** —— 否则会报"缺铁矿石"，
+        注意： 一个产物往往有好几个冶炼配方（iron_ingot 就有：铁矿 / 深层铁矿 /
+        粉碎矿 / 生铁…）。必须挑她有的那个 —— 否则会报"缺铁矿石"，
         而她身上明明揣着生铁。
         """
         data = await self._call(f"mcb recipe {target}")
@@ -123,7 +123,7 @@ class Smelter:
         return None
 
     async def smelt(self, target: str) -> str:
-        """把 `target` 炼出来。返回一句人话（工具直接回给模型）。"""
+        """把 target 炼出来。返回一句人话（工具直接回给模型）。"""
         name = str(target or "").strip()
         if not name:
             return "没说要炼什么。"
@@ -154,7 +154,7 @@ class Smelter:
         ok, why = await open_block(self.bridge, FURNACE_BLOCK, io, FURNACE_CLS,
                                    radius=FURNACE_RADIUS)
         if not ok:
-            # ⚠️ **报具体哪一步断的**，别混成一句 —— 见 containers.open_block 的说明
+            # 注意： 报具体哪一步断的，别混成一句 —— 见 containers.open_block 的说明
             return (
                 f"开不了熔炉：{why}。"
                 f"（服务端扫描半径上限 {FURNACE_RADIUS} 格 —— 站远了她就看不见）"
@@ -175,7 +175,7 @@ class Smelter:
             await self._close(io)
             return "放燃料失败了。"
 
-        # ⚠️ 熔炉是**加工类**：放进去还得**等**。合成是"放了立刻有"，这个不是。
+        # 注意： 熔炉是加工类：放进去还得等。合成是"放了立刻有"，这个不是。
         waited = 0.0
         while waited < SMELT_TIMEOUT:
             await asyncio.sleep(POLL)
@@ -204,5 +204,5 @@ class Smelter:
         return f"烧好了 **{name} ×{got}**（原料 {cands[0]}，燃料 {fuel[0].split(':')[-1]}）。"
 
     async def _close(self, io: ContainerIO) -> None:
-        """关界面。⚠️ 必须能关掉 —— 界面开着的时候她动不了（docs/04 坑 10s）。"""
+        """关界面。注意： 必须能关掉 —— 界面开着的时候她动不了（docs/04 坑 10s）。"""
         await io.bridge.call("mcb closeGui")

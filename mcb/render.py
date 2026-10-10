@@ -1,13 +1,13 @@
-"""把桥回来的数据变成**给模型看的中文**。
+"""把桥回来的数据变成给模型看的中文。
 
-**所有** `describe_*` 都在这 —— 别把它们再塞回 `main.py`。
-理由：工具方法应该只管"授权 → 调桥 → 返回"，措辞是另一件事，
-混在一起会让 `main.py` 越滚越大（它曾经 853 行、18 个工具）。
+所有 describe_* 都在这 —— 别把它们再塞回 main.py。
+理由：工具方法应该只管"授权  ->  调桥  ->  返回"，措辞是另一件事，
+混在一起会让 main.py 越滚越大（它曾经 853 行、18 个工具）。
 
-⚠️ 这里的措辞**是模型唯一看得见的东西**，要说清"这是什么、意味着什么、下一步该干嘛"。
+注意： 这里的措辞是模型唯一看得见的东西，要说清"这是什么、意味着什么、下一步该干嘛"。
 
-⚠️⚠️ **本文件是纯函数，不许 import 插件里的别的东西、不许有工具方法。**
-（踩过：`mc_craft` 那个 `@filter.llm_tool` 曾经被误搬到这里，而这里没有 `filter`，
+注意：注意： 本文件是纯函数，不许 import 插件里的别的东西、不许有工具方法。
+（踩过：mc_craft 那个 @filter.llm_tool 曾经被误搬到这里，而这里没有 filter，
 插件直接加载失败 —— 见 docs/11。）
 """
 
@@ -16,29 +16,29 @@ from __future__ import annotations
 
 # ---- 失败的三段式（抄 Numen，见 docs\25 §三 1.1）----------------------
 #
-# ⚠️ **为什么要统一**：模型收到一句"没能让她出发：桥断了"之后**不知道该干什么** ——
-#    是换个参数？等她上线？还是这条路根本走不通？**它只能瞎猜或者放弃。**
+# 注意： 为什么要统一：模型收到一句"没能让她出发：桥断了"之后不知道该干什么 ——
+#    是换个参数？等她上线？还是这条路根本走不通？它只能瞎猜或者放弃。
 #
-#    Numen 的做法（`docs\19` §一.3）：失败**不是 JSON，是固定形状的几行文本**。
-#    它试过给结构化 JSON，最后**明确把 `data` 字段删了** —— 原话是"模型会把它
-#    连同文字一起读进去"，反而更乱。所以我们返回**文本**，形状固定：
+#    Numen 的做法（docs\19 §一.3）：失败不是 JSON，是固定形状的几行文本。
+#    它试过给结构化 JSON，最后明确把 data 字段删了 —— 原话是"模型会把它
+#    连同文字一起读进去"，反而更乱。所以我们返回文本，形状固定：
 #
 #         <第一行：一句话说清发生了什么>
 #         error: <kind> —— 错在哪，点名参数与它的值>
-#         usage: <正确写法>            ← 可省
-#         hint:  <能直接照抄的下一行>   ← 可省
+#         usage: <正确写法>             <-  可省
+#         hint:  <能直接照抄的下一行>    <-  可省
 #
-# ⭐ **`hint` 是最值钱的一行**：它必须是**下一次调用**（`mc_goto x=… z=…`），
+# ⭐ hint 是最值钱的一行：它必须是下一次调用（mc_goto x=… z=…），
 #    不是"你可以试试走过去"这种话。模型照抄就能重试。
 #
-# ⚠️ **`kind` 由调用方显式给，绝不从错误文本里猜** ——
-#    Numen 的 `ToolOutcome` 类注释专门骂过旧实现 `contains("\"error\"")` 的误判：
-#    **拿关键词猜只会误判**。
+# 注意： kind 由调用方显式给，绝不从错误文本里猜 ——
+#    Numen 的 ToolOutcome 类注释专门骂过旧实现 contains("\"error\"") 的误判：
+#    拿关键词猜只会误判。
 
 class Kind:
-    """失败的种类。**抄 Numen `ErrorKind` 的子集**（它 14 个，挑我们真有的）。
+    """失败的种类。抄 Numen ErrorKind 的子集（它 14 个，挑我们真有的）。
 
-    ⚠️ 加新种类前先问：**模型拿到这个种类，能做出不一样的事吗？**
+    注意： 加新种类前先问：模型拿到这个种类，能做出不一样的事吗？
     不能的话就别加 —— 种类太多等于没有种类。
     """
 
@@ -58,7 +58,7 @@ class Kind:
 
 def fail(kind: str, what: str, detail: str = "", usage: str = "",
          hint: str = "") -> str:
-    """拼一条失败回执。**形状固定**，见本段开头的说明。"""
+    """拼一条失败回执。形状固定，见本段开头的说明。"""
     lines = [what]
     lines.append(f"error: {kind}" + (f" —— {detail}" if detail else ""))
     if usage:
@@ -70,10 +70,10 @@ def fail(kind: str, what: str, detail: str = "", usage: str = "",
 
 def reword(err, what: str, kind: str = Kind.FAILED, detail: str = "",
            usage: str = "", hint: str = "") -> str:
-    """把 `_call` / 仲裁层回来的一句错误，包成三段式。
+    """把 _call / 仲裁层回来的一句错误，包成三段式。
 
-    `err` 是桥或仲裁层给的**原始错误文本**（可为 None）——
-    没拿到就把 `detail` 换成"桥没说原因"。
+    err 是桥或仲裁层给的原始错误文本（可为 None）——
+    没拿到就把 detail 换成"桥没说原因"。
     """
     return fail(kind, what, detail=str(err or detail or "桥没说原因"),
                 usage=usage, hint=hint)
@@ -82,7 +82,7 @@ def reword(err, what: str, kind: str = Kind.FAILED, detail: str = "",
 # ---- 界面 -----------------------------------------------------------
 
 def _menu_items(menu) -> dict[int, tuple[str, int]] | None:
-    """菜单 → `{格号: (物品名, 数量)}`。读不到返回 None（**不是空 dict**）。"""
+    """菜单  ->  {格号: (物品名, 数量)}。读不到返回 None（不是空 dict）。"""
     if not isinstance(menu, dict):
         return None
     out: dict[int, tuple[str, int]] = {}
@@ -102,11 +102,11 @@ def _menu_items(menu) -> dict[int, tuple[str, int]] | None:
 
 
 def describe_click_result(slot, mode, before, after) -> str:
-    """点完一格**当场对账** —— 拿点之前的界面快照和点之后比。
+    """点完一格当场对账 —— 拿点之前的界面快照和点之后比。
 
-    抄 Numen `ContainerOps.route/place`（点完当场 diff 前后格子并回一句人话），
-    理由（`docs\\25` §三 1.8）：原来只回"过一会儿用 mc_inventory 自己看" ——
-    **那是把验证甩给一个不会去验证的人**（`docs\\17` D3 那条教训）。
+    抄 Numen ContainerOps.route/place（点完当场 diff 前后格子并回一句人话），
+    理由（docs\\25 §三 1.8）：原来只回"过一会儿用 mc_inventory 自己看" ——
+    那是把验证甩给一个不会去验证的人（docs\\17 D3 那条教训）。
     """
     a = _menu_items(after)
     if a is None:
@@ -115,7 +115,7 @@ def describe_click_result(slot, mode, before, after) -> str:
             "hint: 过几秒用 `mc_menu` 看一次；一直读不到就用 `mc_state` 看她在不在线"
         )
 
-    # 🔴 界面被顶掉了 —— 这一下多半点在**另一个容器**上（`docs\\04` 坑 13）
+    # 重要： 界面被顶掉了 —— 这一下多半点在另一个容器上（docs\\04 坑 13）
     b_id = before.get("id") if isinstance(before, dict) else None
     a_id = after.get("id")
     if b_id is not None and a_id is not None and b_id != a_id:
@@ -188,7 +188,7 @@ def describe_menu(data: dict) -> str:
 
 def describe_state(data: dict, stance: str = "defend", work: dict | None = None,
                    journal=None) -> str:
-    """她现在的样子 —— **身体状态 + 正在做的事 + 最近发生的事**。
+    """她现在的样子 —— 身体状态 + 正在做的事 + 最近发生的事。
 
     三块缺一不可：只有身体数字，白不知道自己刚才干了什么（用户 2026-10-09
     要的「让她可以感知到，表现出来她知道她在干什么」）。
@@ -211,7 +211,7 @@ def describe_state(data: dict, stance: str = "defend", work: dict | None = None,
         parts.append(f"维度 {str(dim).removeprefix('minecraft:')}")
 
     # 朝向 —— 和状态包里同一个理由（2026-10-10）：她自己读不到"头朝哪"，
-    # 用户问她"你怎么一直低头"时她只能编。这里用 `describe_look` 那套措辞，保持一致。
+    # 用户问她"你怎么一直低头"时她只能编。这里用 describe_look 那套措辞，保持一致。
     facing = data.get("facing")
     if facing:
         pitch = data.get("pitch")
@@ -223,7 +223,7 @@ def describe_state(data: dict, stance: str = "defend", work: dict | None = None,
                 extra = "，基本在往下看"
         parts.append(f"面朝{_COMPASS_CN.get(str(facing), str(facing))}{extra}")
 
-    # 时间 / 天气 —— "现在几点、下没下雨"。**不做解读**（不写"该收工了"）
+    # 时间 / 天气 —— "现在几点、下没下雨"。不做解读（不写"该收工了"）
     env = data.get("env") if isinstance(data.get("env"), dict) else {}
     hhmm = env.get("hhmm")
     if isinstance(hhmm, str) and hhmm:
@@ -259,7 +259,7 @@ def describe_state(data: dict, stance: str = "defend", work: dict | None = None,
 
 
 def describe_work(work: dict | None) -> str:
-    """**任务层在做什么。** 这就是「她知道自己正在干什么」那一句。"""
+    """任务层在做什么。 这就是「她知道自己正在干什么」那一句。"""
     if not isinstance(work, dict):
         return "正在做的事：没有任务在跑。"
 
@@ -283,7 +283,7 @@ def describe_work(work: dict | None) -> str:
 
 
 def describe_path(task: object) -> str:
-    """客户端上报的 **Baritone 寻路**状态（跟上面的「任务层」不是一回事）。"""
+    """客户端上报的 Baritone 寻路状态（跟上面的「任务层」不是一回事）。"""
     if not isinstance(task, dict) or not task.get("available"):
         reason = (task or {}).get("reason") if isinstance(task, dict) else None
         return f"寻路：**未知** —— {reason or '客户端没有上报状态'}"
@@ -395,10 +395,10 @@ _FACE_CN = {"up": "顶面", "down": "底面", "north": "北面", "south": "南�
 
 
 def describe_look(data: dict, places=None) -> str:
-    """把 `mcb lookat` 的结果说清楚 —— "我正看着什么"。
+    """把 mcb lookat 的结果说清楚 —— "我正看着什么"。
 
-    ⚠️ 服务端给的是**近似**（用的是服务端收到的朝向，约一 tick 延迟），
-    不是客户端真正渲染的那一帧。数据里 `err` 非空时要如实报出来。
+    注意： 服务端给的是近似（用的是服务端收到的朝向，约一 tick 延迟），
+    不是客户端真正渲染的那一帧。数据里 err 非空时要如实报出来。
     """
     if not isinstance(data, dict):
         return "看不了：桥返回的不是数据。"
@@ -423,7 +423,7 @@ def describe_look(data: dict, places=None) -> str:
             f"你正看着 **{blk.get('id')}**{where}，距 {_num(blk.get('dist'))} 格（对着它的{face}）"
         )
         # 中间隔着玻璃/树叶这类"看得穿但摸得着"的东西 —— 报出来，
-        # 否则她会以为眼前空着（服务端射线**刻意**看得穿它们，见 mcbRayBlock）
+        # 否则她会以为眼前空着（服务端射线刻意看得穿它们，见 mcbRayBlock）
         thru = data.get("through")
         if isinstance(thru, dict):
             tpos = thru.get("pos") if isinstance(thru.get("pos"), list) else []
@@ -474,10 +474,10 @@ def describe_look(data: dict, places=None) -> str:
 # ---- 周边概览（mc_around）---------------------------------------------------
 
 def describe_around(data: dict, t2: dict | None = None) -> str:
-    """把 `mcb around` 的结果说清楚 —— "我周围有什么"。
+    """把 mcb around 的结果说清楚 —— "我周围有什么"。
 
-    `t2` 是**第二层**（`mcb t2`，跨 tick 全分辨率扫描）的状态或结果，可能没有。
-    ⚠️ 有 T2 结果时，那句"没有方块实体的设施我看不见"的**缺口说明要撤掉** ——
+    t2 是第二层（mcb t2，跨 tick 全分辨率扫描）的状态或结果，可能没有。
+    注意： 有 T2 结果时，那句"没有方块实体的设施我看不见"的缺口说明要撤掉 ——
     否则她会在明明拿到了工作台坐标的情况下还说"附近没有工作台"。
     """
     if not isinstance(data, dict):
@@ -540,7 +540,7 @@ def describe_around(data: dict, t2: dict | None = None) -> str:
     done = isinstance(t2, dict) and t2.get("job") == "done"
     lines.extend(_around_deep(t2, done))
 
-    # ⚠️ 缺口只在**第二层还没给出结果**时才说 —— 拿到了还说"看不见"是自相矛盾
+    # 注意： 缺口只在第二层还没给出结果时才说 —— 拿到了还说"看不见"是自相矛盾
     if not done:
         lines.append(
             "⚠️ **上面这个列表只含「有方块实体」的东西**（箱子/熔炉/木桶/床/告示牌/刷怪笼/传送门…）。"
@@ -554,7 +554,7 @@ def describe_around(data: dict, t2: dict | None = None) -> str:
 
 
 def _around_deep(t2: dict | None, done: bool) -> list[str]:
-    """`mc_around` 的第二层（T2）那几行。**没有 T2 就返回空**，别硬凑。"""
+    """mc_around 的第二层（T2）那几行。没有 T2 就返回空，别硬凑。"""
     if not isinstance(t2, dict):
         return []
     job = t2.get("job")
@@ -596,7 +596,7 @@ def _around_deep(t2: dict | None, done: bool) -> list[str]:
     else:
         out.append("  · **一个都没有** —— 这一片确实没有工作台/铁砧/石切机/堆肥桶这类东西")
 
-    # 完整方块计数：**只报"有用的"** —— 石头泥土水这些噪音不占篇幅
+    # 完整方块计数：只报"有用的" —— 石头泥土水这些噪音不占篇幅
     types = t2.get("types") or []
     useful = []
     for t in types:
@@ -618,7 +618,7 @@ def _around_deep(t2: dict | None, done: bool) -> list[str]:
 # ---- 查玩家位置（mc_where）--------------------------------------------------
 
 def describe_where(data: dict, who: str) -> str:
-    """把 `mcb where` 的结果说清楚。"""
+    """把 mcb where 的结果说清楚。"""
     if not isinstance(data, dict):
         return f"查不到 {who}。"
 
@@ -657,27 +657,27 @@ def describe_catalog(catalog: list[dict]) -> str:
 
 # ---- 状态数据包 -------------------------------------------------------------
 #
-# ⚠️⚠️ **这是"感知"那一块，规矩跟上面所有 describe_* 都不一样。**
+# 注意：注意： 这是"感知"那一块，规矩跟上面所有 describe_* 都不一样。
 #
 # 用户 2026-10-09 拍板（原话）：
 #   > "感知我是没法接受程序文本的。必须是如同上文附加在末尾一样，
 #   >   规定一个包含信息的状态数据包让她知道处境。"
 #
-# 区别**不是措辞问题**：
-#   ❌ `[身体] 我饿了（饱食度 6），但身上没有食物。` —— 程序替她写的**台词**
-#   ✅ `food=6/20 food_items=0`                      —— 关于她身体的**数据**
+# 区别不是措辞问题：
+#   不成立或禁止： [身体] 我饿了（饱食度 6），但身上没有食物。 —— 程序替她写的台词
+#   已完成： food=6/20 food_items=0                      —— 关于她身体的数据
 #
-# **程序只负责把状态摆出来，不负责说出来。**
+# 程序只负责把状态摆出来，不负责说出来。
 # 凡是"她会用第一人称讲的话"，一律不许出现在这里。
 #
 # 另外三条：
-#   · **不做任何解读** —— 不许写"（危险）""（该吃了）"。那是她的判断
-#   · **缺失写 `?` 不写 0** —— 把"读不到"和"没有"分开（docs/04 坑 10f）
-#   · **字段名要短** —— 每次 LLM 请求都要重发，是按字收费的
+#   · 不做任何解读 —— 不许写"（危险）""（该吃了）"。那是她的判断
+#   · 缺失写 ? 不写 0 —— 把"读不到"和"没有"分开（docs/04 坑 10f）
+#   · 字段名要短 —— 每次 LLM 请求都要重发，是按字收费的
 
 
 def _num(value, fmt: str = "g") -> str:
-    """数值渲染。**读不到回 `?`，不回 0** —— 把"不知道"和"零"分开。"""
+    """数值渲染。读不到回 ?，不回 0 —— 把"不知道"和"零"分开。"""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return "?"
     return format(value, fmt)
@@ -686,7 +686,7 @@ def _num(value, fmt: str = "g") -> str:
 def state_packet(data: dict, stance: str = "defend", work: dict | None = None,
                  journal=None, places=None, chat=None, *, log_lines: int = 4,
                  wiring: bool = True, instincts: str = "") -> str:
-    """**紧凑的状态数据包** —— 纯数据，给白当处境感知用。
+    """紧凑的状态数据包 —— 纯数据，给白当处境感知用。
 
     形如：
 
@@ -704,10 +704,10 @@ def state_packet(data: dict, stance: str = "defend", work: dict | None = None,
     body = [f"pos={_num(data.get('x'), '.1f')},{_num(data.get('y'), '.1f')},{_num(data.get('z'), '.1f')}"]
     dim = str(data.get("dim") or "").removeprefix("minecraft:")
     body.append(f"dim={dim or '?'}")
-    # 🧭 朝向 —— **她自己看不见自己的头朝哪**（2026-10-10 用户实报："她声称自己没低头，
-    #    但一直是低头状态"，现场服务端读到 `pitch:81.3`）。
-    #    以前只有 `mc_lookat` 吐过这个信息，而她不会去问那个问题 ——
-    #    **状态包里有，才算她"知道"**（律④：能力自我认知 = 工具表 + 状态包）。
+    #  朝向 —— 她自己看不见自己的头朝哪（2026-10-10 用户实报："她声称自己没低头，
+    #    但一直是低头状态"，现场服务端读到 pitch:81.3）。
+    #    以前只有 mc_lookat 吐过这个信息，而她不会去问那个问题 ——
+    #    状态包里有，才算她"知道"（律4：能力自我认知 = 工具表 + 状态包）。
     facing = str(data.get("facing") or "")
     if facing:
         body.append(f"face={facing}")
@@ -732,10 +732,10 @@ def state_packet(data: dict, stance: str = "defend", work: dict | None = None,
     else:
         weather = "?"          # 读不到 ≠ 晴天（docs/04 坑 10f）
     body.append(f"w={weather}")
-    # 氧气 / 在水里 —— **只在"值得说"的时候才占字数**（没在水里就不写 `water=no`）。
-    # ⚠️ 为什么要这一维：溺水是"会慢慢死、但血量不一定掉"的情形。
-    #    实测她卡在水里 253 秒、`drown` 每秒一条，但 `dmg=0`（身上挂着抗性 V），
-    #    **反射只看 hp 就永远不触发**。→ 凡是要保命的判据，都得从"状态"判。
+    # 氧气 / 在水里 —— 只在"值得说"的时候才占字数（没在水里就不写 water=no）。
+    # 注意： 为什么要这一维：溺水是"会慢慢死、但血量不一定掉"的情形。
+    #    实测她卡在水里 253 秒、drown 每秒一条，但 dmg=0（身上挂着抗性 V），
+    #    反射只看 hp 就永远不触发。 ->  凡是要保命的判据，都得从"状态"判。
     air = data.get("air")
     in_water = data.get("inWater")
     under = data.get("underWater")
@@ -777,13 +777,13 @@ def state_packet(data: dict, stance: str = "defend", work: dict | None = None,
         lines.append(chat_text)
 
     # ---- 接线说明 ----
-    # ⚠️ **和上面那些数据一起给**，不放到系统提示词里 ——
+    # 注意： 和上面那些数据一起给，不放到系统提示词里 ——
     #    它解释的就是上面那几个字段，分开放她会拼不起来（用户 2026-10-10 定：
     #    "提示词交代应该配合上下文注入"）。
     if wiring:
-        # ⭐ **本能名册也在这一档**：反射是"程序替她做的决定"，
-        #    不交代的话她既无法否决、也无法解释（`docs\25` §三 1.2）。
-        #    文本由 `mcb\reflexes.py` 出 —— **本文件保持纯函数，不 import 插件里的别的东西**。
+        # ⭐ 本能名册也在这一档：反射是"程序替她做的决定"，
+        #    不交代的话她既无法否决、也无法解释（docs\25 §三 1.2）。
+        #    文本由 mcb\reflexes.py 出 —— 本文件保持纯函数，不 import 插件里的别的东西。
         if instincts:
             lines.append(instincts)
         lines.append(WIRING_NOTE)
@@ -793,16 +793,16 @@ def state_packet(data: dict, stance: str = "defend", work: dict | None = None,
 
 # ---- 接线说明（英文，见 token_check.py 的实测）-------------------------------
 #
-# ⚠️ **这段的存在理由**（2026-10-10 实测）：
-#    白在 QQ 被问"你能不能感知游戏内聊天"，她答"**我听不见**，我手头的传感器只有
-#    身体状态、血量和方块交互" —— 她说得**字面上完全正确**，因为我们**真的没有**
-#    一个"读聊天"的工具。她的能力自我认知 = **工具表 + 状态包**，
+# 注意： 这段的存在理由（2026-10-10 实测）：
+#    白在 QQ 被问"你能不能感知游戏内聊天"，她答"我听不见，我手头的传感器只有
+#    身体状态、血量和方块交互" —— 她说得字面上完全正确，因为我们真的没有
+#    一个"读聊天"的工具。她的能力自我认知 = 工具表 + 状态包，
 #    凡是 harness 替她做的事（uplink 注入 / 反射 / 事件流），在她那儿等于不存在。
 #
-#    所以这段必须**明确交代接线**，否则她会一直否认自己有的能力。
+#    所以这段必须明确交代接线，否则她会一直否认自己有的能力。
 #
-# ⚠️ 用**英文**：实测同等内容英文省 1.5~2.2 倍 token，而这段每次注入都要重发。
-#    详见 `_AI工作区\mc-brain\plugin-check\token_check.py`。
+# 注意： 用英文：实测同等内容英文省 1.5~2.2 倍 token，而这段每次注入都要重发。
+#    详见 _AI工作区\mc-brain\plugin-check\token_check.py。
 WIRING_NOTE = (
     "[wiring] Everything tagged [mc:*] is the state of the MINECRAFT WORLD — a game. "
     "It is NOT the real world and not your user's real surroundings: if [mc:body] says "
@@ -824,9 +824,9 @@ CHAT_LINES = 8
 
 
 def chat_section(lines, *, limit: int = CHAT_LINES) -> str:
-    """`[chat]` 段 —— 游戏公屏里她**听到的**话。
+    """[chat] 段 —— 游戏公屏里她听到的话。
 
-    ⚠️ **带说话人和他在哪**（用户 2026-10-10 定的）：她视距只有 32 格，
+    注意： 带说话人和他在哪（用户 2026-10-10 定的）：她视距只有 32 格，
     出了这个圈她看不见，"山那边"只能靠人告诉。真人也没有世界地图。
     """
     if not lines:
@@ -853,9 +853,9 @@ def chat_section(lines, *, limit: int = CHAT_LINES) -> str:
 
 
 def describe_chat(lines, count: int = 20) -> str:
-    """翻游戏公屏 —— 给 `mc_chat_log` 工具用的版本。
+    """翻游戏公屏 —— 给 mc_chat_log 工具用的版本。
 
-    比 `[chat]` 段宽松（那是**每轮重发**的，要抠字；这是**她要才给**的，可以说清楚）。
+    比 [chat] 段宽松（那是每轮重发的，要抠字；这是她要才给的，可以说清楚）。
     """
     rows = [x for x in (lines or []) if isinstance(x, dict)]
     try:

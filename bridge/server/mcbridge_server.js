@@ -1,12 +1,12 @@
 // 服务端侧桥 —— Nanako 的神经
 //
 // 三个方向：
-//   下行  RCON `/mcb <action>` → sendData('mcbridge') → 客户端脚本 → Baritone / sendChat
-//   回执  `event.respond(Component)` → RCON 读到            （见下 mcbReply）
-//   上行  玩家聊天 → PlayerEvents.chat → 环形缓冲 → `/mcb chat` 拉取
-//        客户端状态 → sendData('mcbridge_up') → 最新快照 → 并进 `/mcb state`
+//   下行  RCON /mcb <action>  ->  sendData('mcbridge')  ->  客户端脚本  ->  Baritone / sendChat
+//   回执  event.respond(Component)  ->  RCON 读到            （见下 mcbReply）
+//   上行  玩家聊天  ->  PlayerEvents.chat  ->  环形缓冲  ->  /mcb chat 拉取
+//        客户端状态  ->  sendData('mcbridge_up')  ->  最新快照  ->  并进 /mcb state
 //
-// 返回格式（**统一信封**，2026-10-09 起）：
+// 返回格式（统一信封，2026-10-09 起）：
 //   成功  MCB {"ok":true,"action":"state","data":{...}}
 //   失败  MCB {"ok":false,"action":"state","error":"Nanako 不在线"}
 //
@@ -19,32 +19,32 @@
 //   /mcb baritone <命令>          透传 Baritone（不带 #）
 //   /mcb stop                    取消寻路
 //
-// ⚠️ 服务端脚本改完 RCON `/reload` 热重载即可 —— 不重启服务端、不踢在线玩家。
-// ⚠️ 客户端脚本改完**必须重启客户端**，跟这份不是一回事。
-// ⚠️ Rhino 的坑（都踩过）：函数体内别用 const；别调 .getClass()；别用变量名 cls；
-//    **`event.source` 是死的**（Java 字段，Rhino 不暴露）—— 回执一律走 `event.respond()`。
+// 注意： 服务端脚本改完 RCON /reload 热重载即可 —— 不重启服务端、不踢在线玩家。
+// 注意： 客户端脚本改完必须重启客户端，跟这份不是一回事。
+// 注意： Rhino 的坑（都踩过）：函数体内别用 const；别调 .getClass()；别用变量名 cls；
+//    event.source 是死的（Java 字段，Rhino 不暴露）—— 回执一律走 event.respond()。
 
 const MCB_TARGET = 'Nanako'
-const MCB_CHANNEL_DOWN = 'mcbridge'      // 服务端 → 客户端
-const MCB_CHANNEL_UP = 'mcbridge_up'     // 客户端 → 服务端
+const MCB_CHANNEL_DOWN = 'mcbridge'      // 服务端  ->  客户端
+const MCB_CHANNEL_UP = 'mcbridge_up'     // 客户端  ->  服务端
 
 // --- 扫描预算（微秒是真的，别凭感觉调）-------------------------------------
 //
-// ⚠️⚠️ **2026-10-10 实测：Rhino 下每次 `getBlockState` 约 8~12 微秒**
-//    （原生 Java 约 0.1µs —— **差 50~100 倍**，因为每次调用都要过 JS↔Java 包装）。
-//    所以"50ms 能读多少格"= 50000 / 10 ≈ **5,000 格**，而不是几十万。
-//    每格 10µs 这个数**加大到 30 万次采样也没变**，不是 JIT 预热。要改参数先重测。
+// 注意：注意： 2026-10-10 实测：Rhino 下每次 getBlockState 约 8~12 微秒
+//    （原生 Java 约 0.1µs —— 差 50~100 倍，因为每次调用都要过 JS <-> Java 包装）。
+//    所以"50ms 能读多少格"= 50000 / 10 ≈ 5,000 格，而不是几十万。
+//    每格 10µs 这个数加大到 30 万次采样也没变，不是 JIT 预热。要改参数先重测。
 
-// `mcb scan` 一次最多读多少格方块（定点找方块用，球形体）
+// mcb scan 一次最多读多少格方块（定点找方块用，球形体）
 const MCB_SCAN_BUDGET = 6000
 
-// `mcb around`（周边概览）的两段预算，单位毫秒。
-// ⚠️ 实测典型耗时（2026-10-10，半径 6 / 抽样步长 8）：**首次 ~50ms，之后更快** ——
+// mcb around（周边概览）的两段预算，单位毫秒。
+// 注意： 实测典型耗时（2026-10-10，半径 6 / 抽样步长 8）：首次 ~50ms，之后更快 ——
 //    第一次调用要把没加载的 chunk 拉进来，后面走缓存。所以看到耗时忽高忽低是正常的。
-//    Minecraft 一个 tick 是 50ms —— 这已经是个能感觉到的尖峰，**调用别太频繁**。
+//    Minecraft 一个 tick 是 50ms —— 这已经是个能感觉到的尖峰，调用别太频繁。
 //    （真要频繁用，得走 T2：跨 tick 后台跑 + 读缓存。）
-const MCB_AROUND_MS_CHUNK = 45      // ① 走方块实体
-const MCB_AROUND_MS_SURFACE = 55    // ② heightmap 地表抽样（**累计**上限，不是每段）
+const MCB_AROUND_MS_CHUNK = 45      // 1 走方块实体
+const MCB_AROUND_MS_SURFACE = 55    // 2 heightmap 地表抽样（累计上限，不是每段）
 const MCB_AROUND_POI_MAX = 60       // 最多回多少条 POI（按距离取近的）
 const MCB_AROUND_SURFACE_MAX = 8    // 地表成分回前几种
 
@@ -81,7 +81,7 @@ function mcbServer(event) {
 }
 
 function mcbFindPlayer(server, name) {
-  // ⚠️ 别用 server.getPlayer(名字) —— 那个重载吃 UUID。
+  // 注意： 别用 server.getPlayer(名字) —— 那个重载吃 UUID。
   //    遍历在线列表逐个比 username。
   try {
     var list = server.players
@@ -96,11 +96,11 @@ function mcbFindPlayer(server, name) {
 }
 
 // 单调时钟（毫秒）。Rhino 下哪种写法能用是探出来的，不是猜的 ——
-// 之前只试过 `Java.loadClass('java.lang.System').currentTimeMillis()`，返回 0，是错的。
+// 之前只试过 Java.loadClass('java.lang.System').currentTimeMillis()，返回 0，是错的。
 //
-// ⚠️ **命中之后要把函数本身缓存下来**（`mcbClockFn`），不能只缓存名字再回去遍历数组 ——
-//    `mcbNowMs()` 是在**计时循环里**被调的（每次都建 `new Date()` + 走一遍闭包数组），
-//    Rhino 下这层开销本身就有几微秒，**等于拿一个会拖慢被测对象的秒表去量它**。
+// 注意： 命中之后要把函数本身缓存下来（mcbClockFn），不能只缓存名字再回去遍历数组 ——
+//    mcbNowMs() 是在计时循环里被调的（每次都建 new Date() + 走一遍闭包数组），
+//    Rhino 下这层开销本身就有几微秒，等于拿一个会拖慢被测对象的秒表去量它。
 var mcbClockWinner = null
 var mcbClockFn = null
 
@@ -128,7 +128,7 @@ function mcbNowMs() {
           mcbClockWinner = ways[i][0]
           console.info('[mcb] 时钟可用: ' + ways[i][0])
         }
-        mcbClockFn = ways[i][1]      // ← 缓存**函数**，下次直接调
+        mcbClockFn = ways[i][1]      //  <-  缓存函数，下次直接调
         return v
       }
     } catch (e) {
@@ -150,7 +150,7 @@ function mcbComponent(text) {
 }
 
 // 把文本回给命令源（RCON 会读到）。
-// 正路是 `event.respond(Component)` —— 实测一次命中；`event.source` 是死的。
+// 正路是 event.respond(Component) —— 实测一次命中；event.source 是死的。
 function mcbReply(event, text) {
   if (event === null || event === undefined) return false
   var comp = mcbComponent(text)
@@ -189,9 +189,9 @@ function mcbErr(event, action, message) {
 // --- 上行之一：客户端状态快照 ----------------------------------------------
 //
 // 客户端脚本定时把 Baritone 状态 sendData('mcbridge_up') 上来。
-// 这里只存"最新一份 + 到达时刻"，读的时候做**陈旧判定**。
+// 这里只存"最新一份 + 到达时刻"，读的时候做陈旧判定。
 //
-// ⚠️ 两条纪律：
+// 注意： 两条纪律：
 //   1. 陈旧 ≠ 当前 —— 客户端崩了/没起来，快照会冻住，必须能看出来
 //   2. 缺失 ≠ 空闲 —— "从没收到过" 和 "她确实在发呆" 是两回事
 
@@ -243,7 +243,7 @@ function mcbTagStr(tag, key) {
 
 function mcbTagNum(tag, key) {
   if (tag === null || tag === undefined) return null
-  // ⚠️ 必须先 contains 再取值 —— CompoundTag.getDouble(不存在的键) 返回 **0.0**，
+  // 注意： 必须先 contains 再取值 —— CompoundTag.getDouble(不存在的键) 返回 0.0，
   //    不是 null。「缺失」被当成 0 会让下游说"还剩 0 格"，是假信息。
   var has = false
   try {
@@ -264,8 +264,8 @@ function mcbTagNum(tag, key) {
 }
 
 // 上行里的 menu 是客户端序列化好的一串 JSON（见 mcbridge.js）。
-// ⚠️ `mcbTagStr` 对**不存在的键**返回 `''`（字符串没有 getDouble 那个 0.0 陷阱），
-//    所以这里把 `''` 当"没有"。
+// 注意： mcbTagStr 对不存在的键返回 ''（字符串没有 getDouble 那个 0.0 陷阱），
+//    所以这里把 '' 当"没有"。
 function mcbParseJsonField(s) {
   if (s === null || s === undefined) return null
   var t = String(s)
@@ -299,9 +299,9 @@ function mcbTaskSnapshot() {
     posX: mcbUpData.posX,
     posY: mcbUpData.posY,
     posZ: mcbUpData.posZ,
-    // ⚠️ **客户端自己的朝向** —— 和 `mcbPlayerState` 里那个（服务端收到的）**不是一回事**。
-    //    Baritone 的 `SERVER` 模式是"静默转"：服务端收到一个朝向、本地画面是另一个。
-    //    调试 aim 时必须看这两个的**差值**，否则会把"转了但没同步"误判成"没转"。
+    // 注意： 客户端自己的朝向 —— 和 mcbPlayerState 里那个（服务端收到的）不是一回事。
+    //    Baritone 的 SERVER 模式是"静默转"：服务端收到一个朝向、本地画面是另一个。
+    //    调试 aim 时必须看这两个的差值，否则会把"转了但没同步"误判成"没转"。
     cliYaw: mcbUpData.yaw,
     cliPitch: mcbUpData.pitch,
     // 当前打开的界面（容器/工作台/背包合成格）。合成和拿箱子全靠它。
@@ -311,8 +311,8 @@ function mcbTaskSnapshot() {
 
 // --- 上行之二：聊天环形缓冲 -------------------------------------------------
 //
-// ⚠️ 不在这里过滤 Nanako —— 她自己的发言也要留档（AstrBot 侧要拿它当
-//    "你刚才说过…" 的上下文前缀）。谁的话能唤醒白是**策略**，在插件里判。
+// 注意： 不在这里过滤 Nanako —— 她自己的发言也要留档（AstrBot 侧要拿它当
+//    "你刚才说过…" 的上下文前缀）。谁的话能唤醒白是策略，在插件里判。
 
 const MCB_CHAT_MAX = 300
 const MCB_CHAT_PAGE = 50
@@ -331,10 +331,10 @@ PlayerEvents.chat(event => {
     }
     if (txt.length > 256) txt = txt.substring(0, 256) + '…'
 
-    // ⚠️ **说话的人在哪儿** —— 她才知道"山那边"是哪个方向。
-    //    用户 2026-10-10 定的：视距内自己看，**视距外靠人告诉**；
+    // 注意： 说话的人在哪儿 —— 她才知道"山那边"是哪个方向。
+    //    用户 2026-10-10 定的：视距内自己看，视距外靠人告诉；
     //    真人也没有世界地图，是听别人说。
-    //    事件对象上 `player` 和 `getEntity()` 两条路都试（Rhino 下哪个通用是探出来的）。
+    //    事件对象上 player 和 getEntity() 两条路都试（Rhino 下哪个通用是探出来的）。
     var px = null, py = null, pz = null
     var pl = null
     try { pl = event.player } catch (eP1) { }
@@ -359,27 +359,27 @@ PlayerEvents.chat(event => {
 
 // --- 事件流（除了聊天以外的事）--------------------------------------------
 //
-// ⚠️ **和聊天缓冲分开** —— 聊天已经在 `mcbChatBuf` 里带 seq 了，
-//    再录一份进事件流就是**同一件事记两遍**，白的 `[log]` 里会出现重复。
-//    这张表只管**聊天以外**的事：挨打 / 死亡 / 进出服 / 背包变动。
+// 注意： 和聊天缓冲分开 —— 聊天已经在 mcbChatBuf 里带 seq 了，
+//    再录一份进事件流就是同一件事记两遍，白的 [log] 里会出现重复。
+//    这张表只管聊天以外的事：挨打 / 死亡 / 进出服 / 背包变动。
 //
-// 机制抄 mcpfabric 的 `EventBus`：**环形缓冲 + 单调 seq + 按 sinceId 增量拉取**。
+// 机制抄 mcpfabric 的 EventBus：环形缓冲 + 单调 seq + 按 sinceId 增量拉取。
 // 为什么不用"每次都推"：推送没法重连、没法去重、断一次就丢；拉取式天然可重放。
 //
-// ⚠️ **每个 `Events.xxx(...)` 注册都包在 try 里** —— 事件名要是这个版本没有，
-//    **整个脚本会加载失败**（KubeJS 脚本是加载期执行的）。宁可少一个钩子，不能全挂。
+// 注意： 每个 Events.xxx(...) 注册都包在 try 里 —— 事件名要是这个版本没有，
+//    整个脚本会加载失败（KubeJS 脚本是加载期执行的）。宁可少一个钩子，不能全挂。
 const MCB_EV_MAX = 600
 
-// ⚠️⚠️ **同类事件必须合并** —— 这是 2026-10-10 实测踩出来的。
+// 注意：注意： 同类事件必须合并 —— 这是 2026-10-10 实测踩出来的。
 //
-//    她淹在水里时 `drown` **每秒产生一条 hurt 事件**，实测堆了 **253+ 条** ——
-//    环形缓冲只有 600 条，于是**真正要看的（死亡 / 进服 / 给东西）全被挤出去了**。
-//    `mcb events` 拉回来的东西几乎全是同一句噪声。
+//    她淹在水里时 drown 每秒产生一条 hurt 事件，实测堆了 253+ 条 ——
+//    环形缓冲只有 600 条，于是真正要看的（死亡 / 进服 / 给东西）全被挤出去了。
+//    mcb events 拉回来的东西几乎全是同一句噪声。
 //
-//    规则：**连续**同 `(kind, who, by)` 且间隔小于这个窗口的，合并成一条并累加 `n`。
+//    规则：连续同 (kind, who, by) 且间隔小于这个窗口的，合并成一条并累加 n。
 //    * 为什么要求"连续"：中间夹了别的事件就不该合并，否则会打乱先后顺序。
-//    * 为什么刷新窗口（用 `lastT` 而不是 `t`）：溺水是**持续性**的，
-//      不刷新的话每 3 秒又开一条新的，10 分钟照样 200 条。刷新 → 整段只留一条。
+//    * 为什么刷新窗口（用 lastT 而不是 t）：溺水是持续性的，
+//      不刷新的话每 3 秒又开一条新的，10 分钟照样 200 条。刷新  ->  整段只留一条。
 const MCB_EV_MERGE_MS = 3000
 
 var mcbEvBuf = []
@@ -424,28 +424,28 @@ function mcbEvSince(since) {
   }
 }
 
-// ⚠️⚠️ **背包事件已废弃（2026-10-10 实测后删除）—— 别再往这儿加回来**
+// 注意：注意： 背包事件已废弃（2026-10-10 实测后删除）—— 别再往这儿加回来
 //
-// 这里原来注册的是 `PlayerEvents.inventoryChanged`，用来抓"谁给了我东西"。
-// **实测它根本不 fire**：墓碑取物明明把背包改了（`grave_key×2 → ×1`、
-// 多了 `oak_log×3`），服务端日志里**一条都没有**，`mcb events` 是 0，
-// 而且注册本身**不抛错**（所以不看数据根本发现不了）。
+// 这里原来注册的是 PlayerEvents.inventoryChanged，用来抓"谁给了我东西"。
+// 实测它根本不 fire：墓碑取物明明把背包改了（grave_key×2  ->  ×1、
+// 多了 oak_log×3），服务端日志里一条都没有，mcb events 是 0，
+// 而且注册本身不抛错（所以不看数据根本发现不了）。
 //
-// 原因：`/give` 和接墓碑走的都是 `Inventory.add()`，
-// **绕过 `AbstractContainerMenu` 的槽位监听器** ——
-// 而 KubeJS 的 `KubeJSInventoryListener.slotChanged(menu, slot, item)`
+// 原因：/give 和接墓碑走的都是 Inventory.add()，
+// 绕过 AbstractContainerMenu 的槽位监听器 ——
+// 而 KubeJS 的 KubeJSInventoryListener.slotChanged(menu, slot, item)
 // 挂在后者上。
 //
-// ✅ **替代方案在插件侧**：`main/astrbot_plugin_mc_body/mcb/events.py` 的
-//    `EventFeed._poll_inventory()` —— **拉取式背包 diff**（`docs/13` §4 原本的方案），
+// 已完成： 替代方案在插件侧：main/astrbot_plugin_mc_body/mcb/events.py 的
+//    EventFeed._poll_inventory() —— 拉取式背包 diff（docs/13 §4 原本的方案），
 //    保证有效，代价只是延迟一个轮询周期。
 //
-// 这张表（`mcbEvBuf`）**只管聊天以外的事件**：挨打 / 死亡 / 进出服。
+// 这张表（mcbEvBuf）只管聊天以外的事件：挨打 / 死亡 / 进出服。
 // 那三个挂的是 NeoForge 事件，不是槽位监听器，所以是可靠的。
 
 // ---- 挨打 / 死亡 / 进出服 -------------------------------------------------
 //
-// 判据：**只记和白有关的**（她被谁打、谁死了、谁进服了、在场玩家挨打）。
+// 判据：只记和白有关的（她被谁打、谁死了、谁进服了、在场玩家挨打）。
 // 全场每一只怪挨打都记的话，缓冲立刻被刷干净。
 
 function mcbIsPlayer(e) {
@@ -461,18 +461,18 @@ function mcbEntityLabel(e) {
   return '?'
 }
 
-// 读玩家的**游戏名**。
+// 读玩家的游戏名。
 //
-// ⚠️⚠️ **2026-10-10 踩到的大坑**：`Player` 这个类**没有 `username` 字段**
-//    （那是 `PlayerChatReceivedKubeEvent.getUsername()` 那个**事件**上的方法，
-//     或者旧映射 / `ServerPlayer` 才有的东西）。
-//    所以 `String(pl.username)` 拿到的是 **`"undefined"` 这个字符串**，
-//    **不是空串** —— 于是
-//        `if (nm === '') { 试下一个 }`   ← 永远不进
-//        `if (nm !== MCB_TARGET) return`  ← 永远命中，静默跳过
-//    实测后果：`inventoryChanged` 一条都没记（背包明明变了，`mcb events` 是 0）。
-//    ⚠️ **教训：判"没读到"要判 `undefined` / `"undefined"` / `null` / `"null"`，
-//       不能只判空串 —— `String(undefined)` 是有内容的。**
+// 注意：注意： 2026-10-10 踩到的大坑：Player 这个类没有 username 字段
+//    （那是 PlayerChatReceivedKubeEvent.getUsername() 那个事件上的方法，
+//     或者旧映射 / ServerPlayer 才有的东西）。
+//    所以 String(pl.username) 拿到的是 "undefined" 这个字符串，
+//    不是空串 —— 于是
+//        if (nm === '') { 试下一个 }    <-  永远不进
+//        if (nm !== MCB_TARGET) return   <-  永远命中，静默跳过
+//    实测后果：inventoryChanged 一条都没记（背包明明变了，mcb events 是 0）。
+//    注意： 教训：判"没读到"要判 undefined / "undefined" / null / "null"，
+//       不能只判空串 —— String(undefined) 是有内容的。
 function mcbPlayerName(pl) {
   if (pl === null || pl === undefined) return null
   var cands = []
@@ -490,22 +490,22 @@ function mcbPlayerName(pl) {
   return null
 }
 
-// `DamageSource` → "谁打的 / 什么打的"。
+// DamageSource  ->  "谁打的 / 什么打的"。
 //
-// ⚠️⚠️ **2026-10-10 实测结论（一次跑完全部候选访问器得出的，别再猜）**：
+// 注意：注意： 2026-10-10 实测结论（一次跑完全部候选访问器得出的，别再猜）：
 //
-//     str              = "DamageSource (arrow)"   ← ✅ **唯一可靠的一条**
+//     str              = "DamageSource (arrow)"    <-  已完成： 唯一可靠的一条
 //     getMsgId         = notFn      ┐
 //     getEntity        = notFn      │ KubeJS 给我们的这个 DamageSource 对象
-//     getDirectEntity  = notFn      │ **实体访问器一个都没有**
+//     getDirectEntity  = notFn      │ 实体访问器一个都没有
 //     getCausingEntity = notFn      ┘
 //     getType          = 存在，但返回的不是实体（是 Holder<DamageType>）
 //
-// 所以**拿不到"具体是谁打的"**。但 `String(src)` 稳定给出**伤害类型**：
+// 所以拿不到"具体是谁打的"。但 String(src) 稳定给出伤害类型：
 //     mob（近战怪）· arrow（远程）· fall（摔）· lava · player_attack …
 //
-// → **报类型，不编造攻击者。** 类型本身就有用："摔的"和"怪咬的"处理方式完全不同。
-//   （"谁在打我"那件事由反射的 `mc_threats` 负责 —— 它有 `targeting` 字段。）
+//  ->  报类型，不编造攻击者。 类型本身就有用："摔的"和"怪咬的"处理方式完全不同。
+//   （"谁在打我"那件事由反射的 mc_threats 负责 —— 它有 targeting 字段。）
 function mcbSourceLabel(src) {
   if (src === null || src === undefined) return null
   // 先试实体访问器 —— 万一别的伤害类型上它们存在
@@ -515,7 +515,7 @@ function mcbSourceLabel(src) {
     var nm = mcbEntityName(ent)
     if (mcbIsUsableName(nm)) return nm
   }
-  // 兜底也是唯一可靠的路：从 `toString()` 里抠出括号里的类型
+  // 兜底也是唯一可靠的路：从 toString() 里抠出括号里的类型
   try {
     var s = String(src)
     var open = s.indexOf('(')
@@ -528,7 +528,7 @@ function mcbSourceLabel(src) {
   return null
 }
 
-// "这个名字能不能用"。⚠️ 判据要**全**：`String(undefined)` 会给出带内容的 `"undefined"`，
+// "这个名字能不能用"。注意： 判据要全：String(undefined) 会给出带内容的 "undefined"，
 // 光判空串是不够的（这个坑踩过两次了）。
 function mcbIsUsableName(v) {
   if (v === null || v === undefined) return false
@@ -539,11 +539,11 @@ function mcbIsUsableName(v) {
   return true
 }
 
-// `DamageSource` 的原始诊断 —— **只留一行 `str`**。
+// DamageSource 的原始诊断 —— 只留一行 str。
 //
-// ⚠️ 原来这里把"所有候选访问器全试一遍"的结果塞进事件里，那是**一次性的排查手段**。
-//    答案已经拿到了（见 `mcbSourceLabel` 的结论），再留着就是每条挨打事件多背十几行噪声。
-//    **排查完就收窄** —— 别让诊断永久占着数据带宽。
+// 注意： 原来这里把"所有候选访问器全试一遍"的结果塞进事件里，那是一次性的排查手段。
+//    答案已经拿到了（见 mcbSourceLabel 的结论），再留着就是每条挨打事件多背十几行噪声。
+//    排查完就收窄 —— 别让诊断永久占着数据带宽。
 function mcbSourceDebug(src) {
   if (src === null || src === undefined) return { null: true }
   try { return { str: String(src).substring(0, 60) } } catch (e) { return { str: 'ERR' } }
@@ -561,8 +561,8 @@ try {
       try { dmg = Number(event.damage) } catch (eD) {
         try { dmg = Number(event.getDamage()) } catch (eD2) { }
       }
-      // ⚠️ **先试 `getSource()`** —— 它是这个事件**文档上有的方法**（已解常量池确认）。
-      //    `event.source` 那条路实测会拿到不对的东西（`by` 报成 "Function"），
+      // 注意： 先试 getSource() —— 它是这个事件文档上有的方法（已解常量池确认）。
+      //    event.source 那条路实测会拿到不对的东西（by 报成 "Function"），
       //    所以只当兜底，不抢先。
       var src = null
       try { src = event.getSource() } catch (eS2) {
@@ -571,7 +571,7 @@ try {
       var vname = mcbEntityLabel(victim)
       var attacker = mcbSourceLabel(src)
 
-      // ⚠️ **一次 LivingDamageEvent 会同时产生"她挨打"和"对方挨打"两条**，
+      // 注意： 一次 LivingDamageEvent 会同时产生"她挨打"和"对方挨打"两条，
       //    只看我们关心的那两头，不然一次互殴记两条噪声。
       var iAmVictim = (vname === MCB_TARGET)
       var iAmAttacker = (attacker === MCB_TARGET)
@@ -583,7 +583,7 @@ try {
       if (dmg !== null && !isNaN(dmg)) extra.dmg = Math.round(dmg * 10) / 10
       if (attacker !== null) extra.by = attacker
       if (hp !== null) extra.hp = hp
-      // ⚠️ 诊断字段 —— `by` 要是不对，看这个就知道是哪条路断了。
+      // 注意： 诊断字段 —— by 要是不对，看这个就知道是哪条路断了。
       //    （僵尸咬一口报 "Function" 那次，就是靠它定位的）
       try { extra.srcDbg = mcbSourceDebug(src) } catch (eSd) { }
 
@@ -658,20 +658,20 @@ try {
 
 // ===== T2：跨 tick 增量扫描 ===============================================
 //
-// **它补的是 T1 的缺口。**
-//   T1（`mcb around`）走「方块实体 + heightmap 抽样」，一次 ~50ms 就能给个概览，
-//   但它**拿不到没有方块实体的方块** —— 工作台 / 铁砧 / 石切机 / 织布机 / 制箭台 /
+// 它补的是 T1 的缺口。
+//   T1（mcb around）走「方块实体 + heightmap 抽样」，一次 ~50ms 就能给个概览，
+//   但它拿不到没有方块实体的方块 —— 工作台 / 铁砧 / 石切机 / 织布机 / 制箭台 /
 //   制图台 / 锻造台 / 砂轮 / 堆肥桶 / 营火 / 传送门框… 这些统统不在
-//   `chunk.getBlockEntities()` 那张表里，T1 看不见它们。
+//   chunk.getBlockEntities() 那张表里，T1 看不见它们。
 //
-//   全分辨率逐方块扫一遍要几十万次读（Rhino 下每格 ~10µs），**一个 tick 干不完** ——
+//   全分辨率逐方块扫一遍要几十万次读（Rhino 下每格 ~10µs），一个 tick 干不完 ——
 //   600 格/tick 就是 6ms，扫 6 chunk 的地表带要跑好几百个 tick。
-//   所以做成**跨 tick 的后台任务**：每 tick 推进一小块，结果进缓存，随时可查。
+//   所以做成跨 tick 的后台任务：每 tick 推进一小块，结果进缓存，随时可查。
 //
-// ⚠️ **每 tick 的读数是"预算"，不是"能扫多快扫多快"** —— 这是共用服务器，
+// 注意： 每 tick 的读数是"预算"，不是"能扫多快扫多快" —— 这是共用服务器，
 //    用户就在同一个服里玩。预算调大会让 MSPT 直接涨，别乱调。
 //
-// ⚠️ **tick 钩子的第一句必须是纯 JS 判断**（`mcbT2 === null`），不碰任何 Java。
+// 注意： tick 钩子的第一句必须是纯 JS 判断（mcbT2 === null），不碰任何 Java。
 //    挂 tick 最怕"每 tick 都白跑一遍 Java 调用" —— 那是 20 次/秒的纯浪费。
 
 const MCB_T2_READS_PER_TICK = 600        // 每 tick 最多读多少格（≈6ms，占 50ms tick 的 12%）
@@ -680,8 +680,8 @@ const MCB_T2_BAND_ABOVE = 4              // 地表往上扫几格
 const MCB_T2_POI_MAX = 300               // POI 最多留多少条（按距离近的优先）
 const MCB_T2_KEEP_MS = 10 * 60 * 1000    // 扫完之后结果保留多久
 
-// 值得单列出来的方块（键是注册名的**路径部分**，不带命名空间）。
-// 挑的原则：**没有方块实体**，因此 T1 看不见 —— 这正是 T2 存在的理由。
+// 值得单列出来的方块（键是注册名的路径部分，不带命名空间）。
+// 挑的原则：没有方块实体，因此 T1 看不见 —— 这正是 T2 存在的理由。
 // 少数有方块实体的（刷怪笼/唱片机）也顺手带上，重复了由下游按坐标去重。
 const MCB_T2_POI_IDS = {
   'crafting_table': '工作台',
@@ -714,8 +714,8 @@ function mcbT2Setup() {
   return mcbT2BP !== null && mcbT2Height !== null
 }
 
-// ⚠️ **热路径专用**：`mcbBlockId` 每次调用都按顺序试 4 条路 —— 一次扫描几百万次读，
-//    那个开销会让 10µs/格 直接翻几倍。这里认准**已经探明的那一条**。
+// 注意： 热路径专用：mcbBlockId 每次调用都按顺序试 4 条路 —— 一次扫描几百万次读，
+//    那个开销会让 10µs/格 直接翻几倍。这里认准已经探明的那一条。
 function mcbBlockIdFast(state) {
   if (mcbBlockIdVia === 'state.id') { try { return String(state.id) } catch (e1) { } }
   else if (mcbBlockIdVia === 'state.block.id') { try { return String(state.block.id) } catch (e2) { } }
@@ -780,7 +780,7 @@ function mcbT2Status() {
   }
 }
 
-// 每 tick 推进一小块。**调用方已经确认过 `mcbT2 !== null && doneAt === 0`。**
+// 每 tick 推进一小块。调用方已经确认过 mcbT2 !== null && doneAt === 0。
 function mcbT2Step() {
   var t = mcbT2
   if (t === null || t.doneAt > 0) return
@@ -789,12 +789,12 @@ function mcbT2Step() {
   var level = t.level
   if (level === null || level === undefined) { t.err.push('level 丢了'); mcbT2 = null; return }
 
-  var perCol = MCB_T2_BAND_ABOVE + MCB_T2_BAND_BELOW + 1   // 每列几次**方块**读
+  var perCol = MCB_T2_BAND_ABOVE + MCB_T2_BAND_BELOW + 1   // 每列几次方块读
   var colCost = perCol + 1                                  // 再加一次 getHeight
   var budget = MCB_T2_READS_PER_TICK
-  // ⚠️⚠️ **`used` 是本 tick 的计数器，`t.reads` 是累计的 —— 别混用。**
-  //    第一版拿 `t.reads` 直接当预算判据，于是第一个 tick 就冲到 600，
-  //    之后每 tick 只扫 1 列、再往后 0 列，**任务永远跑不完**（实测 8 秒才 67 列）。
+  // 注意：注意： used 是本 tick 的计数器，t.reads 是累计的 —— 别混用。
+  //    第一版拿 t.reads 直接当预算判据，于是第一个 tick 就冲到 600，
+  //    之后每 tick 只扫 1 列、再往后 0 列，任务永远跑不完（实测 8 秒才 67 列）。
   var used = 0
 
   while (used < budget) {
@@ -820,7 +820,7 @@ function mcbT2Step() {
       var wx = c[0] * 16 + (t.col & 15)
       var wz = c[1] * 16 + ((t.col >> 4) & 15)
 
-      // ⚠️ `getHeight` 收的是**世界坐标**（内部自己 `& 15`），别传 chunk 内局部坐标。
+      // 注意： getHeight 收的是世界坐标（内部自己 & 15），别传 chunk 内局部坐标。
       var sy = -1
       try { sy = Number(ch.getHeight(mcbT2Height, wx, wz)) } catch (eH) { sy = -1 }
       used += colCost
@@ -874,8 +874,8 @@ function mcbT2Stop() {
 }
 
 // 扫完的结果留一会儿好让插件拉到，过期就清掉。
-// ⚠️ **惰性清理，不在 tick 里判过期** —— `mcbNowMs()` 在 Rhino 里是一次 Java 调用，
-//    放进 tick 就是每 tick 白烧一次，而且一烧就是 `MCB_T2_KEEP_MS` 那么久。
+// 注意： 惰性清理，不在 tick 里判过期 —— mcbNowMs() 在 Rhino 里是一次 Java 调用，
+//    放进 tick 就是每 tick 白烧一次，而且一烧就是 MCB_T2_KEEP_MS 那么久。
 //    这两个入口本来就调用得稀疏，放这儿判最划算。
 function mcbT2Reap() {
   if (mcbT2 === null) return
@@ -885,7 +885,7 @@ function mcbT2Reap() {
 
 try {
   ServerEvents.tick(event => {
-    // ⚠️ **第一句必须是纯 JS 判断，不碰任何 Java。** 没任务时这个钩子成本接近零 ——
+    // 注意： 第一句必须是纯 JS 判断，不碰任何 Java。 没任务时这个钩子成本接近零 ——
     //    挂 tick 最怕的就是"每 tick 都白跑一遍 Java 调用"，那是 20 次/秒的纯浪费。
     if (mcbT2 === null || mcbT2.doneAt > 0) return
     try { mcbT2Step() } catch (e) {
@@ -898,7 +898,7 @@ try {
 
 // --- 背包与饥饿（服务端可读，不需要客户端）--------------------------------
 
-// 一个物品槽的信息。每个访问器独立 try —— Rhino 下哪个能用的**是探出来的**，
+// 一个物品槽的信息。每个访问器独立 try —— Rhino 下哪个能用的是探出来的，
 // 所以把失败原因也带回去，一次测试就能知道要改哪里。
 function mcbStackInfo(stack) {
   if (stack === null || stack === undefined) return null
@@ -941,7 +941,7 @@ function mcbStackInfo(stack) {
     }
   }
 
-  // 能不能吃、吃了顶多少 —— **判据跟车万女仆的 isHealMeal 对齐**：
+  // 能不能吃、吃了顶多少 —— 判据跟车万女仆的 isHealMeal 对齐：
   // 看 FoodProperties 存不存在，而不是维护一份食物白名单（这样 mod 食物自动兼容）。
   var food = null
   var foodErr = null
@@ -959,20 +959,20 @@ function mcbStackInfo(stack) {
 
   // ---- 攻击伤害：这东西能不能打 ------------------------------------------
   //
-  // ⚠️⚠️ **为什么不用名字判"是不是武器"**（2026-10-10 实测）：
-  //    TaCZ 的枪 `hoverName` 返回的是**本地化 key**（`item.tacz.modern_kinetic_gun`），
-  //    拿名字判"这是不是武器"**必错**。
-  //    **属性才是最稳的判据** —— 跟"用 FoodProperties 判食物"一个思路，
+  // 注意：注意： 为什么不用名字判"是不是武器"（2026-10-10 实测）：
+  //    TaCZ 的枪 hoverName 返回的是本地化 key（item.tacz.modern_kinetic_gun），
+  //    拿名字判"这是不是武器"必错。
+  //    属性才是最稳的判据 —— 跟"用 FoodProperties 判食物"一个思路，
   //    mod 加的近战武器自动兼容，不用我们维护名单。
   //
-  // ⚠️⚠️ **只有下面这一条读法能用**（另外两条实测都不行，别再试）：
-  //    ❌ `stack.getAttributeModifiers(EquipmentSlot.MAINHAND)` —— 方法不存在
-  //    ❌ `getItem().getDefaultAttributeModifiers().entries()` —— 那对象没 `.entries()`
-  //    ✅ `stack.getAttributeModifiers().modifiers()` ← **这条通**
-  //       （元素上有 `.attribute()` 和 `.modifier().amount()`）
+  // 注意：注意： 只有下面这一条读法能用（另外两条实测都不行，别再试）：
+  //    不成立或禁止： stack.getAttributeModifiers(EquipmentSlot.MAINHAND) —— 方法不存在
+  //    不成立或禁止： getItem().getDefaultAttributeModifiers().entries() —— 那对象没 .entries()
+  //    已完成： stack.getAttributeModifiers().modifiers()  <-  这条通
+  //       （元素上有 .attribute() 和 .modifier().amount()）
   //
-  // ⚠️ **`modifiers=[]` 空数组是正常的** —— 那就是"这东西没有攻击加成"。
-  //    `atk` 缺省 = 没有攻击加成（**不是**"读失败"）。
+  // 注意： modifiers=[] 空数组是正常的 —— 那就是"这东西没有攻击加成"。
+  //    atk 缺省 = 没有攻击加成（不是"读失败"）。
   var atk = null
   try {
     var $Attr = Java.loadClass('net.minecraft.world.entity.ai.attributes.Attributes')
@@ -992,8 +992,8 @@ function mcbStackInfo(stack) {
     console.warn('[mcb] 读攻击伤害失败: ' + eAtk)
   }
 
-  // ---- 标签：`#c:tools/melee_weapon` 这种 ----------------------------------
-  // ⚠️ 只取前 8 个、且**去掉命名空间前缀以外的杂项** —— 全量塞进上行会把 RCON 撑爆。
+  // ---- 标签：#c:tools/melee_weapon 这种 ----------------------------------
+  // 注意： 只取前 8 个、且去掉命名空间前缀以外的杂项 —— 全量塞进上行会把 RCON 撑爆。
   var tags = null
   try {
     var t = stack.getTags()
@@ -1009,9 +1009,9 @@ function mcbStackInfo(stack) {
   } catch (eTag) { }
 
   var info = { n: name, c: count, via: nameVia }
-  // ⚠️ **必须带上注册名**。「名字」是**显示名**，跟语言走（同一个面包在中文客户端叫"面包"、
-  //    英文客户端叫"Bread"），拿它做匹配一定会错。**配方里用的是 `minecraft:oak_planks`
-  //    这种注册名** —— 合成规划就靠这个字段对齐。
+  // 注意： 必须带上注册名。「名字」是显示名，跟语言走（同一个面包在中文客户端叫"面包"、
+  //    英文客户端叫"Bread"），拿它做匹配一定会错。配方里用的是 minecraft:oak_planks
+  //    这种注册名 —— 合成规划就靠这个字段对齐。
   try {
     var regId = mcbItemId(stack)
     if (regId !== null) info.id = regId
@@ -1067,7 +1067,7 @@ function mcbInventory(player) {
 
 var mcbBlockIdVia = null
 
-// 取方块 ID。Rhino 下哪个访问器能用是**探出来的**，命中一次就记住。
+// 取方块 ID。Rhino 下哪个访问器能用是探出来的，命中一次就记住。
 function mcbBlockId(state) {
   var ways = [
     ['state.id', function () { return state.id }],
@@ -1130,7 +1130,7 @@ function mcbScan(player, radius) {
   for (var dx = -radius; dx <= radius; dx++) {
     for (var dy = -radius; dy <= radius; dy++) {
       for (var dz = -radius; dz <= radius; dz++) {
-        // ⚠️ **球，不是立方体** —— 立方体的八个角占了体积的一大半，
+        // 注意： 球，不是立方体 —— 立方体的八个角占了体积的一大半，
         //    而那正是"离玩家最远"的部分，性价比最低。
         if (dx * dx + dy * dy + dz * dz > rr) continue
         var bx = px + dx, by = py + dy, bz = pz + dz
@@ -1160,10 +1160,10 @@ function mcbScan(player, radius) {
     }
   }
   arr.sort(function (a, b) { return b.n - a.n })
-  // ⚠️⚠️ **别截断类型列表** —— 踩过（2026-10-09）：
-  //    原来这里是 `arr.slice(0, 25)`，结果**工作台（全图只有 1 个）被挤掉了**，
+  // 注意：注意： 别截断类型列表 —— 踩过（2026-10-09）：
+  //    原来这里是 arr.slice(0, 25)，结果工作台（全图只有 1 个）被挤掉了，
   //    下游报"附近没有工作台"，可她离工作台只有 1.5 格。
-  //    **稀有方块恰恰是最要紧的那种**，按数量截断等于专挑它们下手。
+  //    稀有方块恰恰是最要紧的那种，按数量截断等于专挑它们下手。
   //    一个预算内的扫描撑死几十种类型，全回也没多少字节。
   out.types = arr
   out.totalTypes = arr.length
@@ -1172,14 +1172,14 @@ function mcbScan(player, radius) {
 
 // --- 索敌（服务端可读，不需要客户端）--------------------------------------
 //
-// 抄的是**原版**那套（女仆的 MaidHostilesSensor 也是抄原版）：
-// 扫附近实体 → 按"是不是敌对"过滤 → 按距离排序 → 取最近的。
+// 抄的是原版那套（女仆的 MaidHostilesSensor 也是抄原版）：
+// 扫附近实体  ->  按"是不是敌对"过滤  ->  按距离排序  ->  取最近的。
 // 我们不用实体的 Brain/Sensor 系统（那是给实体用的），直接查世界就行。
 
-// ⚠️ **只按类判"是不是怪"是不够的** —— 抄 Kindred 的坑 #1：
-// 他们的 AI 同伴被**狼**咬死，因为 `Senses` 只把 `HostileEntity` 当威胁，
-// 而**狼在 1.21 里不是 Monster**。所以判据是三条并集：
-//   ① 是 `Monster` 类  ② 名字像怪（mod 生物兜底）  ③ **正瞄着我**
+// 注意： 只按类判"是不是怪"是不够的 —— 抄 Kindred 的坑 #1：
+// 他们的 AI 同伴被狼咬死，因为 Senses 只把 HostileEntity 当威胁，
+// 而狼在 1.21 里不是 Monster。所以判据是三条并集：
+//   1 是 Monster 类  2 名字像怪（mod 生物兜底）  3 正瞄着我
 var MCB_HOSTILE_RE = /zombie|skeleton|creeper|spider|witch|slime|phantom|drowned|husk|stray|pillager|vindicator|ravager|blaze|ghast|magma|endermite|silverfish|guardian|shulker|wither|hoglin|piglin|zoglin|warden|bogged|breeze|creaking|monster|wolf|bear|llama|hog|piranha|revenant|necromancer|undead/i
 
 function mcbEntityPos(e) {
@@ -1244,7 +1244,7 @@ function mcbThreats(player, radius) {
       if (pos === null) continue
       var tn = ''
       try { tn = String(e.type) } catch (eT) { }
-      // 它是不是**正瞄着白**？抄 Kindred 坑 #1 的修复。
+      // 它是不是正瞄着白？抄 Kindred 坑 #1 的修复。
       var targeting = false
       try {
         var tg = null
@@ -1265,7 +1265,7 @@ function mcbThreats(player, radius) {
     }
   }
 
-  // ① 精确：`Monster` 类 —— 原版和大部分 mod 的怪都继承它
+  // 1 精确：Monster 类 —— 原版和大部分 mod 的怪都继承它
   try {
     var $M = Java.loadClass('net.minecraft.world.entity.monster.Monster')
     collect(level.getEntitiesOfClass($M, box), true)
@@ -1274,10 +1274,10 @@ function mcbThreats(player, radius) {
     out.err.push('Monster: ' + e1)
   }
 
-  // ② 兜底：**所有实体**里"正瞄着我"的。
-  //    ⚠️⚠️ 这一步不能省 —— 抄 Kindred 的坑 #1：他们的同伴被**狼**咬死，
-  //    就是因为只把 HostileEntity 当威胁。**狼（Wolf）在 1.21 里不是 Monster**，
-  //    咬人时根本不会出现在①的结果里。**"谁在盯着我"比"它是什么类"更重要。**
+  // 2 兜底：所有实体里"正瞄着我"的。
+  //    注意：注意： 这一步不能省 —— 抄 Kindred 的坑 #1：他们的同伴被狼咬死，
+  //    就是因为只把 HostileEntity 当威胁。狼（Wolf）在 1.21 里不是 Monster，
+  //    咬人时根本不会出现在1的结果里。"谁在盯着我"比"它是什么类"更重要。
   try {
     collect(level.getEntities(player, box), false)
     out.via.push('all-entities')
@@ -1297,7 +1297,7 @@ function mcbThreats(player, radius) {
     en.dist = Math.round(Math.sqrt(
       (ep[0] - px) * (ep[0] - px) + (ep[1] - py) * (ep[1] - py) + (ep[2] - pz) * (ep[2] - pz)
     ) * 10) / 10
-    // 敌对 = **Monster 类** 或 **名字像怪** 或 **正瞄着我**
+    // 敌对 = Monster 类 或 名字像怪 或 正瞄着我
     en.hostile = !!en._m || en.targeting || MCB_HOSTILE_RE.test(en.type)
     delete en._m
     arr.push(en)
@@ -1314,18 +1314,18 @@ function mcbThreats(player, radius) {
 //
 // "我正看着什么" —— 最自然的感知入口。
 //
-// ⚠️ **为什么走服务端，不读客户端的 `mc.hitResult`**：
-//    客户端那份在低帧率下经常 MISS（`mcbridge.js:546` 的原话），
+// 注意： 为什么走服务端，不读客户端的 mc.hitResult：
+//    客户端那份在低帧率下经常 MISS（mcbridge.js:546 的原话），
 //    而且改客户端脚本要重启那个 ~110 秒的进程。服务端这份用的是
-//    **服务端收到的朝向**（约一 tick 延迟）—— 是近似，但零成本、当场能测。
+//    服务端收到的朝向（约一 tick 延迟）—— 是近似，但零成本、当场能测。
 //
-//    顺带纠正一个容易搞反的事实：**原版真正的权威其实是客户端的 hitResult**
-//    （`ServerboundUseItemOnPacket` 就是客户端把 BlockHitResult 发上来、
-//    服务端只校验距离）。所以这里给的是**近似**，不是权威。
-//    哪天真和"她看见的"对不上，再补客户端那条 —— `mcbridge.js:586-595` 代码现成。
+//    顺带纠正一个容易搞反的事实：原版真正的权威其实是客户端的 hitResult
+//    （ServerboundUseItemOnPacket 就是客户端把 BlockHitResult 发上来、
+//    服务端只校验距离）。所以这里给的是近似，不是权威。
+//    哪天真和"她看见的"对不上，再补客户端那条 —— mcbridge.js:586-595 代码现成。
 
-// 从"上一格 → 命中格"的位移反推命中面。
-// 规则：**命中面永远朝着上一格**（prev 在 +Z 就是南面）。
+// 从"上一格  ->  命中格"的位移反推命中面。
+// 规则：命中面永远朝着上一格（prev 在 +Z 就是南面）。
 function mcbFaceFromDelta(dx, dy, dz) {
   if (dy === 1) return 'up'
   if (dy === -1) return 'down'
@@ -1336,19 +1336,19 @@ function mcbFaceFromDelta(dx, dy, dz) {
   return null
 }
 
-// 视线射线 —— **自己走体素，不走 `player.pick()`**。
+// 视线射线 —— 自己走体素，不走 player.pick()。
 //
-// ⚠️ **为什么不用原版 `pick`**：它用 `ClipContext.Block.OUTLINE`，
-//    **玻璃、玻璃板、树叶、铁栏杆这些只要有轮廓形状的都会挡住** ——
+// 注意： 为什么不用原版 pick：它用 ClipContext.Block.OUTLINE，
+//    玻璃、玻璃板、树叶、铁栏杆这些只要有轮廓形状的都会挡住 ——
 //    于是"隔着玻璃看东西"永远只答得出玻璃。
 //
-// 这里改成**只认"真遮挡"的方块**：`state.canOcclude()`。
-//    玻璃 `false`（看得穿）· 石头 `true`（挡死）。
-//    这是**视觉语义**，跟碰撞箱（`getCollisionShape`，mcpfabric 用的那个）不是一回事。
+// 这里改成只认"真遮挡"的方块：state.canOcclude()。
+//    玻璃 false（看得穿）· 石头 true（挡死）。
+//    这是视觉语义，跟碰撞箱（getCollisionShape，mcpfabric 用的那个）不是一回事。
 //
 // 返回两个东西：
-//   `seen`     = 第一个**非空气**方块（可能就是玻璃）
-//   `occluder` = 第一个**真挡住视线**的方块（视线实质上停在这儿）
+//   seen     = 第一个非空气方块（可能就是玻璃）
+//   occluder = 第一个真挡住视线的方块（视线实质上停在这儿）
 // 两个不一样时，就是"她隔着某样东西看着另一样东西"。
 function mcbRayBlock(level, ex, ey, ez, lx, ly, lz, maxDist) {
   var out = { seen: null, occluder: null, steps: 0 }
@@ -1362,11 +1362,11 @@ function mcbRayBlock(level, ex, ey, ez, lx, ly, lz, maxDist) {
   var t = 0.0
   while (t <= maxDist && out.steps < 3000) {
     out.steps++
-    // ⚠️⚠️ **采样点取步长中点，不能用步长起点**（2026-10-10 定位）。
-    //    射线**正擦着方块边界**走时，起点采样会落到边界**下面那一格**：
-    //    实测 `hit=[-4.0, 90.0, -7.0]`（正好是玻璃的底面）——
-    //    原版解析求交把边界判给"**正在进入**"的那格（y=90 的玻璃），
-    //    而 `Math.floor(89.9999)` 判给 y=89 的安山岩，于是射线**根本碰不到玻璃**，
+    // 注意：注意： 采样点取步长中点，不能用步长起点（2026-10-10 定位）。
+    //    射线正擦着方块边界走时，起点采样会落到边界下面那一格：
+    //    实测 hit=[-4.0, 90.0, -7.0]（正好是玻璃的底面）——
+    //    原版解析求交把边界判给"正在进入"的那格（y=90 的玻璃），
+    //    而 Math.floor(89.9999) 判给 y=89 的安山岩，于是射线根本碰不到玻璃，
     //    表现成"自研射线和原版 pick 对不上"。
     //    取中点 = 偏向"已经进入"的那一侧，和原版语义一致。
     var ts = t + STEP * 0.5
@@ -1375,7 +1375,7 @@ function mcbRayBlock(level, ex, ey, ez, lx, ly, lz, maxDist) {
     var bz = Math.floor(ez + lz * ts)
     if (prev === null || bx !== prev[0] || by !== prev[1] || bz !== prev[2]) {
       var id = null
-      var occl = true             // 读不出来就**当它挡**（退回原版行为，宁可保守）
+      var occl = true             // 读不出来就当它挡（退回原版行为，宁可保守）
       try {
         var st = level.getBlockState(new $BP(bx, by, bz))
         id = mcbBlockId(st)
@@ -1383,7 +1383,7 @@ function mcbRayBlock(level, ex, ey, ez, lx, ly, lz, maxDist) {
           occl = !!st.canOcclude()
         } catch (eO) {
           occl = true
-          // 记一次就够 —— `canOcclude` 要是不存在，`through` 永远不出现，
+          // 记一次就够 —— canOcclude 要是不存在，through 永远不出现，
           // 光看结果是发现不了的（会安静地退化成原版 pick 的行为）
           if (out.occlErr === undefined) out.occlErr = String(eO)
         }
@@ -1406,15 +1406,15 @@ function mcbRayBlock(level, ex, ey, ez, lx, ly, lz, maxDist) {
   return out
 }
 
-// 读一个 `BlockPos` 的 x/y/z 整数坐标。
+// 读一个 BlockPos 的 x/y/z 整数坐标。
 //
-// ⚠️⚠️ **2026-10-10 实测**：`BlockPos` 在 Rhino 下有**两种形状**，都得兜住 ——
-//    · `be.getBlockPos()` 回的是**正常 `BlockPos`** → `x`/`y`/`z` 是**方法**
-//      （`getX()` …），字段访问给的是函数对象，`Number()` 出来是 NaN
-//    · `player.pick().getBlockPos()` 回的是 **`MutableBlockPos`** → 那里
-//      `x`/`y`/`z` 是**字段**（写 `bp.x()` 直接抛
-//      `TypeError: Cannot call property x in object MutableBlockPos{...}`）
-//    所以：**字段先试，方法兜底，两边都不给就返回 null。**
+// 注意：注意： 2026-10-10 实测：BlockPos 在 Rhino 下有两种形状，都得兜住 ——
+//    · be.getBlockPos() 回的是正常 BlockPos  ->  x/y/z 是方法
+//      （getX() …），字段访问给的是函数对象，Number() 出来是 NaN
+//    · player.pick().getBlockPos() 回的是 MutableBlockPos  ->  那里
+//      x/y/z 是字段（写 bp.x() 直接抛
+//      TypeError: Cannot call property x in object MutableBlockPos{...}）
+//    所以：字段先试，方法兜底，两边都不给就返回 null。
 function mcbPosXYZ(p) {
   var x = null, y = null, z = null
   try { x = Number(p.x) } catch (e1) { }
@@ -1434,9 +1434,9 @@ function mcbR1(v) {
   return isNaN(n) ? null : Math.round(n * 10) / 10
 }
 
-// yaw → 八向罗盘词。她要自己讲"我朝西北看"就得有这个词，
+// yaw  ->  八向罗盘词。她要自己讲"我朝西北看"就得有这个词，
 // 不然只能报一个数字，那是程序在说话。
-// ⚠️ MC 的 yaw 约定：0=南(+Z) · 90=西(-X) · 180=北(-Z) · 270=东(+X)
+// 注意： MC 的 yaw 约定：0=南(+Z) · 90=西(-X) · 180=北(-Z) · 270=东(+X)
 function mcbCompass(yaw) {
   if (isNaN(yaw)) return null
   var names = ['south', 'southwest', 'west', 'northwest', 'north', 'northeast', 'east', 'southeast']
@@ -1444,17 +1444,17 @@ function mcbCompass(yaw) {
   return names[Math.round(d / 45) % 8]
 }
 
-// 朝向（yaw/pitch），带**三级兜底**。
+// 朝向（yaw/pitch），带三级兜底。
 //
-// ⚠️⚠️ **2026-10-10 实测踩到的两个坑，别再犯**：
-//   ① `player.yRot` 在 Rhino 下**不抛异常**，返回 `undefined` ——
-//      所以 `try { player.yRot } catch { 试 getYRot() }` 的兜底**永远不触发**，
-//      `Number(undefined)` 静默变 NaN。**必须显式判 NaN。**
-//   ② **别用动态属性名取 Java 方法**（`player['getYRot']()`）——
-//      实测 `getYRot()` 走这个方法拿不到数。写成**字面量调用**才有用。
+// 注意：注意： 2026-10-10 实测踩到的两个坑，别再犯：
+//   1 player.yRot 在 Rhino 下不抛异常，返回 undefined ——
+//      所以 try { player.yRot } catch { 试 getYRot() } 的兜底永远不触发，
+//      Number(undefined) 静默变 NaN。必须显式判 NaN。
+//   2 别用动态属性名取 Java 方法（player['getYRot']()）——
+//      实测 getYRot() 走这个方法拿不到数。写成字面量调用才有用。
 //
-// 三级：字段 → getter → **从视线向量反推**。
-// 最后那级是保底 —— `getViewVector` 已经实测可用，所以这条路一定通。
+// 三级：字段  ->  getter  ->  从视线向量反推。
+// 最后那级是保底 —— getViewVector 已经实测可用，所以这条路一定通。
 //   MC 约定：view = ( -sin(yaw)cos(pitch), -sin(pitch), cos(yaw)cos(pitch) )
 function mcbYawPitch(player, look) {
   var yaw = null, pitch = null, via = 'field'
@@ -1519,7 +1519,7 @@ function mcbLookAt(player, reach) {
   if (ang.pitch !== null) out.pitch = mcbR1(ang.pitch)
   if (ang.yaw === null) out.err.push('拿不到 yaw（字段/ getter / 视线反推 三条路都不通）')
 
-  // ① 方块 —— 自研体素射线（能看穿玻璃，理由见 mcbRayBlock 的注释）
+  // 1 方块 —— 自研体素射线（能看穿玻璃，理由见 mcbRayBlock 的注释）
   var blockDist = reach
   out.block = null
   try {
@@ -1531,7 +1531,7 @@ function mcbLookAt(player, reach) {
     if (hitBlock !== null) {
       out.block = hitBlock
       blockDist = hitBlock.dist
-      // 中间隔着东西（玻璃/树叶…）→ 报出来，她才知道"看得见，但隔了一层"
+      // 中间隔着东西（玻璃/树叶…） ->  报出来，她才知道"看得见，但隔了一层"
       if (ray.occluder !== null && ray.seen !== null && ray.seen !== ray.occluder) {
         out.through = ray.seen
       }
@@ -1541,7 +1541,7 @@ function mcbLookAt(player, reach) {
       out.blockDist = ray.seen.dist
       out.onlySeen = true
     }
-    // 诊断：原版 `pick` 怎么答的。**两个不一致，就说明玻璃那类方块真的在起作用**
+    // 诊断：原版 pick 怎么答的。两个不一致，就说明玻璃那类方块真的在起作用
     try {
       var vp = player.pick(reach, 1.0, false)
       if (vp !== null && vp !== undefined) {
@@ -1551,7 +1551,7 @@ function mcbLookAt(player, reach) {
           var vbp = vp.getBlockPos()
           vpv.id = mcbBlockId(level.getBlockState(vbp))
           vpv.pos = mcbPosXYZ(vbp)
-          // ⚠️ 命中**点** + 算出来的距离 —— 有了它才能判断
+          // 注意： 命中点 + 算出来的距离 —— 有了它才能判断
           //    "两条射线是不是真的打在同一格上"（2026-10-10 遇到过一次对不上）
           try {
             var vloc = vp.getLocation()
@@ -1566,9 +1566,9 @@ function mcbLookAt(player, reach) {
     } catch (eVP) { out.pickVanilla = { err: String(eVP) } }
   } catch (e5) { out.err.push('ray: ' + e5) }
 
-  // ② 实体 —— 服务端没有跨版本稳定的"射线 vs 实体"求交（`ProjectileUtil` 的签名
-  //    每个版本都在变），自己做**锥形命中**：
-  //    把实体中心投影到视线上，投影落在射程内、垂距小于它自己的碰撞箱半宽 → 算看着它。
+  // 2 实体 —— 服务端没有跨版本稳定的"射线 vs 实体"求交（ProjectileUtil 的签名
+  //    每个版本都在变），自己做锥形命中：
+  //    把实体中心投影到视线上，投影落在射程内、垂距小于它自己的碰撞箱半宽  ->  算看着它。
   out.entity = null
   try {
     var $AABB = Java.loadClass('net.minecraft.world.phys.AABB')
@@ -1604,7 +1604,7 @@ function mcbLookAt(player, reach) {
       if (best === null || t < bestT) { best = e; bestT = t }
     }
     if (best !== null && bestT <= blockDist) {
-      // 只有**实体比方块近**才算"看着她"。否则她在看那面墙，
+      // 只有实体比方块近才算"看着她"。否则她在看那面墙，
       // 锥形测试没有遮挡概念，这一步就是拿来补遮挡的。
       var btype = ''
       try { btype = String(best.type) } catch (eT) { }
@@ -1632,7 +1632,7 @@ function mcbLookAt(player, reach) {
 
 // --- 配方查询（合成规划要用）------------------------------------------------
 //
-// ⚠️ **不要自己编配方表** —— 服务端的 `RecipeManager` 认识**所有 mod 的配方**，
+// 注意： 不要自己编配方表 —— 服务端的 RecipeManager 认识所有 mod 的配方，
 //    种类、数量、摆法、要不要工作台，全在里面。抄它就不会漏 mod。
 //
 // 索引按"产物物品 id"建，懒加载一次（脚本重载后全局重置，正好重建）。
@@ -1651,13 +1651,13 @@ function mcbItemId(stack) {
 
 // 一个 Ingredient 有哪些候选（比如"任意木板"会有 11 种）
 //
-// ⚠️⚠️ **NeoForge 1.21.1 的 `Ingredient` 没有 `getItems()`** —— 实测报
-//     `Cannot find function getItems`。能用的三条路（按优先级）：
-//       ① `ing.values` —— `Ingredient$Value[]`，每个 Value 有 `getItems()`（**正统，优先**）
-//       ② `ing.getValues()` / `ing.getStacks()` —— KubeJS 自己加的
-//       ③ `ing.stacks` —— KubeJS 的 `ItemStackSet`（可迭代）
-//     另外 **Java 数组不能调 `.iterator()`**（抛 InternalError，被 catch 吞掉，
-//     看着像"取不到"）—— 数组用下标 + `.length`。
+// 注意：注意： NeoForge 1.21.1 的 Ingredient 没有 getItems() —— 实测报
+//     Cannot find function getItems。能用的三条路（按优先级）：
+//       1 ing.values —— Ingredient$Value[]，每个 Value 有 getItems()（正统，优先）
+//       2 ing.getValues() / ing.getStacks() —— KubeJS 自己加的
+//       3 ing.stacks —— KubeJS 的 ItemStackSet（可迭代）
+//     另外 Java 数组不能调 .iterator()（抛 InternalError，被 catch 吞掉，
+//     看着像"取不到"）—— 数组用下标 + .length。
 function mcbIngredientIds(ing) {
   var out = []
   if (ing === null || ing === undefined) { out.push('#NULL'); return out }
@@ -1674,7 +1674,7 @@ function mcbIngredientIds(ing) {
     } catch (e) { errs.push('addArr:' + e) }
   }
 
-  // ① 正统：values[i].getItems()
+  // 1 正统：values[i].getItems()
   try {
     var vals = ing.values
     if (vals !== null && vals !== undefined) {
@@ -1684,7 +1684,7 @@ function mcbIngredientIds(ing) {
     }
   } catch (e0) { errs.push('values:' + e0) }
 
-  // ② KubeJS 的 getValues() / getStacks()
+  // 2 KubeJS 的 getValues() / getStacks()
   if (out.length === 0) {
     var cands = []
     try { var a = ing.getValues(); if (a) cands.push(a) } catch (e2) { errs.push('getValues:' + e2) }
@@ -1701,7 +1701,7 @@ function mcbIngredientIds(ing) {
     }
   }
 
-  // ③ ItemStackSet
+  // 3 ItemStackSet
   if (out.length === 0) {
     try {
       var s = ing.stacks
@@ -1716,9 +1716,9 @@ function mcbIngredientIds(ing) {
   return out
 }
 
-// 一条配方 → 给下游看的紧凑结构
+// 一条配方  ->  给下游看的紧凑结构
 //
-// `kind` 决定下游怎么"摆料 + 取产物"（见插件侧 `mcb/containers.py` 的容器模板表）：
+// kind 决定下游怎么"摆料 + 取产物"（见插件侧 mcb/containers.py 的容器模板表）：
 //   crafting / smelting / stonecutting / smithing
 function mcbRecipeInfo(recipe, holder, kind) {
   var info = { id: null, kind: kind || 'crafting', type: 'unknown',
@@ -1791,7 +1791,7 @@ function mcbRecipeIndex(server) {
 
   var n = 0
 
-  // 把一类配方灌进索引。**加新容器 = 在这里多一行**，别写新函数。
+  // 把一类配方灌进索引。加新容器 = 在这里多一行，别写新函数。
   function ingest(recipes, kind) {
     try {
       var it0 = recipes.iterator()
@@ -1811,7 +1811,7 @@ function mcbRecipeIndex(server) {
 
   ingest(list, 'crafting')
 
-  // ⚠️ **非合成的配方也要索引** —— 白要"把铁矿烧成锭"，光有 crafting 是不够的。
+  // 注意： 非合成的配方也要索引 —— 白要"把铁矿烧成锭"，光有 crafting 是不够的。
   //    冶炼/切石的产物种类远少于合成，代价很小。
   try { ingest(rm.getAllRecipesFor($RT.SMELTING), 'smelting') }
   catch (eS) { errs.push('SMELTING: ' + eS) }
@@ -1861,9 +1861,9 @@ function mcbNumOrNull(v) {
 
 // --- 环境（时间 / 天气）---------------------------------------------------
 //
-// ⚠️ **读法一律"字段 → 判 NaN → getter"** —— Rhino 下字段不存在时
-//    **不抛异常、只给 undefined**，光靠 catch 兜不住（见 mcbYawPitch 那个坑）。
-//    而且 getter 必须**写成字面量**，`obj['getX']()` 这种动态调用拿不到数。
+// 注意： 读法一律"字段  ->  判 NaN  ->  getter" —— Rhino 下字段不存在时
+//    不抛异常、只给 undefined，光靠 catch 兜不住（见 mcbYawPitch 那个坑）。
+//    而且 getter 必须写成字面量，obj['getX']() 这种动态调用拿不到数。
 function mcbEnv(level) {
   var out = { err: [] }
   if (level === null || level === undefined) { out.err.push('level 为空'); return out }
@@ -1891,18 +1891,18 @@ function mcbEnv(level) {
   return out
 }
 
-// --- 扫描能力探针（**先量再设计**）-----------------------------------------
+// --- 扫描能力探针（先量再设计）-----------------------------------------
 //
-// ⚠️⚠️ **为什么不照抄 mcpfabric 的半径**：
-//    KubeJS 跑在 Rhino 上，**每次 Java 调用都要过一层 JS↔Java 包装** ——
-//    纯 Java 里 100ns 的 `getBlockState`，在这里可能贵 10~100 倍。
-//    所以"服务端能扫多大"**是实测出来的，不是算出来的**。
+// 注意：注意： 为什么不照抄 mcpfabric 的半径：
+//    KubeJS 跑在 Rhino 上，每次 Java 调用都要过一层 JS <-> Java 包装 ——
+//    纯 Java 里 100ns 的 getBlockState，在这里可能贵 10~100 倍。
+//    所以"服务端能扫多大"是实测出来的，不是算出来的。
 //
 // 这个动作只读、不改世界，量三件事：
-//   ① 那几个关键 API 在 Rhino 下到底存不存在（`getSections` / `hasOnlyAir` /
-//      `getBlockEntities` / heightmap / `PalettedContainer`）
-//   ② **每次方块读的实际微秒数** —— 用它反推"50ms 预算能扫多少格"
-//   ③ 方块实体（箱子/熔炉那种）的迭代成本 —— POI 可能根本不用扫方块
+//   1 那几个关键 API 在 Rhino 下到底存不存在（getSections / hasOnlyAir /
+//      getBlockEntities / heightmap / PalettedContainer）
+//   2 每次方块读的实际微秒数 —— 用它反推"50ms 预算能扫多少格"
+//   3 方块实体（箱子/熔炉那种）的迭代成本 —— POI 可能根本不用扫方块
 function mcbScanProbe(player, arg) {
   var out = { err: [], ok: [], api: {}, bench: {} }
   var level = null
@@ -1922,7 +1922,7 @@ function mcbScanProbe(player, arg) {
     out.err.push('isEmpty: ' + e2)
   }
 
-  // 方块实体 —— POI 的**便宜路子**：直接拿箱子/熔炉那张表，不用扫 4096 个方块
+  // 方块实体 —— POI 的便宜路子：直接拿箱子/熔炉那张表，不用扫 4096 个方块
   try {
     var bes = chunk.getBlockEntities()
     var nbe = -1
@@ -1954,8 +1954,8 @@ function mcbScanProbe(player, arg) {
     try { out.api.statesStr = String(sec.getStates()).substring(0, 60); out.ok.push('section.getStates') } catch (e7) {
       out.err.push('getStates: ' + e7)
     }
-    // ⚠️ `PalettedContainer.count(Counter)` 要传一个 Java 函数式接口 ——
-    //    Rhino **不一定**会替我们把 JS 函数转成 SAM。试一下，能通就是大杀器
+    // 注意： PalettedContainer.count(Counter) 要传一个 Java 函数式接口 ——
+    //    Rhino 不一定会替我们把 JS 函数转成 SAM。试一下，能通就是大杀器
     //    （一次调用拿到整段 16³ 的方块统计，等于零成本）。
     try {
       var acc = 0
@@ -1978,8 +1978,8 @@ function mcbScanProbe(player, arg) {
   } catch (e9) { out.err.push('getHeight: ' + e9) }
 
   // ---- 基准：每次方块读多贵 ----
-  // ⚠️ N 要够大 —— 太小会量到**解释器/JIT 预热阶段**，把开销高估好几倍。
-  //    `mcb scanprobe 200000` 可以手动加码。
+  // 注意： N 要够大 —— 太小会量到解释器/JIT 预热阶段，把开销高估好几倍。
+  //    mcb scanprobe 200000 可以手动加码。
   var N = 100000
   try {
     var nArg = parseInt(arg, 10)
@@ -2036,28 +2036,28 @@ function mcbScanProbe(player, arg) {
 
 // --- 周边概览（T1）--------------------------------------------------------
 //
-// "我周围有什么" —— **大半径、便宜**。
+// "我周围有什么" —— 大半径、便宜。
 //
-// ⚠️⚠️ **为什么不逐方块扫**（2026-10-10 实测，别再来一遍）：
-//    KubeJS 跑在 Rhino 上，**每次 Java 调用要过一层 JS↔Java 包装** ——
-//    `getBlockState` 实测 **8~12 微秒**（原生 Java 约 0.1µs，**差 50~100 倍**）。
-//    → 50ms 预算只够读 **~6,000 格**。
-//      6 chunk 半径逐方块扫 = 43,264 列 × 4 次 ≈ 17 万次 ≈ **1.3 秒**，不可行。
-//    → 所以这里**只走两条便宜通道**：
-//        ① **方块实体**：`chunk.getBlockEntities()` 一次调用拿整块 chunk 的
+// 注意：注意： 为什么不逐方块扫（2026-10-10 实测，别再来一遍）：
+//    KubeJS 跑在 Rhino 上，每次 Java 调用要过一层 JS <-> Java 包装 ——
+//    getBlockState 实测 8~12 微秒（原生 Java 约 0.1µs，差 50~100 倍）。
+//     ->  50ms 预算只够读 ~6,000 格。
+//      6 chunk 半径逐方块扫 = 43,264 列 × 4 次 ≈ 17 万次 ≈ 1.3 秒，不可行。
+//     ->  所以这里只走两条便宜通道：
+//        1 方块实体：chunk.getBlockEntities() 一次调用拿整块 chunk 的
 //           箱子/熔炉/木桶/烟熏炉/漏斗/刷怪笼/告示牌/讲台/附魔台/信标/潜影盒/蜂箱
-//        ② **heightmap**：每列一次 `level.getHeight(...)`，再抽样读地表那格
+//        2 heightmap：每列一次 level.getHeight(...)，再抽样读地表那格
 //
-// ⚠️ **缺口（T2 要补的）**：**没有方块实体的 POI 这里拿不到** ——
+// 注意： 缺口（T2 要补的）：没有方块实体的 POI 这里拿不到 ——
 //    工作台、铁砧、床、堆肥桶、石切机、织布机、制箭台、传送门框。
-//    它和 `mcb scan`（定点找方块）是**互补**的，不是替代。
+//    它和 mcb scan（定点找方块）是互补的，不是替代。
 //
-// ⚠️ 另一个实测发现：整合包里的 `byepregen` mod 换掉了 `PalettedContainer`
-//    （`com.moepus.byepregen.PaletteContainer.*`）——
-//    **mcpfabric 那个"用 palette 一次聚合"的省法在这儿不成立**（实测 `count()` 只数出 1）。
+// 注意： 另一个实测发现：整合包里的 byepregen mod 换掉了 PalettedContainer
+//    （com.moepus.byepregen.PaletteContainer.*）——
+//    mcpfabric 那个"用 palette 一次聚合"的省法在这儿不成立（实测 count() 只数出 1）。
 //    别再试那条路。
-// 一个 chunk（相对玩家的原点 ox,oz，边长 16）**整块**都在半径 √RR 外吗？
-// 用**最近的那条边**判 —— 保守（宁可多扫不可漏扫），不然会切掉贴着边界的 chunk。
+// 一个 chunk（相对玩家的原点 ox,oz，边长 16）整块都在半径 √RR 外吗？
+// 用最近的那条边判 —— 保守（宁可多扫不可漏扫），不然会切掉贴着边界的 chunk。
 function mcbRingOut(ox, oz, RR) {
   var nx = ox > 0 ? ox : (ox + 16 < 0 ? ox + 16 : 0)
   var nz = oz > 0 ? oz : (oz + 16 < 0 ? oz + 16 : 0)
@@ -2082,7 +2082,7 @@ function mcbAround(player, radiusChunks, step) {
     return Math.round(Math.sqrt(dx * dx + dy * dy + dz * dz) * 10) / 10
   }
 
-  // ---- ① POI：按 chunk 走方块实体 ----
+  // ---- 1 POI：按 chunk 走方块实体 ----
   var chunks = []
   for (var dx = -radiusChunks; dx <= radiusChunks; dx++) {
     for (var dz = -radiusChunks; dz <= radiusChunks; dz++) {
@@ -2092,7 +2092,7 @@ function mcbAround(player, radiusChunks, step) {
   chunks.sort(function (a, b) { return a[2] - b[2] })     // 近的 chunk 先走
 
   var nChunk = 0, nBE = 0, i
-  var live = []          // 已经取到的 chunk —— 第②段**直接复用**，别再 getChunk 一遍
+  var live = []          // 已经取到的 chunk —— 第2段直接复用，别再 getChunk 一遍
   for (i = 0; i < chunks.length; i++) {
     if (mcbNowMs() - t0 > MCB_AROUND_MS_CHUNK) { out.truncatedChunks = chunks.length - i; break }
     var cx = chunks[i][0], cz = chunks[i][1]
@@ -2107,8 +2107,8 @@ function mcbAround(player, radiusChunks, step) {
     try { bes = ch.getBlockEntities() } catch (eBE) { continue }
     if (bes === null || bes === undefined) continue
 
-    // ⚠️ `LevelChunk.getBlockEntities()` 回的是 **Map**（不是 Collection），
-    //    所以要先 `.values()`。用 iterator 走 —— 比 `Java.from()` 稳。
+    // 注意： LevelChunk.getBlockEntities() 回的是 Map（不是 Collection），
+    //    所以要先 .values()。用 iterator 走 —— 比 Java.from() 稳。
     var it = null
     try { it = bes.values().iterator() } catch (eV) {
       try { it = bes.iterator() } catch (eV2) { it = null }
@@ -2143,9 +2143,9 @@ function mcbAround(player, radiusChunks, step) {
   out.poiTotal = out.poi.length
   out.poi = out.poi.slice(0, MCB_AROUND_POI_MAX)
 
-  // ---- ② 地表：heightmap 抽样 ----
+  // ---- 2 地表：heightmap 抽样 ----
   //
-  // ⚠️ **必须按 chunk 走，不能用 `level.getHeight(x,z)`** ——
+  // 注意： 必须按 chunk 走，不能用 level.getHeight(x,z) ——
   //    后者每次都要在世界里查一遍 chunk。实测地表抽样是总耗时的大头
   //    （每列约 62µs，比"两次 Java 调用"的估计高 3 倍 —— Rhino 连循环和算术都慢）。
   var $HM = null
@@ -2180,7 +2180,7 @@ function mcbAround(player, radiusChunks, step) {
           cols++
           if (yMin === null || h < yMin) yMin = h
           if (yMax === null || h > yMax) yMax = h
-          // ⚠️ 地表那格是 `h - 1` —— MOTION_BLOCKING 给的是"最高挡路方块**上面**那格"
+          // 注意： 地表那格是 h - 1 —— MOTION_BLOCKING 给的是"最高挡路方块上面那格"
           var sid = null
           try { sid = mcbBlockId(ch2.getBlockState(new $BP(bx0, h - 1, bz0))) } catch (eB2) { }
           if (sid !== null) {
@@ -2219,9 +2219,9 @@ function mcbAround(player, radiusChunks, step) {
 
 // 读一个坐标的方块"视觉属性"（诊断用）。
 //
-// ⚠️ 存在的理由：验证"射线能不能穿玻璃"**不需要让她瞄准** ——
+// 注意： 存在的理由：验证"射线能不能穿玻璃"不需要让她瞄准 ——
 //    瞄准会引入她走动、朝向滞后、擦边采样一堆干扰（2026-10-10 折腾了很久）。
-//    直接读这一格的属性，命题就一句话：`canOcclude()` 是 true 还是 false。
+//    直接读这一格的属性，命题就一句话：canOcclude() 是 true 还是 false。
 function mcbBlockInfo(player, x, y, z) {
   var out = { pos: [x, y, z], err: [] }
   var level = null
@@ -2235,16 +2235,16 @@ function mcbBlockInfo(player, x, y, z) {
   try { st = level.getBlockState(new $BP(x, y, z)) } catch (e2) { out.err.push('getBlockState: ' + e2); return out }
   out.id = mcbBlockId(st)
 
-  // 三个**视觉**语义的判据，各读各的 —— 哪个能用是探出来的
-  // ⚠️ `isSolidRender()` **这个映射里没有** —— Rhino 报
+  // 三个视觉语义的判据，各读各的 —— 哪个能用是探出来的
+  // 注意： isSolidRender() 这个映射里没有 —— Rhino 报
   //    "Can't find method BlockBehaviour$BlockStateBase.isSolidRender()"，别再试。
-  //    可用的视觉判据就是 `canOcclude` 和 `getLightBlock`。
+  //    可用的视觉判据就是 canOcclude 和 getLightBlock。
   try { out.canOcclude = !!st.canOcclude() } catch (e3) { out.err.push('canOcclude: ' + e3) }
   try { out.lightBlock = Number(st.getLightBlock()) } catch (e5) {
     try { out.lightBlock = Number(st.getLightBlock(level, new $BP(x, y, z))) } catch (e6) { }
   }
-  // 对照：**碰撞**语义（mcpfabric 的 `exposed` 用的就是它）—— 实测玻璃
-  // `collisionEmpty=false` 而 `canOcclude=false`，**所以拿碰撞箱当"看不看得见"会判错**。
+  // 对照：碰撞语义（mcpfabric 的 exposed 用的就是它）—— 实测玻璃
+  // collisionEmpty=false 而 canOcclude=false，所以拿碰撞箱当"看不看得见"会判错。
   // 放这儿就是为了让两种语义的差别肉眼可见。
   try { out.collisionEmpty = !!st.getCollisionShape(level, new $BP(x, y, z)).isEmpty() } catch (e7) { }
   return out
@@ -2267,14 +2267,14 @@ function mcbPlayerState(player) {
   } catch (e2) {
     out.food = null
   }
-  // 🍖 **吃东西探针**：服务端到底认不认"她正在使用物品"？
-  // 客户端日志已经证明 isUsingItem=true 了，但那只是**客户端的自我预测**
-  // （`MultiPlayerGameMode.useItem` 会在本地先跑一遍 `Item.use`）。
-  // 真正把面包吃掉的是**服务端**的 `LivingEntity.updateUsingItem` ——
-  // 它在 remaining 归零时调 `completeUsingItem()`，而那行有 `!isClientSide` 的守卫。
-  //   服务端 isUsing=false        → 包根本没到 / 被拒 → 问题在下行
-  //   服务端 isUsing=true 且 remain 在掉 → 服务端在吃，问题在别处
-  //   服务端 isUsing=true 但 remain 不动 → 服务端也卡住了
+  //  吃东西探针：服务端到底认不认"她正在使用物品"？
+  // 客户端日志已经证明 isUsingItem=true 了，但那只是客户端的自我预测
+  // （MultiPlayerGameMode.useItem 会在本地先跑一遍 Item.use）。
+  // 真正把面包吃掉的是服务端的 LivingEntity.updateUsingItem ——
+  // 它在 remaining 归零时调 completeUsingItem()，而那行有 !isClientSide 的守卫。
+  //   服务端 isUsing=false         ->  包根本没到 / 被拒  ->  问题在下行
+  //   服务端 isUsing=true 且 remain 在掉  ->  服务端在吃，问题在别处
+  //   服务端 isUsing=true 但 remain 不动  ->  服务端也卡住了
   try {
     var ui = null
     try { ui = player.useItem } catch (eU1) { }
@@ -2298,12 +2298,12 @@ function mcbPlayerState(player) {
   } catch (e4) {
     out.sleeping = null
   }
-  // 🌊 **氧气 / 在水里** —— 2026-10-10 加，起因是她淹在水里出不来。
+  //  氧气 / 在水里 —— 2026-10-10 加，起因是她淹在水里出不来。
   //
-  //    为什么必须单独报这一维：**溺水是"会慢慢死、但血量不一定掉"的情形**。
-  //    实测现场：她卡在水里 253 秒，事件流里 `drown` 每秒一条，
-  //    但 `dmg: 0`（身上挂着抗性 V）→ **反射只看 hp，于是永远不触发**，她就一直泡着。
-  //    ⭐ 教训：**凡是要"保命"的判据，都得从"状态"判，不能只从"伤害"判。**
+  //    为什么必须单独报这一维：溺水是"会慢慢死、但血量不一定掉"的情形。
+  //    实测现场：她卡在水里 253 秒，事件流里 drown 每秒一条，
+  //    但 dmg: 0（身上挂着抗性 V） ->  反射只看 hp，于是永远不触发，她就一直泡着。
+  //    ⭐ 教训：凡是要"保命"的判据，都得从"状态"判，不能只从"伤害"判。
   try {
     var air = null
     try { air = mcbNumOrNull(player.airSupply) } catch (eA1) {
@@ -2323,10 +2323,10 @@ function mcbPlayerState(player) {
   } catch (eU) {
     out.underWater = null
   }
-  // 她自己那一列的地表高度 —— **一次 heightmap 调用，几乎免费**。
-  // 用途：溺水反射要一个"往上浮到哪"的目标（`baritone goto <x> <地表y> <z>`）。
-  // ⚠️ 只查她脚下这一列，不做邻域 —— 反射是每秒跑的，不能扫一片。
-  // ⚠️ `mcbT2Height` 要 `mcbT2Setup()` 跑过才有值（它俩是共用的缓存），
+  // 她自己那一列的地表高度 —— 一次 heightmap 调用，几乎免费。
+  // 用途：溺水反射要一个"往上浮到哪"的目标（baritone goto <x> <地表y> <z>）。
+  // 注意： 只查她脚下这一列，不做邻域 —— 反射是每秒跑的，不能扫一片。
+  // 注意： mcbT2Height 要 mcbT2Setup() 跑过才有值（它俩是共用的缓存），
   //    不然传进去的是 null，getHeight 会抛 —— 这条路上必须显式补一次。
   try {
     mcbT2Setup()
@@ -2337,19 +2337,19 @@ function mcbPlayerState(player) {
     out.surfY = null
   }
 
-  // 🧭 **朝向（她自己的头朝哪）** —— 2026-10-10 加。
+  //  朝向（她自己的头朝哪） —— 2026-10-10 加。
   //
-  // 起因（用户实报）："**她声称自己没低头，但一直是低头状态**"。
-  // 现场实测：`mcb lookat` 读到 `pitch:81.3`（几乎垂直朝下），而她嘴里说
-  // "我哪有低头，是靴子沉啦。抬头了抬头了" —— **她连"自己在低头"都读不到**，
+  // 起因（用户实报）："她声称自己没低头，但一直是低头状态"。
+  // 现场实测：mcb lookat 读到 pitch:81.3（几乎垂直朝下），而她嘴里说
+  // "我哪有低头，是靴子沉啦。抬头了抬头了" —— 她连"自己在低头"都读不到，
   // 手里是零数据，只能编。
   //
-  // 落回我们那条律：**能力自我认知 = 工具表 + 状态包** ——
-  // 这条信息以前只有 `mc_lookat` 一个地方吐过（还包装成"你面朝X（基本在往下看）"），
-  // 而她不会去问那个问题。**状态包里有，才算她"知道"。**
+  // 落回我们那条律：能力自我认知 = 工具表 + 状态包 ——
+  // 这条信息以前只有 mc_lookat 一个地方吐过（还包装成"你面朝X（基本在往下看）"），
+  // 而她不会去问那个问题。状态包里有，才算她"知道"。
   //
-  // ⚠️ 读法复用 `mcbYawPitch`（字段 → getter → **从视线向量反推**），
-  //    实测走的就是最后那条（`rotVia:"look"`），一定通。
+  // 注意： 读法复用 mcbYawPitch（字段  ->  getter  ->  从视线向量反推），
+  //    实测走的就是最后那条（rotVia:"look"），一定通。
   try {
     var lookV = null
     try { lookV = player.getViewVector(1.0) } catch (eLV) { lookV = null }
@@ -2374,11 +2374,11 @@ function mcbChatData(since, me) {
     if (mcbChatBuf[i].seq > since) lines.push(mcbChatBuf[i])
   }
   if (lines.length > MCB_CHAT_PAGE) lines = lines.slice(lines.length - MCB_CHAT_PAGE)
-  // ⚠️ **距离在拉取时算，不在说话时算** —— 她要的是"**现在**他离我多远"，
+  // 注意： 距离在拉取时算，不在说话时算 —— 她要的是"现在他离我多远"，
   //    不是"他说话那一刻离我多远"。
-  // ⚠️⚠️ `me` 必须由**调用方**传进来（调用方才有 `event`）——
-  //    在这里自己调 `mcbServer()` 是错的：它要 event 参数，
-  //    不传会返回 null 并**每次调用都刷两条 ERROR 日志**（2026-10-10 踩过）。
+  // 注意：注意： me 必须由调用方传进来（调用方才有 event）——
+  //    在这里自己调 mcbServer() 是错的：它要 event 参数，
+  //    不传会返回 null 并每次调用都刷两条 ERROR 日志（2026-10-10 踩过）。
   if (me !== null && me !== undefined) {
     var mx = Number(me.x), my = Number(me.y), mz = Number(me.z)
     var mdim = ''
@@ -2433,7 +2433,7 @@ ServerEvents.basicCommand('mcb', event => {
     var since = 0
     try { since = parseInt(arg, 10) } catch (e) { since = 0 }
     if (isNaN(since) || since < 0) since = 0
-    // ⚠️ `me` 在这里取 —— 只有这一层有 `event`。`mcb chat` **不依赖白在线**，
+    // 注意： me 在这里取 —— 只有这一层有 event。mcb chat 不依赖白在线，
     //    所以她不在时 me 为 null，只是算不出距离，消息照样回。
     var meForChat = null
     try {
@@ -2445,8 +2445,8 @@ ServerEvents.basicCommand('mcb', event => {
   }
 
   // 事件增量 —— 「刚才都发生了什么」（挨打/死亡/进出服）。
-  // 和 `chat` 分开：聊天已经在聊天缓冲里带 seq 了，再录一份就是记两遍。
-  // ⚠️ **背包变动不在这里** —— 服务端的 `inventoryChanged` 实测不 fire，
+  // 和 chat 分开：聊天已经在聊天缓冲里带 seq 了，再录一份就是记两遍。
+  // 注意： 背包变动不在这里 —— 服务端的 inventoryChanged 实测不 fire，
   //    改由插件侧的拉取式 diff 负责（见上方那段注释）。
   if (action === 'events') {
     var evSince = 0
@@ -2456,7 +2456,7 @@ ServerEvents.basicCommand('mcb', event => {
     return
   }
 
-  // 查**任意**玩家的位置 —— 脱战要能"往主人方向跑"，就得知道主人在哪。
+  // 查任意玩家的位置 —— 脱战要能"往主人方向跑"，就得知道主人在哪。
   // 不依赖 Nanako 在线，所以放在她那条判断之前。
   if (action === 'where') {
     var ds2 = mcbServer(event)
@@ -2465,7 +2465,7 @@ ServerEvents.basicCommand('mcb', event => {
     if (!who) { mcbErr(event, 'where', '没给玩家名'); return }
     var tp = mcbFindPlayer(ds2, who)
     if (tp === null) {
-      // 不在线是**状态**不是故障 —— 和 state 一个规矩
+      // 不在线是状态不是故障 —— 和 state 一个规矩
       mcbOk(event, 'where', { online: false, name: who })
       return
     }
@@ -2475,7 +2475,7 @@ ServerEvents.basicCommand('mcb', event => {
     try { tout.z = mcbNumOrNull(tp.z) } catch (eW3) { tout.z = null }
     try { tout.dim = String(tp.level.dimension) } catch (eW4) { tout.dim = null }
     try { tout.hp = mcbNumOrNull(tp.health) } catch (eW5) { tout.hp = null }
-    // 顺带算出**离白多远** —— 问坐标的目的十有八九是"过去找他"，
+    // 顺带算出离白多远 —— 问坐标的目的十有八九是"过去找他"，
     // 让服务端一次算完，省掉插件再查一次 state 的往返。
     try {
       var me = mcbFindPlayer(ds2, MCB_TARGET)
@@ -2500,7 +2500,7 @@ ServerEvents.basicCommand('mcb', event => {
 
   var player = mcbFindPlayer(server, MCB_TARGET)
   if (player === null) {
-    // 「不在线」是**状态**不是**故障** —— 用 ok:true 包住，让调用方分得清
+    // 「不在线」是状态不是故障 —— 用 ok:true 包住，让调用方分得清
     // "管子断了" 和 "她人不在"
     if (action === 'state') {
       mcbOk(event, 'state', { online: false, name: MCB_TARGET })
@@ -2523,7 +2523,7 @@ ServerEvents.basicCommand('mcb', event => {
   }
 
   // 配方查询 —— "这东西怎么做"。不依赖客户端，也不依赖她在哪。
-  // ⚠️ 不依赖 Nanako 在线也更好，但放在这里够用了（她不在线时上面就 return 了）。
+  // 注意： 不依赖 Nanako 在线也更好，但放在这里够用了（她不在线时上面就 return 了）。
   if (action === 'recipe') {
     mcbOk(event, 'recipe', mcbRecipe(server, arg))
     return
@@ -2531,9 +2531,9 @@ ServerEvents.basicCommand('mcb', event => {
 
   // 周围扫描 —— 白"知道周围有什么"才能做计划
   if (action === 'scan') {
-    // ⚠️⚠️ **半径按预算反推，不写死**（2026-10-10 重写）。
-    //    这里原来是 `if (r > 16) r = 16`，注释写"16^3 = 4096 次读取" ——
-    //    **那个算法是错的**：半径 16 是 33³ = **35,937** 次，少算 8.8 倍。
+    // 注意：注意： 半径按预算反推，不写死（2026-10-10 重写）。
+    //    这里原来是 if (r > 16) r = 16，注释写"16^3 = 4096 次读取" ——
+    //    那个算法是错的：半径 16 是 33³ = 35,937 次，少算 8.8 倍。
     //    按实测 10µs/格，那是 ~360ms 的 tick 卡顿（默认值 8 也已经是 ~40ms）。
     //    现在按球体积反推：(4/3)πr³ ≤ MCB_SCAN_BUDGET。
     var r = 8
@@ -2553,15 +2553,15 @@ ServerEvents.basicCommand('mcb', event => {
     return
   }
 
-  // 周边概览 —— **大半径、便宜的**那一路（POI 走方块实体 + 地表走 heightmap）。
-  // ⚠️ 它和 `mcb scan` 是**互补**的，不是替代：
-  //    `scan`  = 定点找**某个方块**（工作台/矿），半径小（受预算限）
-  //    `around`= "周围有什么"（箱子/熔炉/刷怪笼 + 地形起伏），半径到 6-8 chunk
-  //    `around` 拿不到**没有方块实体的** POI（工作台/铁砧/床/堆肥桶）—— 那是 T2 的活
+  // 周边概览 —— 大半径、便宜的那一路（POI 走方块实体 + 地表走 heightmap）。
+  // 注意： 它和 mcb scan 是互补的，不是替代：
+  //    scan  = 定点找某个方块（工作台/矿），半径小（受预算限）
+  //    around= "周围有什么"（箱子/熔炉/刷怪笼 + 地形起伏），半径到 6-8 chunk
+  //    around 拿不到没有方块实体的 POI（工作台/铁砧/床/堆肥桶）—— 那是 T2 的活
   if (action === 'around') {
-    // ⚠️ 默认 **6 chunk / 步长 8** 是实测调出来的（2026-10-10）：
-    //    6/8 → 49ms、451 列、**跑完**；6/4 → 56ms 但只采到 320 列就被预算**截断**。
-    //    **被截断的细步长不如跑完的粗步长** —— 别以为步长越小越好。
+    // 注意： 默认 6 chunk / 步长 8 是实测调出来的（2026-10-10）：
+    //    6/8  ->  49ms、451 列、跑完；6/4  ->  56ms 但只采到 320 列就被预算截断。
+    //    被截断的细步长不如跑完的粗步长 —— 别以为步长越小越好。
     var rc = 6
     var stp = 8
     var parts = String(arg || '').split(' ')
@@ -2580,10 +2580,10 @@ ServerEvents.basicCommand('mcb', event => {
     return
   }
 
-  // T2：跨 tick 全分辨率扫描 —— **补 T1 的缺口**（没有方块实体的 POI：工作台/铁砧/
+  // T2：跨 tick 全分辨率扫描 —— 补 T1 的缺口（没有方块实体的 POI：工作台/铁砧/
   //     石切机/堆肥桶/传送门框…）。它是个后台任务，不阻塞 tick，结果进缓存。
   //     用法：
-  //       mcb t2 start [chunk数]   开一个任务（默认半径 6 chunk），**以发起者为圆心**
+  //       mcb t2 start [chunk数]   开一个任务（默认半径 6 chunk），以发起者为圆心
   //       mcb t2 status            进度（跑没跑完、扫了多少、花了多少 tick）
   //       mcb t2 get               结果（方块计数 + POI 列表）
   //       mcb t2 stop              取消
@@ -2649,38 +2649,38 @@ ServerEvents.basicCommand('mcb', event => {
     return
   }
 
-  // ⚠️⚠️ **closeGui 必须由服务端动手，不能整个转发给客户端**
-  //    （2026-10-09 深夜定位，完整分析见 `main/docs/04-必读坑.md` 坑 10s）
+  // 注意：注意： closeGui 必须由服务端动手，不能整个转发给客户端
+  //    （2026-10-09 深夜定位，完整分析见 main/docs/04-必读坑.md 坑 10s）
   //
   // 原来这一条也走下面的通用转发，客户端兜底走到了
-  // `player.clientSideCloseContainer()` —— **它只做本地那一半**
-  // （`containerMenu = inventoryMenu`），**不发 `ServerboundContainerClosePacket`**。
+  // player.clientSideCloseContainer() —— 它只做本地那一半
+  // （containerMenu = inventoryMenu），不发 ServerboundContainerClosePacket。
   // 原版是"先发包、再本地收尾"，我们只拿了后半截。
   //
-  // 后果：**客户端以为 id=0（背包），服务端还开着 id=1（那个箱子）**。
-  // 之后每一次 `handleInventoryMouseClick` 带的 containerId 都对不上 →
-  // **服务端静默丢弃**。症状最坑人：返回 sent:true、客户端日志也打了"已点格子"，
-  // **但世界毫无变化** —— 极易误判成"格子号算错了"。
-  // 脱节之后 **合成 / 开箱子 / 换快捷栏全都失效**。
+  // 后果：客户端以为 id=0（背包），服务端还开着 id=1（那个箱子）。
+  // 之后每一次 handleInventoryMouseClick 带的 containerId 都对不上  -> 
+  // 服务端静默丢弃。症状最坑人：返回 sent:true、客户端日志也打了"已点格子"，
+  // 但世界毫无变化 —— 极易误判成"格子号算错了"。
+  // 脱节之后 合成 / 开箱子 / 换快捷栏全都失效。
   //
-  // 正解：**服务端权威地关**，两边一起归位。这还能**修复已经脱节的状态**
+  // 正解：服务端权威地关，两边一起归位。这还能修复已经脱节的状态
   // （客户端侧修法是修不了现状的，得先重启客户端）。
   if (action === 'closeGui') {
     var closedId = -1
     var how = 'none'
     try { closedId = Number(player.containerMenu.containerId) } catch (eId) { }
 
-    // ① **先告诉客户端**：`ClientboundContainerClosePacket` → 客户端
-    //    `ClientPacketListener.handleContainerClose` → `clientSideCloseContainer()`
-    //    → 客户端的 containerMenu 回到 inventoryMenu。
+    // 1 先告诉客户端：ClientboundContainerClosePacket  ->  客户端
+    //    ClientPacketListener.handleContainerClose  ->  clientSideCloseContainer()
+    //     ->  客户端的 containerMenu 回到 inventoryMenu。
     //
-    //    ⚠️⚠️ **这一步不能省。** 踩过（2026-10-09）：只做服务端 `doCloseContainer()`
-    //    的话**客户端不知道**，它会一直以为自己还开着那个容器 ——
+    //    注意：注意： 这一步不能省。 踩过（2026-10-09）：只做服务端 doCloseContainer()
+    //    的话客户端不知道，它会一直以为自己还开着那个容器 ——
     //    于是又变成反方向的脱节（服务端 id=0 / 客户端 id=1），点格子照样被丢。
-    //    **关容器必须两边都通知到，缺一边就是脱节。**
+    //    关容器必须两边都通知到，缺一边就是脱节。
     //
-    //    ⚠️ 这是**服务端→客户端**的包，没有 sequence 校验问题
-    //    （那条铁律只管客户端→服务端）。参数在 1.20.2 之后被废弃过，
+    //    注意： 这是服务端 -> 客户端的包，没有 sequence 校验问题
+    //    （那条铁律只管客户端 -> 服务端）。参数在 1.20.2 之后被废弃过，
     //    所以两种构造都试一遍。
     var told = 'no'
     try {
@@ -2697,8 +2697,8 @@ ServerEvents.basicCommand('mcb', event => {
       console.error('[mcb] 通知客户端关容器失败: ' + ePkt)
     }
 
-    // ② **服务端权威地关**自己那一半。
-    //    ⚠️ 服务端上 `player.closeContainer()`**不存在**（实测），只能 `doCloseContainer()`。
+    // 2 服务端权威地关自己那一半。
+    //    注意： 服务端上 player.closeContainer()不存在（实测），只能 doCloseContainer()。
     try {
       player.doCloseContainer()
       how = 'doCloseContainer'
@@ -2706,7 +2706,7 @@ ServerEvents.basicCommand('mcb', event => {
       console.error('[mcb] 服务端关闭容器失败: ' + eC2)
     }
 
-    // ③ 再让客户端脚本把**画面**也撤掉（`setScreen(null)`）。
+    // 3 再让客户端脚本把画面也撤掉（setScreen(null)）。
     //    连接断过、或客户端脚本版本旧时，前两步可能没覆盖到。
     try {
       player.sendData(MCB_CHANNEL_DOWN, { action: 'closeGui', arg: '' })
@@ -2722,7 +2722,7 @@ ServerEvents.basicCommand('mcb', event => {
   try {
     player.sendData(MCB_CHANNEL_DOWN, { action: action, arg: arg })
     console.info('[mcb] 已下发 action=' + action + ' -> ' + MCB_TARGET)
-    // ⚠️ 这里只代表"已下发到她的客户端"，**不代表客户端真的执行了**。
+    // 注意： 这里只代表"已下发到她的客户端"，不代表客户端真的执行了。
     //    动作有没有生效，靠 mc_state 看坐标 / task 状态复核。
     mcbOk(event, action, { sent: true, target: MCB_TARGET })
   } catch (e) {
