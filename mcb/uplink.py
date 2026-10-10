@@ -139,7 +139,7 @@ class ChatUplink:
                 _trim_head(self._recent_self, 2)
                 continue
 
-            head = f"<{who}> {text}"
+            head = _speaker_line(who, text, line)
             self._ambient.append(head)
             _trim_head(self._ambient, self.ambient_limit)
             if self._is_wake(text):
@@ -298,6 +298,34 @@ def _as_int(value, default: int = 0) -> int:
 def _trim_head(items: list[str], limit: int) -> None:
     while len(items) > limit:
         items.pop(0)
+
+
+def _speaker_line(who: str, text: str, raw: dict) -> str:
+    """`<谁> 说了什么` —— **外加他在哪、离多远**。
+
+    ⚠️ **坐标是这条的重点**（用户 2026-10-10 定的）：
+    "**视距内自己看，视距外靠人告诉**" —— 她视距只有 2 chunk（32 格），
+    出了这个圈她**什么都看不见**，只能听人报。真人也没有世界地图，
+    是听别人说"山那边有个村"。
+
+    ⚠️ 距离是**拉取时**算的（服务端 `mcbChatData`），不是说话时算的 ——
+    她要的是"**现在**他离我多远"，不是"他说话那一刻"。
+    """
+    pos = raw.get("pos")
+    dist = raw.get("dist")
+    if not (isinstance(pos, list) and len(pos) == 3):
+        return f"<{who}> {text}"
+    where = f"（他在 ({_g(pos[0])},{_g(pos[1])},{_g(pos[2])})"
+    if isinstance(dist, (int, float)) and not isinstance(dist, bool):
+        where += f"，离你 {dist:g} 格"
+    where += "）"
+    return f"<{who}> {text}{where}"
+
+
+def _g(v: object) -> str:
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        return f"{v:g}"
+    return "?"
 
 
 def _clean_for_game_chat(text: str) -> str:

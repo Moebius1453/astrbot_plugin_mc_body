@@ -32,6 +32,7 @@ from .mcb.rcon import BridgeError, RconBridge
 from .mcb import containers as mcb_containers
 from .mcb.containers import ContainerIO
 from .mcb.craft import CraftRunner, Crafter
+from .mcb.events import EventFeed
 from .mcb.journal import Journal
 from .mcb.places import PlaceBook
 from .mcb.reflex import ReflexGuard
@@ -101,6 +102,11 @@ class McBodyPlugin(Star):
         self.io = ContainerIO(self.bridge)
         self.tasks = TaskRunner(self.bridge, self.journal, io=self.io)
 
+        # 事件流 —— 「刚才都发生了什么」（挨打/死亡/进出服/背包变动）。
+        # ⚠️ 和 `uplink.py` 的聊天**分工不同、两张表**：那张管"人说的话"，
+        #    这张管"聊天以外的事"。合表就是同一件事记两遍（见 mcb/events.py 头部）。
+        self.events = EventFeed(self.bridge, self.journal)
+
         self.reflex = ReflexGuard(
             self.bridge,
             interval=float(self._cfg("reflex_interval_seconds", 1)),
@@ -121,6 +127,9 @@ class McBodyPlugin(Star):
         self._last_notify_at = 0.0
         # 数她经历了多少次 LLM 请求 —— 用来"每 N 次附一次状态包"（见 inject_body_state）
         self._llm_calls = 0
+        # 游戏公屏的**已读游标** —— 和 uplink 的 `_last_seq` **故意分开**：
+        # 那个管"要不要唤醒她"，这个管"她看没看见"，共用一个会互相吃消息。
+        self._chat_seen_seq = 0
 
     async def _notify(self, facts: str) -> None:
         """把一个**处境事实**推到白的会话里（她/用户能看见）。
@@ -167,24 +176,58 @@ class McBodyPlugin(Star):
         """
         if not self._cfg("enable_body_state", True):
             return
+        # ⚠️ **聊天是"新的就立刻给"，不受 every 节流**（用户 2026-10-10）：
+        #    状态晚三轮无所谓（血还在掉），但**有人跟你说话晚三轮就蠢了**。
+        #    先看有没有新聊天，有就这一轮一定注。
+        chat_lines, has_new_chat = await self._pull_chat()
+
         self._llm_calls += 1
         every = max(1, int(self._cfg("body_state_every", 3)))
         # 第一次就给 —— 她一开始就该知道自己站在哪、什么状态
-        if self._llm_calls != 1 and self._llm_calls % every != 0:
+        due = (self._llm_calls == 1 or self._llm_calls % every == 0)
+        if not due and not has_new_chat:
             return
         try:
             data, err = await self._call("mcb state")
             if err or not data.get("online"):
                 return
+            # ⚠️ **聊天只在她"被唤醒的那一刻"由 uplink 注入是不够的** ——
+            #    实测（2026-10-10）她在 QQ 会说"我听不见游戏聊天"，
+            #    因为那条通路不在她的自我模型里。所以：**聊天也当上下文数据包的一部分**，
+            #    和 [body]/[log] 一起给，并配一段接线说明（见 render.WIRING_NOTE）。
             packet = render.state_packet(
-                data, self.reflex.stance, self.tasks.status(), self.journal, self.places
+                data, self.reflex.stance, self.tasks.status(), self.journal, self.places,
+                chat_lines if has_new_chat else None,
+                wiring=self._cfg("enable_wiring_note", True),
             )
             from astrbot.core.agent.message import TextPart
             req.extra_user_content_parts.append(TextPart(text=packet))
-            logger.debug(f"[mc_body] 已附状态包（第 {self._llm_calls} 次请求）")
+        except Exception as exc:  # noqa: BLE001 - 注入失败绝不能让她这条消息也发不出去
+            logger.warning(f"[{PLUGIN_NAME}] 状态注入失败（不影响对话）：{exc}")
+
+    async def _pull_chat(self) -> tuple[list[dict], bool]:
+        """拉新的游戏公屏消息。返回 (新行, 有没有新的)。
+
+        ⚠️ 用一个**独立的游标** `_chat_seen_seq`，**不复用** uplink 的 `_last_seq` ——
+        uplink 关心的是"要不要唤醒她"，我们关心的是"她看没看见"，
+        两者语义不同，共用一个游标会互相吃消息。
+        """
+        try:
+            data, err = await self._call(f"mcb chat {self._chat_seen_seq}")
+            if err:
+                return [], False
         except Exception as exc:  # noqa: BLE001
-            # ⚠️ 附件失败**绝不能影响她这一轮对话** —— 感知是锦上添花，不是命脉
-            logger.warning(f"[mc_body] 状态包注入失败（忽略）：{exc}")
+            logger.debug(f"[{PLUGIN_NAME}] 拉聊天失败：{exc}")
+            return [], False
+        lines = [x for x in (data.get("lines") or []) if isinstance(x, dict)]
+        if not lines:
+            return [], False
+        newest = max(
+            (int(float(x.get("seq") or 0)) for x in lines), default=self._chat_seen_seq
+        )
+        if newest > self._chat_seen_seq:
+            self._chat_seen_seq = newest
+        return lines, True
 
     # ---- 生命周期 -------------------------------------------------------
 
@@ -214,6 +257,10 @@ class McBodyPlugin(Star):
         else:
             logger.info(f"[{PLUGIN_NAME}] 防御反射已关闭（enable_reflex=false）")
 
+        # 事件流跟着反射一起开关 —— 两者都是"常驻在跑的后台感知"，没必要拆成两个开关
+        if self._cfg("enable_reflex", True):
+            self.events.start()
+
         logger.info(
             f"[{PLUGIN_NAME}] 已加载，RCON 目标 {self.bridge.host}:{self.bridge.port}"
         )
@@ -223,6 +270,7 @@ class McBodyPlugin(Star):
         #    会卡在这个 await 上。停任务顺带把她的寻路也取消掉。
         await self.tasks.stop(quiet=True)
         await self.reflex.stop()
+        await self.events.stop()
         await self.uplink.stop()
         await self.bridge.close()
         logger.info(f"[{PLUGIN_NAME}] 已卸载，RCON 连接已关闭")
@@ -383,12 +431,23 @@ class McBodyPlugin(Star):
             if hit is not None:
                 name, place = hit
                 tx, tz = int(float(place["x"])), int(float(place["z"]))
+                # ⚠️ **顺手做一次指纹自检** —— 去一个很久没去的地方，
+                #    最该知道的就是"那地方还在不在"。一次 RCON 往返，很便宜。
+                #    抄 mcpfabric `memory.ts` 的 `valid/changed/gone`。
+                status = self.places.check(
+                    name, await self._block_at(place.get("x"), place.get("y"), place.get("z"))
+                )
                 _, err = await self._call(f"mcb baritone goto {tx} {tz}")
                 if err:
                     return f"没能让她出发：{err}"
+                warn = {
+                    "changed": "⚠️ 不过**那地方已经和记的时候不一样了** —— 到那儿先看一眼再说。",
+                    "gone": "❌ 而且**那儿已经空了** —— 多半被挖掉或炸没了，可能白跑一趟。",
+                }.get(status, "")
                 return (f"出发去「{name}」（{tx}, {tz}）"
                         + (f"，那儿是{place['what']}" if place.get("what") else "")
-                        + "。过会儿用 mc_state 看坐标确认到没到。")
+                        + "。过会儿用 mc_state 看坐标确认到没到。"
+                        + ("\n" + warn if warn else ""))
 
             # ② 不是地点名 → 当方块注册名在附近扫
             block_id = want if ":" in want else f"minecraft:{want}"
@@ -423,22 +482,26 @@ class McBodyPlugin(Star):
     @filter.llm_tool(name="mc_place")
     async def mc_place(self, event: AstrMessageEvent, action: str = "list",
                        name: str = "", what: str = "", note: str = ""):
-        """**地点簿** —— 记住 / 查看 / 忘掉「哪儿是什么」。
+        """**地点簿** —— 记住 / 查看 / 自检 / 忘掉「哪儿是什么」。
 
         你的扫描只有附近 16 格，出了这个圈你就是瞎的。**把重要的地方记下来**，
         以后 `mc_goto near="名字"` 就能直接过去，不用任何人报坐标。
 
         · `action="remember"` —— **把你现在站的地方记下来**（要起个 `name`）。
           顺手写 `what`（这儿是什么），以后翻到能看懂。
+          记的时候会**自动存下你脚下方块的指纹**。
         · `action="list"` —— 看看记过哪些地方
+        · `action="check"` —— **那地方还是原来的样子吗？** 逐个比对指纹，
+          回「没变 / 变了 / 没了 / 说不准」。给 `name` 就只查那一个。
+          ⚠️ 什么时候该查：**很久没去过的据点、被炸过的地方、别人的地盘**。
         · `action="forget"` —— 忘掉一个（给 `name`）
 
         **该记的时候**：造了个据点、发现一块田、放了箱子、找到矿洞入口、
         墓碑在哪… **走过的路会忘，记下来才不会忘。**
 
         Args:
-            action(string): "remember"（记下当前位置）/ "list"（列出来）/ "forget"（忘掉）。
-            name(string): 地点名，起个你自己记得住的（"家"、"麦田"、"矿洞口"）。
+            action(string): "remember" / "list" / "check" / "forget"。
+            name(string): 地点名，起个你自己记得住的（"家"、"麦田"、"矿洞口"）。check 时可只给一个。
             what(string): 这儿是什么（比名字多说一点）。
             note(string): 备注（可选）。
         """
@@ -458,14 +521,65 @@ class McBodyPlugin(Star):
                 return f"读不到坐标，记不了：{err}"
             if not data.get("online"):
                 return "她不在线，拿不到坐标。"
+            px, py, pz = data.get("x") or 0, data.get("y") or 0, data.get("z") or 0
+            # **顺手把脚下方块的指纹也记上** —— 以后就能知道"这地方变了没"。
+            # ⚠️ 读脚底下一格（`y-1`），不是脚下那格 —— 站的地方永远是空气，没有信息量。
+            fp = await self._block_at(px, float(py) - 1, pz)
             got = self.places.remember(
-                name, data.get("x") or 0, data.get("y") or 0, data.get("z") or 0,
+                name, px, py, pz,
                 dim=str(data.get("dim") or ""), what=what, note=note,
+                fp=fp or "",
             )
             self.journal.add("body", f"记了个地方：{got}")
             return got
 
-        return f"不认得 action={action!r}。只认 remember / list / forget。"
+        if act in ("check", "verify", "valid", "diff"):
+            return await self._check_places(name)
+
+        return f"不认得 action={action!r}。只认 remember / list / check / forget。"
+
+    async def _block_at(self, x, y, z) -> str | None:
+        """读某个坐标上的方块 id。读不到回 None（**不是空串** —— 空串会被当成"没了"）。"""
+        try:
+            tx, ty, tz = int(float(x)), int(float(y)), int(float(z))
+        except (TypeError, ValueError):
+            return None
+        try:
+            data, err = await self._call(f"mcb blockinfo {tx} {ty} {tz}")
+        except Exception:  # noqa: BLE001
+            return None
+        if err:
+            return None
+        got = data.get("id")
+        return str(got) if got else None
+
+    async def _check_places(self, name: str = "") -> str:
+        """比对地点簿里的指纹 —— **那地方还是原来的样子吗**。
+
+        ⚠️ 每个地方要一次 RCON 往返，所以**封顶**（12 个）。**不做事前缓存**：
+        这个功能的意义就是"现在去看一眼"，缓存等于自欺。
+        """
+        rows = self.places.list()
+        if not rows:
+            return "地点簿是空的 —— 还没记过任何地方。"
+        if name.strip():
+            hit = self.places.match(name)
+            if hit is None:
+                return f"地点簿里没有「{name}」。"
+            rows = [dict(hit[1], name=hit[0])]
+
+        lines: list[str] = []
+        for r in rows[:12]:
+            key = str(r.get("name") or "?")
+            status = self.places.check(key, await self._block_at(r.get("x"), r.get("y"), r.get("z")))
+            mark = {"ok": "✅ 没变", "changed": "⚠️ **变了**", "gone": "❌ **没了**",
+                    "unknown": "❓ 说不准"}.get(status, status)
+            lines.append(f"· 「{key}」({r.get('x'):g},{r.get('y'):g},{r.get('z'):g}) —— {mark}"
+                         + (f"（记的时候是 {r.get('fp')}）" if status in ("changed", "gone") and r.get("fp") else ""))
+        if len(rows) > 12:
+            lines.append(f"…（还有 {len(rows) - 12} 个没查 —— 一次只查 12 个，每个要一次往返）")
+        lines.append("⚠️ 「说不准」= 当初没记指纹、或现在读不到那个坐标 —— **不等于没变**。")
+        return "地点自检：\n" + "\n".join(lines)
 
     @filter.llm_tool(name="mc_follow")
     async def mc_follow(self, event: AstrMessageEvent, player: str):
@@ -893,22 +1007,128 @@ class McBodyPlugin(Star):
             return "日志是空的 —— 要么刚重启过，要么真的什么都还没发生。"
         return f"最近 {min(n, len(self.journal))} 条：\n{self.journal.render(n)}"
 
-    @filter.llm_tool(name="mc_look")
-    async def mc_look(self, event: AstrMessageEvent, question: str = ""):
+    @filter.llm_tool(name="mc_events")
+    async def mc_events(self, event: AstrMessageEvent, count: int = 20):
+        """**刚才都发生了什么** —— 挨打/死亡/谁进服退服/你背包里多了少了什么。
+
+        什么时候用：
+        · 你身上东西突然变了，想知道是**谁给的**（"得到 diamond_sword×1"）
+        · 你掉血了但没看清是谁打的（"挨打 ← zombie -3.5hp 剩 12.7"）
+        · 想知道**谁在线**、刚谁进服了
+        · 用户问"刚才有人来过吗"
+
+        ⚠️ 和 `mc_journal` 的分工：
+        · `mc_events` = **外面发生的事**（别人做了什么、世界发生了什么）
+        · `mc_journal` = **你自己做的事**（插了几根火把、烧成了什么）
+
+        ⚠️ **背包变动是攒过才报的** —— 挖矿时不会一条一块石头地刷屏，
+        而是合成一行"得到 cobblestone×23"。所以你看到的是**聚合后的**，
+        不是逐次的时间线。想要精确的当下状态就 `mc_inventory`。
+
+        Args:
+            count(number): 往回看多少条，默认 20，最多 60。
+        """
+        if (deny := self._guard(event)):
+            return deny
+        try:
+            n = max(1, min(int(count), 60))
+        except (TypeError, ValueError):
+            n = 20
+        return "最近发生的事：\n" + self.events.render(n)
+
+    @filter.llm_tool(name="mc_around")
+    async def mc_around(self, event: AstrMessageEvent):
+        """**看看周围一圈有什么** —— 大范围概览：地势 + 地表成分 + 附近的箱子/机器/设施。
+
+        ⚠️ 和另外两个的**分工**：
+        · 问"**周围环境怎么样**""这附近有箱子吗""地势平不平" → **用这个**（覆盖 ~96 格）
+        · 问"**这一格是什么**"（准星指着的） → 用 `mc_lookat`（精确到方块、零成本）
+        · 问"**某个具体方块在哪**"（工作台/熔炉的坐标） → 用 `mc_goto near`
+
+        ⚠️ **它看不见什么**：只列**有方块实体**的设施（箱子/熔炉/木桶/床/告示牌/
+        刷怪笼/传送门）。**工作台、铁砧、石切机、堆肥桶这些不在里面** —— 找它们用 `mc_goto near`。
+
+        ⚠️ 慢 —— 一次约 50ms 服务端时间（一个 tick），别连着猛调。
+        """
+        if (deny := self._guard(event)):
+            return deny
+        data, err = await self._call("mcb around")
+        if err:
+            return f"看不了：{err}"
+        return render.describe_around(data)
+
+    @filter.llm_tool(name="mc_where")
+    async def mc_where(self, event: AstrMessageEvent, player: str):
+        """查**某个玩家在哪** —— 你、或者服务器上任何一个人。
+
+        什么时候用：
+        · 想过去找某人 → 先问出坐标，再 `mc_goto` 过去
+        · 想知道自己离对方多远
+
+        ⚠️ 这是**服务端直接读的真值**，不需要对方说话或同意。
+        所以用的时候心里有数：你在问"他在哪"，而不是"他刚才在哪说的"。
+
+        Args:
+            player(string): 玩家名（游戏里的 ID）。
+        """
+        if (deny := self._guard(event)):
+            return deny
+        who = " ".join(str(player or "").split())
+        if not who:
+            return "得说清楚找谁。"
+        data, err = await self._call(f"mcb where {who}")
+        if err:
+            return f"查不到：{err}"
+        return render.describe_where(data, who)
+
+    @filter.llm_tool(name="mc_chat_log")
+    async def mc_chat_log(self, event: AstrMessageEvent, count: int = 20):
+        """**翻游戏公屏** —— 谁在游戏里说了什么，连他当时站在哪。
+
+        什么时候用：
+        · 用户问"刚才有人在游戏里说话吗""他们聊了什么"
+        · 你在游戏里被叫了名字、想回头看上下文
+        · 想知道某个人**在哪**说的那句话（每条都带他的坐标和离你多远）
+
+        ⚠️ **你本来就听得见公屏** —— 有人叫你的名字会直接把你唤醒；
+        新消息也会自动出现在你每轮收到的 `[chat]` 段里。这个工具是给你**主动往前翻**用的。
+
+        Args:
+            count(number): 往回翻多少条，默认 20，最多 50。
+        """
+        if (deny := self._guard(event)):
+            return deny
+        try:
+            n = max(1, min(int(count), 50))
+        except (TypeError, ValueError):
+            n = 20
+        data, err = await self._call("mcb chat 0")
+        if err:
+            return f"翻不到：{err}"
+        lines = [x for x in (data.get("lines") or []) if isinstance(x, dict)]
+        if not lines:
+            return "游戏公屏是空的 —— 还没人说过话。"
+        return f"游戏公屏最近 {min(n, len(lines))} 条：\n" + render.describe_chat(lines, n)
+
+    @filter.llm_tool(name="mc_screenshot")
+    async def mc_screenshot(self, event: AstrMessageEvent, question: str = ""):
         """**看一眼你周围** —— 截下你游戏画面，转述成文字告诉你。
 
         你平时只能"读数据"，看不见画面。这个工具给你**眼睛**。
+        ⚠️ 要"我正看着什么"（准星指的那个方块/生物）请走 `mc_lookat` ——
+        它是即时的、免费的；这个要截图 + 调识图 API，慢得多。
 
         什么时候用：
-        · 想知道"我面前是什么""这儿长什么样""那个方块是什么"
+        · 想知道"这儿长什么样""这地方好看吗"（**风景和整体印象**，
+          这是 `mc_lookat` 给不了的）
         · 数据说不清的时候（`mc_state` 只有坐标，看不见风景）
         · 想确认某件事成没成（东西放对地方了吗）
 
         ⚠️ 三件事你得知道：
         1. **慢** —— 截图 + 传 + 识图，好几秒到十几秒
         2. **糊** —— 你的画面只有 640×360，看清轮廓和颜色，认不清小字
-        3. **只照到你正对着的** —— 第一人称视角，背后的看不见。
-           想换个角度就先走过去或者转头，再调一次
+        3. **只照到你正对着的，而且远处是雾** —— 第一人称视角，背后的看不见；
+           你的视距只有 32 格，超出就是雾。想换个角度就先走过去或者转头，再调一次
 
         Args:
             question(string): 你想知道什么（可选），比如"我面前是什么方块""田里熟了没"。
@@ -919,6 +1139,28 @@ class McBodyPlugin(Star):
         if not self._cfg("enable_sight", True):
             return "看东西的功能被管理员关掉了。"
         return await self.sight.look(str(question or ""))
+
+    @filter.llm_tool(name="mc_lookat")
+    async def mc_lookat(self, event: AstrMessageEvent):
+        """**你现在正看着什么** —— 准星指着的那一样东西，立刻就有答案。
+
+        看的是**视线尽头最近的那样东西**：如果是一只生物/掉落物，就回它；
+        否则回你正对着的方块（含它在哪个面）。
+        顺带回你的**朝向**（`facing`：south/northwest…）—— 你讲方位时能用上。
+
+        ⚠️ 和 `mc_screenshot` 的分工：
+        · 问"**这一格是什么**""我看的是鸡还是石头" → **用这个**（即时、免费）
+        · 问"**这儿长什么样**""周围环境如何" → 用 `mc_screenshot`（慢、要调 API）
+
+        ⚠️ 你的视线只有约 4.5 格。`target=none` 说明你在看空气/看天 ——
+        想看远处的东西得先 `mc_goto` 走过去，或者调 `mc_screenshot` 看全景。
+        """
+        if (deny := self._guard(event)):
+            return deny
+        data, err = await self._call("mcb lookat")
+        if err:
+            return f"看不了：{err}"
+        return render.describe_look(data, self.places)
 
     # ---- 调试入口 -------------------------------------------------------
 

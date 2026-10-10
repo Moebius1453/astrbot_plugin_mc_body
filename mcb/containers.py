@@ -478,9 +478,13 @@ def _within(state: dict, target, radius: float) -> bool:
 async def find_block(bridge, block_id: str, radius: int = 16) -> list[int] | None:
     """附近找某个方块，返回 [x, y, z]；没有返回 None。
 
+    ⚠️ **2026-10-10 起半径由服务端按预算钳制** —— 传 16 实际只会扫到 11
+    （服务端 `MCB_SCAN_BUDGET`，实测 Rhino 下每格 ~10µs，再大就是几百毫秒的卡顿）。
+    返回值里的 `clampedFrom`/`clampedTo` 能看到有没有被钳。
+
     ⚠️ 扫描**不会截断类型列表**了（曾经 `slice(0,25)` 把唯一的工作台挤掉，
     见 docs/04 坑 10r）—— 但**全图只有一个**的那种方块仍然容易落在半径外，
-    所以找不到时该考虑加大半径，而不是断言"没有"。
+    所以找不到时该考虑换个办法（`mc_around` 走方块实体那条路），而不是断言"没有"。
     """
     try:
         sc = (await bridge.call(f"mcb scan {int(radius)}")).get("data") or {}

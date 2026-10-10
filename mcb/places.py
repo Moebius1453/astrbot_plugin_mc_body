@@ -43,6 +43,9 @@ MAX_NAME = 24
 MAX_WHAT = 40
 MAX_NOTE = 80
 
+# 指纹（那个坐标上的方块 id）长度上限 —— 正常就 "minecraft:crafting_table" 这么长
+MAX_FP = 64
+
 
 class PlaceBook:
     """地点簿。**同名覆盖**，**写磁盘**。"""
@@ -81,8 +84,14 @@ class PlaceBook:
     # ---- 写 -------------------------------------------------------------
 
     def remember(self, name: str, x: float, y: float, z: float, *,
-                 dim: str = "", what: str = "", note: str = "") -> str:
-        """记一个地方。**同名覆盖**（滚动更新）。返回一句人话。"""
+                 dim: str = "", what: str = "", note: str = "",
+                 fp: str = "") -> str:
+        """记一个地方。**同名覆盖**（滚动更新）。返回一句人话。
+
+        `fp` = **指纹**：记的这一刻，那个坐标上是什么方块（方块 id）。
+        下次再查到它就能知道**那地方变了没**（`check()`）。
+        ⚠️ 抄的是 mcpfabric `memory.ts` 的 `fingerprint` + `valid/changed/gone` 自检。
+        """
         key = _clean(name, MAX_NAME)
         if not key:
             return "得给这个地方起个名字。"
@@ -96,6 +105,9 @@ class PlaceBook:
             # ⚠️ 新描述为空时**保留旧的** —— 她只想刷新坐标，不该把"这是什么"抹掉
             "what": _clean(what, MAX_WHAT) or (old or {}).get("what", ""),
             "note": _clean(note, MAX_NOTE) or (old or {}).get("note", ""),
+            # ⚠️ 指纹**只在明确给了新的才覆盖** —— 读不到方块时别把旧指纹抹成空，
+            #    那样会丢掉"这地方原来是什么"这唯一一条线索
+            "fp": _clean(fp, MAX_FP) or (old or {}).get("fp", ""),
             "seen": time.time(),
         }
         self._places[key] = entry
@@ -105,6 +117,27 @@ class PlaceBook:
         verb = "更新了" if old else "记住了"
         return (f"{verb}「{key}」：({entry['x']:g}, {entry['y']:g}, {entry['z']:g})"
                 + (f" —— {entry['what']}" if entry["what"] else ""))
+
+    def check(self, name: str, current: str | None) -> str:
+        """比对指纹 —— **那地方还是原来的样子吗**。
+
+        返回 `ok` / `changed` / `gone` / `unknown`（没记指纹或读不到就是 unknown）。
+
+        ⚠️ **`unknown` 不等于 `ok`** —— 「不知道」和「没变」是两件事，
+        混在一起她就会以为一切正常（docs/04 坑 10f 同一个道理）。
+        """
+        hit = self.get(name)
+        if hit is None:
+            return "unknown"
+        was = str(hit.get("fp") or "")
+        if not was or current is None:
+            return "unknown"
+        cur = str(current)
+        if cur == was:
+            return "ok"
+        if not cur or "air" in cur:
+            return "gone"      # 那格空了 —— 被挖掉/被炸没了
+        return "changed"
 
     def forget(self, name: str) -> str:
         key = _clean(name, MAX_NAME)
@@ -138,6 +171,32 @@ class PlaceBook:
             if low in k.lower() or k.lower() in low:
                 return k, v
         return None
+
+    def near(self, x: float, y: float, z: float, *, radius: float = 8.0,
+             dim: str = "") -> tuple[str, dict, float] | None:
+        """离这个坐标**最近**的记过的地点（在 radius 内）。没有就 None。
+
+        给"我正看着什么"用 —— 让她认出"这是我记过的熔炉区"。
+        ⚠️ `dim` 只在**两边都非空**时比，且只比 `:` 后面那截 ——
+        我们存过 "overworld"，也见过 "minecraft:overworld"，直接比字符串会假不匹配。
+        """
+        want = str(dim or "").split(":")[-1].lower()
+        best = None
+        bestd = float(radius)
+        for k, v in self._places.items():
+            have = str(v.get("dim") or "").split(":")[-1].lower()
+            if want and have and want != have:
+                continue
+            try:
+                d = ((float(v["x"]) - x) ** 2 + (float(v["y"]) - y) ** 2
+                     + (float(v["z"]) - z) ** 2) ** 0.5
+            except (KeyError, TypeError, ValueError):
+                continue
+            if d <= bestd:
+                best, bestd = (k, v), d
+        if best is None:
+            return None
+        return best[0], best[1], round(bestd, 1)
 
     def list(self) -> list[dict]:
         """按**最近去过**排序（常用的/新的在前）。"""

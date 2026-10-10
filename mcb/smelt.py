@@ -26,7 +26,8 @@ from .containers import ContainerIO, open_block
 FURNACE_BLOCK = "minecraft:furnace"
 FURNACE_CLS = "FurnaceMenu"
 
-# 走到熔炉附近再开。⚠️ 服务端 `mcb scan` 半径上限是 16，给再大也没用。
+# 走到熔炉附近再开。⚠️ 服务端 `mcb scan` 的半径**由预算钳制**（2026-10-10 起），
+# 传 16 实际只扫到约 11 —— 再大就是几百毫秒的 tick 卡顿（实测 Rhino 每格 ~10µs）。
 FURNACE_RADIUS = 16
 
 # 燃料候选。**只放"塞进熔炉燃料格一定能烧"的东西**，并按耐烧程度排序。
