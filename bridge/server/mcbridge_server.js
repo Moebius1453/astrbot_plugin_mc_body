@@ -490,6 +490,8 @@ function mcbPlayerName(pl) {
   return null
 }
 
+var mcbWalkIntent = null
+
 const MCB_PLACED_KEY = 'mc_body_placed_v1'
 
 function mcbPlacedTable(level) {
@@ -575,10 +577,17 @@ BlockEvents.broken(event => {
         '[mc:permission] error: ' + verdict.kind + '；不能拆 ' + fact.block
           + ' @ ' + fact.pos.join(',') + '：' + deny
           + '。请停止这项操作并告诉用户，重复寻路不会获得许可。',
-        { by: fact.pos.join(','), pos: fact.pos, block: fact.block })
+        { by: fact.pos.join(',') + ':' + (mcbWalkIntent ? mcbWalkIntent.token : ''),
+          pos: fact.pos, block: fact.block,
+          walkToken: mcbWalkIntent ? mcbWalkIntent.token : '',
+          walkOwner: mcbWalkIntent ? mcbWalkIntent.owner : '' })
     }
   } catch (err) {
     deny = '权限事实读取失败: ' + err
+    mcbEvAdd('permission', MCB_TARGET, '[mc:permission] error: refused；' + deny,
+      { by: 'facts-error:' + (mcbWalkIntent ? mcbWalkIntent.token : ''),
+        walkToken: mcbWalkIntent ? mcbWalkIntent.token : '',
+        walkOwner: mcbWalkIntent ? mcbWalkIntent.owner : '' })
     console.error('[mcb] ' + deny)
   }
   // cancel 通过 EventExit 结束处理，不能被上面的错误处理吞掉。
@@ -2834,8 +2843,25 @@ ServerEvents.basicCommand('mcb', event => {
     return
   }
 
+  if (action === 'walk') {
+    try {
+      var intent = JSON.parse(arg)
+      if (typeof intent.cmd !== 'string' || !intent.cmd.trim()
+          || typeof intent.token !== 'string' || !/^[a-f0-9]{32}$/.test(intent.token)
+          || typeof intent.owner !== 'string') {
+        mcbErr(event, action, '寻路意图格式错误')
+        return
+      }
+      player.sendData(MCB_CHANNEL_DOWN, { action: 'baritone', arg: intent.cmd })
+      mcbWalkIntent = { token: intent.token, owner: intent.owner }
+      mcbOk(event, action, { sent: true, token: intent.token })
+    } catch (eWalk) { mcbErr(event, action, '寻路下发失败: ' + eWalk) }
+    return
+  }
+
   try {
     player.sendData(MCB_CHANNEL_DOWN, { action: action, arg: arg })
+    if (action === 'baritone' || action === 'stop') mcbWalkIntent = null
     console.info('[mcb] 已下发 action=' + action + ' -> ' + MCB_TARGET)
     // 注意： 这里只代表"已下发到她的客户端"，不代表客户端真的执行了。
     //    动作有没有生效，靠 mc_state 看坐标 / task 状态复核。

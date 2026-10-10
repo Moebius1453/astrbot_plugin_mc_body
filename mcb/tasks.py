@@ -134,6 +134,15 @@ class TaskContext:
     # ---- 桥 -------------------------------------------------------------
 
     async def call(self, command: str) -> dict | None:
+        if self._runner.arbiter is not None and command.startswith("mcb baritone "):
+            await self.checkpoint()
+            await self._runner.arbiter.claim_walk(
+                LEVEL_TASK, "task", command.removeprefix("mcb baritone "), "任务动作"
+            )
+            return {} if self._runner.arbiter.last_error is None else None
+        if self._runner.arbiter is not None and command == "mcb stop":
+            await self._runner.arbiter.release_walk("task")
+            return {}
         return await self._runner.call(command)
 
     async def state(self) -> dict:
@@ -614,6 +623,13 @@ class TaskRunner:
             self.journal.add("task", "被叫停")
         return "已经停下了。"
 
+    async def fail_permission(self, detail: str) -> None:
+        name = self._job.name if self._job is not None else "任务"
+        await self.stop(quiet=True)
+        self._finish("failed", detail)
+        self._outcome["kind"] = render.Kind.DENIED
+        self.journal.add("task", f"「{name}」因权限拒绝终止：{detail}")
+
     # ---- 内部 -----------------------------------------------------------
 
     async def checkpoint(self) -> None:
@@ -654,7 +670,9 @@ class TaskRunner:
 
     async def _gate(self) -> None:
         """挂起时卡在这。每个步骤之前都过一遍。"""
-        while self._paused:
+        while self._paused or (self.arbiter is not None
+                               and self.arbiter.walk_holder() is not None
+                               and self.arbiter.walk_holder().owner != "task"):
             await asyncio.sleep(0.5)
 
     async def _run(self, task: Task) -> None:
@@ -690,3 +708,6 @@ class TaskRunner:
             logger.exception("[mc_body] 任务炸了")
             self._finish("failed", f"出了意外：{exc}")
             self.journal.add("error", f"任务出错：{exc}")
+        finally:
+            if self.arbiter is not None:
+                await self.arbiter.release_walk("task")

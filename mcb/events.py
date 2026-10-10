@@ -94,9 +94,10 @@ class EventFeed:
     """轮询服务端事件流，写进状态日志，并留一份给 mc_events 查。"""
 
     def __init__(self, bridge, journal=None, *, poll_interval: float = POLL_INTERVAL,
-                 keep: int = KEEP) -> None:
+                 keep: int = KEEP, on_permission=None) -> None:
         self.bridge = bridge
         self.journal = journal
+        self.on_permission = on_permission
         self.poll_interval = max(0.5, float(poll_interval))
         self.keep = max(4, int(keep))
 
@@ -168,7 +169,10 @@ class EventFeed:
             raise RuntimeError(reply.get("error") or "mcb events 返回失败")
         data = reply.get("data") or {}
         for raw in (data.get("lines") or []):
+            fresh = isinstance(raw, dict) and _as_int(raw.get("seq")) > self._last_seq
             self._absorb(raw)
+            if fresh and raw.get("kind") == "permission" and self.on_permission is not None:
+                await self.on_permission(raw)
         max_seq = _as_int(data.get("max"))
         if max_seq > self._last_seq:
             self._last_seq = max_seq

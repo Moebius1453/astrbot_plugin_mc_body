@@ -52,7 +52,9 @@ TTL 是这条的兜底：expire_stale() 每 tick 扫一遍，到点自动让位�
 
 from __future__ import annotations
 
+import json
 import time
+import uuid
 
 from astrbot.api import logger
 
@@ -72,7 +74,7 @@ _LEVEL_CN = {LEVEL_REFLEX: "反射", LEVEL_USER: "用户", LEVEL_TASK: "任务"}
 
 
 class _Claim:
-    __slots__ = ("level", "owner", "cmd", "note", "expire_at")
+    __slots__ = ("level", "owner", "cmd", "note", "expire_at", "token")
 
     def __init__(self, level: int, owner: str, cmd: str | None, note: str,
                  expire_at: float | None = None) -> None:
@@ -82,6 +84,7 @@ class _Claim:
         self.note = note
         # TTL 到点的单调时钟时刻；None = 永不过期（用户/任务的声明就该这样）
         self.expire_at = expire_at
+        self.token = ""
 
 
 class Arbiter:
@@ -93,6 +96,7 @@ class Arbiter:
         self._walk: list[_Claim] = []
         # 现在实际下发的是哪条命令（去重用 —— 别重复下同一条）
         self._walk_applied: str | None = None
+        self._walk_applied_claim: _Claim | None = None
         # 上一次下发的错误。注意： 工具层要拿它回话给白 ——
         # 仲裁把异常吞了，要是连错误都不留，白会以为"发出去了"。
         self.last_error: str | None = None
@@ -173,6 +177,17 @@ class Arbiter:
             return
         await self._sync_walk("release:" + owner)
 
+    def rejected_claim(self, token: str) -> _Claim | None:
+        return next((c for c in self._walk
+                     if c.token == token and token and c.level >= LEVEL_USER), None)
+
+    async def reject_walk(self, token: str) -> str | None:
+        claim = self.rejected_claim(token)
+        if claim is None:
+            return None
+        await self.release_walk(claim.owner)
+        return claim.owner
+
     def walk_holder(self) -> _Claim | None:
         return self._walk[0] if self._walk else None
 
@@ -183,10 +198,13 @@ class Arbiter:
         """把栈顶那条施加下去。只有真的变了才下发。"""
         top = self.walk_holder()
         want = top.cmd if top is not None else None
-        if want == self._walk_applied:
+        if want == self._walk_applied and top is self._walk_applied_claim:
             return
-        self._walk_applied = want
-        cmd = f"mcb baritone {want}" if want else "mcb stop"
+        cmd = "mcb stop"
+        if want:
+            top.token = uuid.uuid4().hex
+            payload = {"token": top.token, "owner": top.owner, "cmd": want}
+            cmd = "mcb walk " + json.dumps(payload, ensure_ascii=True)
         self.last_error = None
         try:
             _, err = await self._call(cmd)
@@ -198,6 +216,8 @@ class Arbiter:
             self.last_error = str(err)
             logger.warning(f"[mc_body] 仲裁下发被拒（{why}）：{err}")
             return
+        self._walk_applied = want
+        self._walk_applied_claim = top
         held = f"{_LEVEL_CN.get(top.level, top.level)}:{top.owner}" if top else "空闲"
         logger.info(f"[mc_body] walk 通道 -> {held}"
                     + (f"（{top.cmd}）" if top and top.cmd else "（停）")

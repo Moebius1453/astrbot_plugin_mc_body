@@ -172,7 +172,8 @@ class McBodyPlugin(Star):
         # 事件流 —— 「刚才都发生了什么」（挨打/死亡/进出服/背包变动）。
         # 注意： 和 uplink.py 的聊天分工不同、两张表：那张管"人说的话"，
         #    这张管"聊天以外的事"。合表就是同一件事记两遍（见 mcb/events.py 头部）。
-        self.events = EventFeed(self.bridge, self.journal)
+        self.events = EventFeed(self.bridge, self.journal,
+                                on_permission=self._permission_denied)
 
         self.reflex = ReflexGuard(
             self.bridge,
@@ -286,6 +287,20 @@ class McBodyPlugin(Star):
         task = data.get("task")
         menu = task.get("menu") if isinstance(task, dict) else None
         return menu if isinstance(menu, dict) else None
+
+    async def _permission_denied(self, raw: dict) -> None:
+        if raw.get("who") != str(self._cfg("character_name", "Nanako")):
+            return
+        token = str(raw.get("walkToken") or "")
+        claim = self.arbiter.rejected_claim(token)
+        if claim is None:
+            return
+        detail = str(raw.get("text") or "权限拒绝")
+        if claim.owner == "task":
+            await self.tasks.fail_permission(detail)
+        else:
+            await self.arbiter.reject_walk(token)
+        self.journal.add("body", f"[mc:permission] 已终止 {claim.owner} 的对应意图：{detail}")
 
     async def _claim_walk_user(self, cmd: str, note: str) -> tuple[dict, str | None]:
         """用户级地声明 walk 通道。返回值和 _call 同形，方便原地替换。
