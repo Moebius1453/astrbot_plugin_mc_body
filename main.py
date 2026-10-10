@@ -191,6 +191,28 @@ class McBodyPlugin(Star):
         #    当成用户现实里在下雨（2026-10-10 实际发生过，见 docs/17 P2）。
         await self.context.send_message(umo, MessageChain([Plain(f"[mc:alert] {facts}")]))
 
+    async def _held_count(self) -> int | None:
+        """**手上**（快捷栏当前格）那个东西有几个。读不到回 `None`，**不假装是 0**。
+
+        用途：`mc_use_on` 靠"手上的数量少没少"来判定"到底放没放成" ——
+        这是唯一能自动验证的实据（见那个工具里的说明）。
+        """
+        data, err = await self._call("mcb inventory")
+        if err or not isinstance(data, dict):
+            return None
+        sel = data.get("held")
+        if sel is None:
+            return None
+        for it in (data.get("hotbar") or []):
+            if not isinstance(it, dict):
+                continue
+            if it.get("slot") == sel:
+                try:
+                    return int(it.get("c"))
+                except (TypeError, ValueError):
+                    return None
+        return None
+
     async def _claim_walk_user(self, cmd: str, note: str) -> tuple[dict, str | None]:
         """**用户级**地声明 walk 通道。返回值和 `_call` 同形，方便原地替换。
 
@@ -861,6 +883,15 @@ class McBodyPlugin(Star):
         if coords is None:
             return f"坐标不合法：({x}, {y}, {z})。"
         tx, ty, tz = coords
+        # ⚠️ **先拍一张"手上的东西"的快照** —— 放方块/用物品成功了的话，
+        #    手上的数量会少。这是**唯一能自动判定"到底放没放成"**的实据。
+        #
+        #    踩过（2026-10-10，用户在公屏让她放熔炉）：工具只回了一句
+        #    "已对着 (…) 右键…**过一会儿用 mc_inventory 看手上东西少没少**"，
+        #    **她没看**，转头就在公屏上说"熔炉放地上啦！" —— 其实熔炉还在包里。
+        #    ⭐ 教训：**把验证甩给一个不会去验证的人，等于没有验证。**
+        #    （和 `docs\11` 那条"成功判据用世界真的变了，不用命令发出去了"是同一条。）
+        before = await self._held_count()
         # 走 useOnAt（直接给坐标构造命中），不依赖准星射线 —— 实测射线经常 MISS
         _, err = await self._call(f"mcb useOnAt {tx} {ty} {tz}")
         if err:
@@ -876,9 +907,22 @@ class McBodyPlugin(Star):
             return "已对着 ({tx},{ty},{tz}) 右键，界面留着没关。\n" + render.describe_menu(data)
         # 不操作界面 → 关掉，免得她动不了
         await self._call("mcb closeGui")
+        after = await self._held_count()
+        if before is None or after is None:
+            return (
+                f"已对着 ({tx},{ty},{tz}) 右键，界面也关掉了。"
+                "（手上数量没读到，**这次没法自动确认生效** —— 要用 mc_inventory 自己看。）"
+            )
+        if after < before:
+            return (
+                f"✅ 已在 ({tx},{ty},{tz}) 用掉了 1 个手上的东西（{before} → {after}）"
+                "—— **这回是真的生效了**。"
+            )
         return (
-            f"已对着 ({tx},{ty},{tz}) 右键，并把可能弹出的界面关掉了。"
-            "如果要确认放置生效，过一会儿用 mc_inventory 看手上东西少没少。"
+            f"⚠️ **没生效**：对着 ({tx},{ty},{tz}) 右键了，"
+            f"但手上的东西**一个没少**（还是 {before} 个）。"
+            "多半是**那里放不下**（目标格不是空气 / 被占着），或者**够不着**。"
+            "**别跟用户说放下了** —— 换个地方再试，或者直说没放成。"
         )
 
     @filter.llm_tool(name="mc_menu")

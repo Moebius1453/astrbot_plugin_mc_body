@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 
 from astrbot.api import logger
 
@@ -199,6 +200,17 @@ class ChatUplink:
             "请用你自己的身份回应。**你的回答会被自动打到游戏公屏上**，"
             "所以直接说话就行 —— 不需要（也不能）调用 `mc_say`，系统已经替你发了。"
             "回答要短，像在游戏里聊天那样，不要加旁白或括号说明。",
+            "",
+            # ⚠️⚠️ 这一段是 2026-10-10 加的，因为实测她**只答应不动手**：
+            #    用户在公屏说"放下熔炉"，她回"好嘞，熔炉放地上啦！" —— **其实根本没放**，
+            #    一翻背包熔炉还在。她是在**演**，不是在**做**。
+            #    原来这段提示词只说"回应"，**从没告诉她可以动手** —— 于是她把每次唤醒
+            #    都当成一次"聊天回复"任务。工具一直都在（`build_main_agent` 会给全套），
+            #    缺的是**让她知道该用**。
+            "⚠️ **说话和执行是两件事。** 有人让你做事（放方块 / 合成 / 走过去 / 打怪 / 查东西…），"
+            "**必须真的调用工具去做**，不能只在公屏上答应一句。"
+            "做不到就直说做不到，**绝对不许用「已经做好了」来圆场** —— "
+            "你说了什么都会被人看见，做没做也瞒不住。",
         ]
         return "\n".join(parts)
 
@@ -268,10 +280,103 @@ class ChatUplink:
         async for _ in runner.step_until_done(self.max_steps):
             pass
 
+        # ⚠️⚠️ **必须自己把这一轮存下来** —— 否则游戏里的对话**从来不进她的历史**。
+        #
+        #    会话**不是 agent 自己存的**，是 **pipeline 那一层**存的：
+        #    `pipeline/.../agent_sub_stages/internal.py:333` 的 `_save_to_history`
+        #    → `conv_manager.update_conversation`（`internal.py:486/532`）。
+        #    我们直接调 `build_main_agent` + `step_until_done`，**绕过了那一层**。
+        #
+        #    后果（用户 2026-10-10 报的）："游戏里面的交流……**看上去就像是两个对话一样**"。
+        #    **实测证据**：全库搜唤醒标记 `来自 Minecraft 游戏内聊天`，**0 次命中** ——
+        #    她在游戏里说的每一句，都不在她的对话历史里。她记不住、也对不上。
+        await self._save_turn(req, runner)
+
         final = runner.get_final_llm_resp()
         if final is None:
             return ""
         return (getattr(final, "completion_text", "") or "").strip()
+
+    async def _load_stored(self, conv) -> list:
+        """读出**真正的历史 list**。
+
+        ⚠️⚠️ **绝不要写 `list(conv.history)`** —— `conv.history` 是 AstrBot v1 的
+        legacy 字段，**类型是 `str`（JSON 文本）**：
+        `conversation_mgr.py:84` → `history=json.dumps(conv_v2.content or [])`。
+
+        `list("<JSON文本>")` **不会抛异常** —— 它把字符串**逐字符拆开**，
+        返回 184467 个单字符。2026-10-10 那次事故就是这么来的：
+        `stored` 成了 184467 个字符，"绝不减少"的闸比较字符数、永远通过，
+        于是把垃圾写回了库。**不是偶尔写坏，是在这个版本下必然写坏。**
+
+        → 所以一律走**原始源头** `ConversationV2.content`（数据库里那个 list[dict]）。
+        """
+        cid = getattr(conv, "cid", None)
+        if cid:
+            try:
+                v2 = await self.context.conversation_manager.db.get_conversation_by_id(cid)
+                if v2 is not None:
+                    return list(v2.content or [])
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"[mc_body] 读会话原始 content 失败，退回 legacy 字段：{exc}")
+
+        # 退路：legacy 字段是 JSON 文本 —— 必须 json.loads，**绝不能 list()**
+        raw = getattr(conv, "history", None)
+        if isinstance(raw, str):
+            try:
+                parsed = json.loads(raw) if raw.strip() else []
+            except ValueError:
+                return []
+            return parsed if isinstance(parsed, list) else []
+        return list(raw) if isinstance(raw, list) else []
+
+    async def _save_turn(self, req, runner) -> None:
+        """把这一轮写回会话 —— 照 pipeline 的做法，但**必须保证"只增不减"**。
+
+        ⚠️⚠️ **2026-10-10 血案（两次，同一个函数）**：
+        ① 初版直接把 `runner.run_context.messages` 丢进去，自以为那是"完整上下文" ——
+           **在我们这条绕过 pipeline 的路上，它只有本轮**（第一条就是 uplink 的 prompt，
+           前面没有历史）。`update_conversation(history=...)` 是**替换**语义 → 494 条 → 1 条。
+        ② "修好"之后仍然写坏：`stored = list(conv.history)` —— 见 `_load_stored` 的说明，
+           `conv.history` 是 **str**，`list()` 把 478 条历史拆成了 184467 个单字符。
+
+        现在两处都堵死了：历史只从 `ConversationV2.content`（真 list）取，
+        合并后**元素个数不可能比原来少**。
+        """
+        try:
+            from astrbot.core.agent.message import dump_messages_with_checkpoints
+
+            conv = getattr(req, "conversation", None)
+            if conv is None:
+                return
+            stored = await self._load_stored(conv)
+            run_msgs = list(getattr(getattr(runner, "run_context", None), "messages", []) or [])
+            # 第一条 system 不要 —— 那是每轮重建的人格/提示词，存了会把历史撑爆
+            fresh = [m for m in run_msgs if getattr(m, "role", "") != "system"]
+            fresh_dicts = dump_messages_with_checkpoints(fresh)
+
+            if len(fresh_dicts) >= len(stored):
+                combined = fresh_dicts              # run 里已经含历史了
+            else:
+                combined = stored + fresh_dicts     # run 里只有本轮，历史补上
+
+            # 🔴 保命闸：**绝不允许写回一个更短的历史**。
+            #    宁可这一轮不落库，也不能再吞掉一次历史。
+            if len(combined) < len(stored):
+                logger.error(
+                    f"[mc_body] 拒绝写回：{len(stored)} 条历史会变成 {len(combined)} 条。"
+                    "（这不该发生，是 bug —— 见 _save_turn 的说明）"
+                )
+                return
+
+            await self.context.conversation_manager.update_conversation(
+                self.umo, conv.cid, history=combined
+            )
+            logger.info(
+                f"[mc_body] 游戏内这一轮已写回会话：历史 {len(stored)} → {len(combined)} 条"
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[mc_body] 游戏内对话落库失败（不影响她这次的回应）：{exc}")
 
     async def _say_in_game(self, text: str) -> None:
         clean = _clean_for_game_chat(text)

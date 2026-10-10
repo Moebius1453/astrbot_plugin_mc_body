@@ -455,7 +455,22 @@ class ReflexGuard:
                 await self._notify_safe(f"{why} food_items=0")
             return
 
-        slot, name, score = best
+        where, idx, item_id, name, score = best
+        slot = idx
+        if where == "main":
+            # 吃的**在背包里** —— 先挪到快捷栏的空格，再去吃。
+            moved = await self._move_food_to_hotbar(item_id)
+            if moved is None:
+                # 快捷栏 9 格全占着 → 老实说，别硬顶掉她手上的东西
+                if not self._no_food_warned:
+                    self._no_food_warned = True
+                    logger.warning(f"[mc_body] 🍖 背包里有 {name}，但快捷栏满、腾不出格")
+                    await self._notify_safe(
+                        f"food_items=1 hotbar_full=1 food={level if isinstance(level, (int, float)) else '?'}"
+                    )
+                return
+            slot = moved
+            self._log(f"把背包里的 {name} 挪到快捷栏第 {slot} 格")
         self._no_food_warned = False
         self._eat_cool = EAT_COOLDOWN_TICKS
         why = "受伤" if (hurt and not hungry) else "饿了"
@@ -489,14 +504,20 @@ class ReflexGuard:
         self._restore_slot = None
         await self._cmd(f"mcb hotbar {slot}")
 
-    async def _find_food(self, *, prefer_saturation: bool = False) -> tuple[int, str, float] | None:
-        """在**快捷栏**里找最该吃的那个食物。返回 `(格号, 名字, 分数)`。
+    async def _find_food(self, *, prefer_saturation: bool = False):
+        """找最该吃的那个食物。返回 `(在哪, 位置, 注册名, 显示名, 分数)`；没有回 `None`。
 
-        ⚠️ 只能找快捷栏（0-8）—— 背包里的东西还挪不出来（见 docs/13 §2）。
-        **这一步正是"物品要能在快捷栏/背包间搬"最直接的动机。**
+        ⚠️⚠️ **快捷栏和背包都要翻。**
+        踩过（2026-10-10，用户报的"**时不时还是弹出 `[mc:alert] food=15/20 hp=18 food_items=0`**"）：
+        原来只翻快捷栏，可她背包里揣着 **64 个面包** ——
+        于是反射一次次判定"身上没吃的"，**一遍遍弹通知，还永远吃不上**。
 
-        `prefer_saturation=True`（受伤时）：按**饱食度**排 —— **原版自然回血看的是它**，
-        不是 nutrition。金苹果 sat=9.6 > 面包 6.0，受伤时该优先吃金苹果。
+        那条"⚠️ 只能找快捷栏（0-8）—— 背包里的东西还挪不出来"的注释
+        **当时是对的，现在已经过时了**：v0.20.0 就做了"物品能在快捷栏/背包之间搬"
+        （`containers.wear` 的 `hotbar0`~`hotbar8` / `backpack`）。
+        **代码跟着注释一起烂掉了** —— 能力有了，用它的地方没跟上。
+
+        吃的在背包里时 `在哪 = "main"`，**调用方负责先把它挪到快捷栏**再吃。
         """
         try:
             reply = await self.bridge.call("mcb inventory")
@@ -504,24 +525,55 @@ class ReflexGuard:
             return None
         if not reply.get("ok"):
             return None
-        hotbar = (reply.get("data") or {}).get("hotbar") or []
+        data = reply.get("data") or {}
+        want = "saturation" if prefer_saturation else "nutrition"
+
         best = None
-        for slot, item in enumerate(hotbar):
-            if not isinstance(item, dict):
-                continue
-            fp = item.get("food")
-            if not isinstance(fp, dict):
-                continue          # 没有 food 字段 = 不能吃
-            # 受伤时按**饱食度**排（回血看它），平时按 nutrition 排（顶饱）
-            key = "saturation" if prefer_saturation else "nutrition"
-            score = fp.get(key)
-            if not isinstance(score, (int, float)):
-                score = fp.get("nutrition")      # 饱食度缺失时退回营养值
-            if not isinstance(score, (int, float)):
-                continue
-            if best is None or score > best[2]:
-                best = (slot, str(item.get("n") or "?"), float(score))
+        for where in ("hotbar", "main"):     # 快捷栏优先 —— 在那儿就不用搬了
+            for idx, item in enumerate(data.get(where) or []):
+                if not isinstance(item, dict):
+                    continue
+                fp = item.get("food")
+                if not isinstance(fp, dict):
+                    continue          # 没有 food 字段 = 不能吃
+                iid = item.get("id")
+                if not iid:
+                    continue
+                # 受伤时按**饱食度**排（回血看它），平时按 nutrition 排（顶饱）
+                score = fp.get(want)
+                if not isinstance(score, (int, float)):
+                    score = fp.get("nutrition")      # 饱食度缺失时退回营养值
+                if not isinstance(score, (int, float)):
+                    continue
+                if where == "main" and best is not None:
+                    continue          # 快捷栏已经有得吃，就别动背包的了
+                if best is None or score > best[4]:
+                    best = (where, idx, str(iid), str(item.get("n") or "?"), float(score))
         return best
+
+    async def _move_food_to_hotbar(self, item_id: str) -> int | None:
+        """把背包里某样吃的挪进**空的快捷栏格**，返回格号；腾不出格回 `None`。
+
+        ⚠️ **只找空格，不顶掉快捷栏里现有的东西。**
+        她快捷栏那几格是剑 / 信标 / 附魔台 / 铁砧 一堆要紧玩意儿，
+        别为了啃口面包把它们换进背包（`hotbar0`~`hotbar8` 是**对调**，不是放下）。
+        """
+        try:
+            reply = await self.bridge.call("mcb inventory")
+        except Exception:
+            return None
+        hotbar = ((reply.get("data") or {}).get("hotbar")) or []
+        from .containers import ContainerIO, wear
+        for i in range(9):
+            # 空槽位在 `mcb inventory` 里是 `null`（不是缺字段）—— 不判就炸
+            if i < len(hotbar) and isinstance(hotbar[i], dict):
+                continue
+            err = await wear(ContainerIO(self.bridge), item_id, f"hotbar{i}")
+            if err is None:
+                return i
+            logger.warning(f"[mc_body] 🍖 把 {item_id} 挪到快捷栏第 {i} 格失败：{err}")
+            return None
+        return None
 
     def _combat_trigger(
         self, hurt: bool, nearest: dict | None, targeting: dict | None
