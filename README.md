@@ -212,10 +212,9 @@
 ## 开发
 
 ```
-main.py            插件入口、工具定义、授权与输出整形
+main.py            插件入口、工具定义、授权（_guard）与调用壳（_call）
 mcb/               所有实现
-  rcon.py          RCON 客户端（自己实现，处理粘包/拆包）
-  bridge.py        桥的薄封装：call → (数据 | 人话错误)
+  rcon.py          RCON 客户端 + 桥的薄封装（自己实现，处理粘包/拆包）
   render.py        把数据变成给模型看的文本（只许纯函数）
   reflex.py        保命反射（不过 LLM）
   arbiter.py       仲裁层：谁能写"走"这个通道
@@ -229,6 +228,8 @@ mcb/               所有实现
   sight.py         截图 → 识图 API → 文字
   uplink.py        聊天上行
 ```
+
+工具方法本身仍在 `main.py` 里（拆出去要动 AstrBot `@filter.llm_tool` 的继承行为，风险大，暂时不动）。
 
 ## License
 
