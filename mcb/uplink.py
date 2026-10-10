@@ -145,6 +145,9 @@ class ChatUplink:
         self._fail_streak = 0
         self.hold_reason: str | None = None
         self.hold_detail = ""
+        # 有人在跟她说活时叫一下这个 —— 闲逛拿它重算安静计时（见 mcb/idle.py）。
+        # 用可赋值属性而不是构造参数：闲逛是在 uplink 之后才建出来的。
+        self.on_activity = None
 
     # ---- 生命周期 -------------------------------------------------------
 
@@ -236,6 +239,9 @@ class ChatUplink:
             self._last_seq = max_seq
 
         if wake_trigger is not None:
+            if self.on_activity is not None:
+                with contextlib.suppress(Exception):
+                    self.on_activity()
             await self._wake(wake_trigger)
 
     # ---- 判定 -----------------------------------------------------------

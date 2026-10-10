@@ -163,6 +163,24 @@
     "hint": "一个 JSON 文件，形状 {\"deny\": [...], \"allow\": [...], \"ask\": [...]}，三张表都可以缺。规则一行一条，写成 动作(项 & 项 & !项)，例如 break(placed) 或 attack(named)。\n\n动词：break / place / attack / take（或 * 表示任何动作）。\n信号：placed / self_placed / block_entity / contents / near_placed / owned / named / villager / hostile / hazard_item。\n还可以写方块/物品的注册名（minecraft:chest）或 entity:<uuid>。\n\n⚠️ 这一层整体压过出厂表：你写的 ask 行能盖住出厂的 allow 行。\n⚠️ 标签项（#minecraft:beds）这一版不支持——写错会报教学式错误，不会静默不生效。",
     "default": ""
   },
+  "enable_idle_wander": {
+    "type": "bool",
+    "description": "闲逛：没人管她的时候她自己动一动",
+    "hint": "身体层的事，**不花 token**（用户 2026-10-11：\"玩家就应该经常动\"）。没人管她、安静够久之后，她会在附近走一段、停一下、再走。\n\n⚠️ **注意：Baritone 的 allowBreak 默认开着**，所以闲逛有可能一路凿过去（就是之前那个\"抽风挖地板\"）。现在的缓解是**只在地表闲逛**——地下是凿穿最凶、也是闲逛最没意义的地方。治本要关掉客户端的 allowBreak，代价是地下会经常\"走不过去\"。\n\n⚠️ 主人在 10 格内时她只小范围挪动，不会聊着聊着走开。",
+    "default": true
+  },
+  "idle_wander_after_seconds": {
+    "type": "float",
+    "description": "闲逛：安静多久之后才动",
+    "hint": "没人管她、walk 通道也空着，过这么久她才自己走一段。太小会显得坐不住；25 秒左右比较像人。她走完一趟会重新计时（走一段停一下，不是永动机）。",
+    "default": 25
+  },
+  "idle_wander_radius": {
+    "type": "float",
+    "description": "闲逛：走多远",
+    "hint": "每一趟目标点离她不超过这么多格（最小 3 格）。主人在 10 格内时自动缩到 6 格，免得她走开。地下不闲逛，所以这个半径实际上是\"地表走多远\"。",
+    "default": 16
+  },
   "journal_capacity": {
     "type": "int",
     "description": "状态日志最多攒多少条",

@@ -34,6 +34,7 @@ from .mcb import containers as mcb_containers
 from .mcb.containers import ContainerIO
 from .mcb.craft import CraftRunner, Crafter
 from .mcb.events import EventFeed
+from .mcb.idle import IdleGuard
 from .mcb.journal import Journal
 from .mcb import permission
 from .mcb import protocol
@@ -202,6 +203,22 @@ class McBodyPlugin(Star):
         self.reflex.bind_tasks(self.tasks)
         # 反射也要走仲裁层（它的 walk 声明优先级最高）
         self.reflex.bind_arbiter(self.arbiter)
+
+        # 闲逛 —— 没人管她的时候她自己动一动（身体层，不花 token）。
+        # 注意： 它没有自己的循环，借反射那 1 秒一次的节拍走（见 mcb/idle.py 的模块注释）。
+        self.idle = IdleGuard(
+            self.bridge,
+            self.arbiter,
+            enabled=bool(self._cfg("enable_idle_wander", True)),
+            after_seconds=float(self._cfg("idle_wander_after_seconds", 25)),
+            radius=float(self._cfg("idle_wander_radius", 16)),
+            owner_name=str(self._cfg("owner_player_name", "") or ""),
+            journal=self.journal,
+        )
+        self.reflex.bind_idle(self.idle)
+        # 用户一开口，闲逛的安静计时重新起算 —— 别聊到一半她走开了。
+        # （走路类的指令不用接：它们会占住 walk 通道，闲逛自己就让开了。）
+        self.uplink.on_activity = self.idle.note_activity
         # 通知去重（见 _notify）
         self._last_notify_text = ""
         self._last_notify_at = 0.0

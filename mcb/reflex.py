@@ -185,6 +185,8 @@ class ReflexGuard:
         self._tasks = None
         # 仲裁层（见 mcb/arbiter.py）。没绑就退回直接下发，行为跟以前一样。
         self.arbiter = None
+        # 闲逛（见 mcb/idle.py）。挂上来之后借这个节拍走，不另起循环。
+        self._idle = None
 
         self._task: asyncio.Task | None = None
 
@@ -221,6 +223,15 @@ class ReflexGuard:
     def bind_arbiter(self, arbiter) -> None:
         """接上仲裁层（见 mcb/arbiter.py）。main.py 在 __init__ 里调。"""
         self.arbiter = arbiter
+
+    def bind_idle(self, idle) -> None:
+        """挂上闲逛（mcb/idle.py）。
+
+        注意： 闲逛**没有自己的循环** —— 借这个 1 秒一次的节拍走。
+        理由是省一次 RCON 往返：这一 tick 已经读过 mcb state 了，
+        闲逛直接用它那份。多起一个循环就是每秒多问一次桥，白花钱。
+        """
+        self._idle = idle
 
     # 注意： 反射的 walk 声明是最高优先级（保命 > 用户 > 任务）。
     #    而且它只在声明、不删别人的 —— 所以脱战一 release，
@@ -355,6 +366,11 @@ class ReflexGuard:
                 task_info.get("status") if isinstance(task_info, dict) else None
             )
             await self.arbiter.expire_stale()
+
+        # 闲逛（身体层，不花 token）—— 借这一 tick 已经读到的状态，不额外问桥。
+        # 放在仲裁那一段之后：它要先看到过期的声明让位、通道空出来了，才轮得到它。
+        if self._idle is not None:
+            await self._idle.tick(data)
 
         hp = data.get("hp")
         hp = float(hp) if isinstance(hp, (int, float)) else None

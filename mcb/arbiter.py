@@ -87,8 +87,9 @@ from astrbot.api import logger
 LEVEL_REFLEX = 0     # 保命。挨打、濒死、卡住
 LEVEL_USER = 10      # 用户/LLM 的直接指令
 LEVEL_TASK = 20      # 正在跑的多步任务
+LEVEL_IDLE = 30      # 闲逛。没人管她的时候她自己动一动（身体层，不花 token）
 
-_LEVEL_CN = {LEVEL_REFLEX: "反射", LEVEL_USER: "用户", LEVEL_TASK: "任务"}
+_LEVEL_CN = {LEVEL_REFLEX: "反射", LEVEL_USER: "用户", LEVEL_TASK: "任务", LEVEL_IDLE: "闲逛"}
 
 # 用户 / 任务的默认 TTL（秒）。它们不靠调用点释放，靠"身体还在动就续期"。
 #
