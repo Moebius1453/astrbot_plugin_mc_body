@@ -455,6 +455,18 @@ function mcbSlotRole(sl, player) {
   }
 }
 
+// 试调一个访问器，把它返回什么写成一行字（诊断用）。
+// 注意： 动态属性名取不到 Java 方法，所以调用方必须写成字面量调用再包进来。
+function mcbProbe1(f) {
+  try {
+    var v = f()
+    if (v === null || v === undefined) return 'null'
+    return typeof v + ':' + String(v).substring(0, 60)
+  } catch (e) {
+    return 'throw:' + String(e).substring(0, 60)
+  }
+}
+
 // 从眼睛到这一点之间有没有别的方块挡着。读不到判定就说"看得见"（老行为，不更差）。
 function mcbVisible(mc, ex, ey, ez, pt, bp) {
   try {
@@ -1155,7 +1167,7 @@ function mcbHandle(action, arg) {
       mcbLastUsePos = { x: qx, y: qy, z: qz }      // clickSlot 要用它转头（3.5）
       mcX.gameMode.useItemOn(mcX.player, $Hand.MAIN_HAND, thit)
       console.info('[mcbridge] 已 useItemOn -> (' + qx + ',' + qy + ',' + qz + ')'
-        + ' 面=' + pick.face + ' 取点=' + pick.via + ' 遮挡=' + (pick.blocked === null ? '不知道' : pick.blocked))
+        + ' 面=' + pick.face + ' 取点=' + pick.via)
     } catch (eU) {
       console.error('[mcbridge] useOnAt 失败: ' + eU)
     }
@@ -1223,7 +1235,144 @@ function mcbHandle(action, arg) {
     // 顺便看一眼两个 API 在不在（实现要用它们）
     try { rbOut.hasPlaceRecipe = (typeof mcRB.gameMode.handlePlaceRecipe === 'function') } catch (ePR) { rbOut.err.push('handlePlaceRecipe: ' + ePR) }
     try { rbOut.hasContains = (typeof rb.contains === 'function') } catch (eCt) { }
+
+    // 把第一条目整个摊开 —— 1.21.1 换了 RecipeDisplay 那套，光看文档猜不出来。
+    // 手法照项目的惯例：候选访问器一次全试，跑一遍就知道哪条通，别一条条猜。
+    // 注意： 动态属性名（obj['method']()）在 Rhino 下拿不到 Java 方法，只能字面量调。
+    try {
+      var dp0 = rb.getCollections().iterator()
+      if (dp0.hasNext()) {
+        var dc0 = dp0.next()
+        rbOut.col0 = String(dc0).substring(0, 200)
+        var drecs = null
+        try { drecs = dc0.getRecipes() } catch (eDR) { rbOut.err.push('getRecipes: ' + eDR) }
+        if (drecs !== null && drecs !== undefined && Number(drecs.size()) > 0) {
+          var de = drecs.get(0)
+          rbOut.entry0 = String(de).substring(0, 300)
+          rbOut.probe = {}
+          rbOut.probe.id = mcbProbe1(function () { return de.id() })
+          rbOut.probe.recipe = mcbProbe1(function () { return de.recipe() })
+          rbOut.probe.display = mcbProbe1(function () { return de.display() })
+          rbOut.probe.craftingRequirements = mcbProbe1(function () { return de.craftingRequirements() })
+          rbOut.probe.result = mcbProbe1(function () { return de.result() })
+          rbOut.probe.colGetRecipes = mcbProbe1(function () { return dc0.getRecipes() })
+          // 如果 display() 通了，再往里看一眼产物
+          try {
+            var dd = de.display()
+            if (dd !== null && dd !== undefined) {
+              rbOut.probe.displayStr = String(dd).substring(0, 200)
+              rbOut.probe.displayResult = mcbProbe1(function () { return dd.result() })
+              var dr = dd.result()
+              if (dr !== null && dr !== undefined) {
+                rbOut.probe.resultStr = String(dr).substring(0, 200)
+                rbOut.probe.resultItem = mcbProbe1(function () { return dr.item() })
+                rbOut.probe.resultStack = mcbProbe1(function () { return dr.stack() })
+              }
+            }
+          } catch (eDD) { rbOut.probe.displayWalkErr = String(eDD).substring(0, 80) }
+        }
+      }
+    } catch (eDump) { rbOut.dumpErr = String(eDump).substring(0, 120) }
+
     console.info('[mcbridge] RECIPEBOOK ' + JSON.stringify(rbOut))
+    return
+  }
+
+  if (action === 'placeRecipe') {
+    // 一键摆料（第 3 批 3.4）：让服务端把某条配方的材料摆进当前的合成格。
+    //
+    // 为什么值得要：手摆格子要按形状一个一个右键，还要自己处理替代材料；
+    // 一个包就能让服务端按配方摆好。抄的是 MC_baritone 的 processPendingCraft。
+    //
+    // 前置（2026-10-11 实测过了才写的，不是猜的）：
+    //   客户端的配方书是满的 —— RECIPEBOOK 探针报 collections=7319 / entries=8103，
+    //   而且 mcb.gameMode.handlePlaceRecipe 存在。
+    //   服务端那条 `data get entity Nanako recipeBook` 回 {} 只是 NBT 不暴露，
+    //   不代表配方书是空的。
+    //
+    // 挑哪一条：arg 可以给配方 id（推荐，插件侧能从服务端 mcb recipe 拿到），
+    // 也可以给物品注册名（退路，按 RecipeHolder.id() 的末段比）。
+    //
+    // 注意： 这里**不**去读配方的产物。1.21.1 换成了 RecipeDisplay 那套，
+    //    老的 getResultItem 已经没了 —— 实测三条路（带 registryAccess / null /
+    //    不带参）全部抛异常，扫完 8103 条一条都认不出来。
+    //    RecipeHolder.id() 是稳定的标准 API，用它。
+    var mcPR = mcbMc()
+    if (mcPR === null || mcPR.player === null || mcPR.gameMode === null) {
+      console.error('[mcbridge] placeRecipe: 不可用'); return
+    }
+    var prWant = String(arg || '').trim()
+    if (!prWant) { console.error('[mcbridge] placeRecipe: 没给配方 id 或物品名'); return }
+
+    var prMenuId = -1
+    try { prMenuId = Number(mcPR.player.containerMenu.containerId) } catch (eMI) { }
+    if (prMenuId < 0) { console.error('[mcbridge] placeRecipe: 读不到界面 id'); return }
+
+    var prFirst = null, prSeen = 0, prTotal = 0
+    var prDiag = []
+    try {
+      var prCols = mcPR.player.getRecipeBook().getCollections()
+      var prIter = prCols.iterator()
+      while (prIter.hasNext()) {
+        var prCol = prIter.next()
+        var prRecs = null
+        try { prRecs = prCol.getRecipes() } catch (eRC) { continue }
+        if (prRecs === null || prRecs === undefined) continue
+        var prIt = prRecs.iterator()
+        while (prIt.hasNext()) {
+          var prEntry = prIt.next()
+          prTotal++
+          // 注意： 实测（2026-10-11，把候选访问器一次全试过）——
+          //    1.21.1 这个版本的 entry 只有 id()，它的 toString 就是配方 id
+          //    （例：kaleidoscope_tavern:shaker/brass_heart）；
+          //    recipe() / display() / result() / craftingRequirements() 四个全抛
+          //    Cannot find function。所以别再去读"这条配方产出什么"了，按配方 id 认。
+          var prRid = null
+          try { prRid = String(prEntry.id()) } catch (eId) {
+            try { prRid = String(prEntry) } catch (eS) { }
+          }
+          if (!prRid) {
+            if (prDiag.length < 3) prDiag.push('entry 连 id() 都没有')
+            continue
+          }
+          // 命中判据：完全相等，或者"物品名 == 配方 id 的末段"
+          // （原版大部分配方就是这么命名的：minecraft:oak_planks 的配方 id 也叫这个）
+          var prHit = (prRid === prWant)
+          if (!prHit) {
+            var prTail = prRid.indexOf(':') >= 0 ? prRid.substring(prRid.indexOf(':') + 1) : prRid
+            var prWantTail = prWant.indexOf(':') >= 0 ? prWant.substring(prWant.indexOf(':') + 1) : prWant
+            prHit = (prTail === prWantTail)
+          }
+          if (!prHit) continue
+          prSeen++
+          if (prFirst === null) prFirst = { entry: prEntry, rid: prRid }
+        }
+      }
+    } catch (eWalk) { prDiag.push('翻配方书出错: ' + eWalk) }
+
+    if (prFirst === null) {
+      console.info('[mcbridge] PLACERECIPE {"want":"' + prWant + '","placed":false,'
+        + '"reason":"配方书里没有这条配方","scanned":' + prTotal
+        + ',"diag":' + JSON.stringify(prDiag) + '}')
+      return
+    }
+    // 调哪一副签名：见到过两种写法（RecipeDisplayId 和 RecipeHolder），两条都试，记下哪条通。
+    var prHow = ''
+    try {
+      mcPR.gameMode.handlePlaceRecipe(prMenuId, prFirst.entry.id(), false)
+      prHow = 'id'
+    } catch (eCall1) {
+      try {
+        mcPR.gameMode.handlePlaceRecipe(prMenuId, prFirst.entry, false)
+        prHow = 'entry'
+      } catch (eCall2) {
+        console.error('[mcbridge] placeRecipe 两副签名都调不动: ' + eCall1 + ' / ' + eCall2)
+        return
+      }
+    }
+    console.info('[mcbridge] PLACERECIPE {"want":"' + prWant + '","placed":true,'
+      + '"recipe":"' + prFirst.rid + '","candidates":' + prSeen
+      + ',"menu":' + prMenuId + ',"how":"' + prHow + '"}')
     return
   }
 

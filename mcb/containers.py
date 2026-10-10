@@ -139,7 +139,14 @@ def _from_roles(roles: str) -> dict:
             out["result"] = marked[0]
         elif len(outputs) == 1:
             out["result"] = outputs[0]
-    # 最长的连续 Y 段 = 她的背包那一片
+    # 最长的连续 Y 段 = 她背包那一片。长度**正好 36** 才敢用。
+    #
+    # 注意： 多出来的 Y 分不出来是护甲还是副手 ——
+    #    默认界面实测是 "RGGGG" + 41 个 Y：5~8 是护甲格（在前），
+    #    45 是副手格（在后），它们都算 Y 而且都跟背包连着。
+    #    所以"取最后 36 格"和"取前 36 格"都不对（副手那次会把起点算成 10）。
+    #    长度不是 36 就不推 —— 宁可让上层报"认不出"，也别照着错的格号去点格子。
+    #    （已知容器的准确值在 CONTAINERS 表里，走的是另一条路，不受这条影响。）
     best_start, best_len = None, 0
     run_start, run_len = None, 0
     for i, r in enumerate(roles):
@@ -151,15 +158,9 @@ def _from_roles(roles: str) -> dict:
                 best_start, best_len = run_start, run_len
         else:
             run_start, run_len = None, 0
-    if best_len >= 36:
-        # 注意： 取这一段的**最后 36 格**，不是从段首开始。
-        #    默认界面里 5~8 是护甲格、它们也算 Y 而且和背包连着，
-        #    于是最长那一段是 40 格（实测就这么被测试抓出来的）。
-        #    玩家背包固定是"27 格主背包 + 9 格快捷栏"，快捷栏永远在最后 ——
-        #    所以从段尾往回数才是对的。
-        inv_base = best_start + best_len - 36
-        out["inv_base"] = inv_base
-        out["hot_base"] = inv_base + 27
+    if best_len == 36:
+        out["inv_base"] = best_start
+        out["hot_base"] = best_start + 27
     return out
 
 
@@ -205,6 +206,11 @@ def layout_for(menu: dict | None) -> dict | None:
             old = out.get("result")
             if isinstance(old, list) and not isinstance(v, list):
                 v = [v] if v is not None else None
+        elif k in ("inv_base", "hot_base") and k in out:
+            # 表里已经有准确值，别用角色串推的盖掉。
+            # 实测过：默认界面的 Y 段有 41 格（护甲 + 背包 + 副手），
+            # 从角色串推不准；表里的值是手写核过的，优先信它。
+            continue
         out[k] = v
     if roles:
         out["roles"] = roles
