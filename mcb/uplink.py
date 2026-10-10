@@ -37,6 +37,12 @@ MAX_GAME_SAY_LEN = 120
 # 句末标点 —— 撞上第一个就截住（**连同标点**，读起来才自然）
 _SENTENCE_END = "。！？!?…"
 
+# ⚠️ 但**太短的"第一句"不算** —— 实测踩到（2026-10-10 21:36）：
+#    她回 `诶？我这不是正看着你呢嘛～`，第一句是 `诶？`（2 字），
+#    硬截之后公屏上只剩一个 **`诶？`**，**正文全丢了**。
+#    语气词开头的句子在中文里太常见，所以要求"到这里至少凑够 N 个字"才肯截。
+_SENTENCE_MIN = 8
+
 
 class ChatUplink:
     """把游戏内聊天接进白的会话。"""
@@ -490,7 +496,9 @@ def _clean_for_game_chat(text: str) -> str:
     """
     flat = " ".join(str(text).split())
     for i, ch in enumerate(flat):
-        if ch in _SENTENCE_END:
+        # ⚠️ `i + 1 >= _SENTENCE_MIN` 这个门槛别去掉 —— 见 `_SENTENCE_MIN` 的注释：
+        #    少了它，"诶？我这不是正看着你呢嘛～" 会被砍成一个光秃秃的"诶？"。
+        if ch in _SENTENCE_END and i + 1 >= _SENTENCE_MIN:
             flat = flat[: i + 1]
             break
     return flat[:MAX_GAME_SAY_LEN]
