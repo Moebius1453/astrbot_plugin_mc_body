@@ -24,6 +24,7 @@ import json
 
 from astrbot.api import logger
 
+from . import numen
 from . import protocol
 
 # 游戏内聊天单条上限约 256；留点余量
@@ -355,7 +356,7 @@ class ChatUplink:
         parts += [
             "",
             "请用你自己的身份回应。**你的回答会被自动打到游戏公屏上**，"
-            "所以直接说话就行 —— 不需要（也不能）调用 `mc_say`，系统已经替你发了。",
+            "所以直接说话就行 —— 不需要（也不能）调用 `mc_say` 或 `say`，系统已经替你发了。",
             # 注意： 用户 2026-10-10："强制游戏内信息只允许回一条简短的"。
             #    这条是软约束（模型可以不听话），所以 _clean_for_game_chat 还有一道
             #    程序性硬截断 —— 两层一起用才稳。
@@ -373,6 +374,16 @@ class ChatUplink:
             "**必须真的调用工具去做**，不能只在公屏上答应一句。"
             "做不到就直说做不到，**绝对不许用「已经做好了」来圆场** —— "
             "你说了什么都会被人看见，做没做也瞒不住。",
+            "",
+            # 注意： 2026-10-11 身体换成 Numen 同伴之后的接线。
+            #    旧的 mc_* 动作工具走 RCON -> 服务端 -> 已退役的客户端，
+            #    会回"已开始/已放下"但什么都不会发生（读类工具例外，那些
+            #    读的是服务端数据，还能用）。所以动作必须一律走 lua。
+            "⚠️ **你的身体是 Numen 同伴，动作只有一条路：`lua` 工具。**"
+            "走路、挖掘、放方块、合成、熔炼、打怪、翻背包 —— 全部写成一段 lua 程序交给 `lua` 去跑，"
+            "一段程序里可以连着做几十步。不熟的函数先用 `numen.api.help(\"numen.move\")` 这样的分组名查用法。"
+            "**旧的 `mc_goto` / `mc_follow` / `mc_place` / `mc_attack` 那一批已经作废** —— "
+            "它们会回你「已经开始了」，但那具身体早就不在了，什么都不会发生。别用它们，也别相信它们的回执。",
         ]
         return "\n".join(parts)
 
@@ -472,6 +483,10 @@ class ChatUplink:
             if tool_set is not None:
                 with contextlib.suppress(Exception):
                     tool_set.remove_tool("mc_say")
+                # 注意： Numen 的 say 也要摘 —— 出口已经由 _say_in_game
+                #     统一走一遍了，她再自己调一次就是公屏上说两遍。
+                with contextlib.suppress(Exception):
+                    tool_set.remove_tool("say")
 
         # 重点： 补上 on_llm_request 钩子 —— 这一步决定"游戏里的她"和"QQ 里的她"
         #      是不是同一个白。
@@ -681,13 +696,12 @@ class ChatUplink:
         clean = _clean_for_game_chat(text)
         if not clean:
             return
-        reply = await self.bridge.call(f"mcb say {clean}")
-        if reply.get("ok"):
-            logger.info(f"[mc_body] 已把白的回复打到游戏里：{clean}")
-        else:
-            logger.warning(
-                f"[mc_body] 白的回复没打进游戏：{reply.get('error')}（内容：{clean}）"
-            )
+        # 重点： 走 Numen 的 say，不走旧的 mcb say。
+        #    旧的 mcb say 终点是已退役的 mc-brain 客户端：服务端会回
+        #    sent:true，游戏里却什么都不发生（见 mcb/numen.py 的说明）。
+        if await numen.say(self.self_name, clean):
+            return
+        logger.warning(f"[mc_body] 白的回复没打进游戏（Numen 没接）：{clean}")
 
 
 # ---- 小工具 -------------------------------------------------------------

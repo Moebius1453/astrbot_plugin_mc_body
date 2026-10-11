@@ -37,6 +37,7 @@ from .mcb.events import EventFeed
 from .mcb.hunt import HuntGuard
 from .mcb.idle import IdleGuard
 from .mcb.journal import Journal
+from .mcb import numen
 from .mcb import permission
 from .mcb import protocol
 from .mcb.places import PlaceBook
@@ -793,9 +794,13 @@ class McBodyPlugin(Star):
         )
 
     async def _say_in_game(self, text: str) -> None:
-        """在公屏说一句。失败不影响调用方 —— 这是附带的通知，不是主流程。"""
+        """在公屏说一句。失败不影响调用方 —— 这是附带的通知，不是主流程。
+
+        重点： 出口是 Numen 的 say，不是旧的 mcb say —— 后者的终点
+        （mc-brain 客户端）已经退役，服务端回 sent:true 但游戏里没反应。
+        """
         try:
-            await self._call(f"mcb say {text}")
+            await numen.say(str(self._cfg("character_name", "Nanako")), text)
         except Exception as exc:  # noqa: BLE001
             logger.info(f"[{PLUGIN_NAME}] 公屏说一句失败（可忽略）：{exc}")
 
@@ -848,7 +853,6 @@ class McBodyPlugin(Star):
 
     # ---- 工具 -----------------------------------------------------------
 
-    @filter.llm_tool(name="mc_state")
     async def mc_state(self, event: AstrMessageEvent):
         """Your own state in MC: online / coords / health / hunger / dimension /
         what you are doing / what just happened.
@@ -869,7 +873,6 @@ class McBodyPlugin(Star):
             hold=render.describe_hold(data, self.uplink.hold_reason, self.uplink.hold_detail),
         )
 
-    @filter.llm_tool(name="mc_say")
     async def mc_say(self, event: AstrMessageEvent, text: str):
         """Say something on the in-game public chat using Nanako's body.
         This is in-game chat, NOT a reply to QQ.
@@ -887,7 +890,6 @@ class McBodyPlugin(Star):
                                 hint="过几秒重试一次")
         return f"已经用 Nanako 的身体在游戏里说了：{clean}"
 
-    @filter.llm_tool(name="mc_goto")
     async def mc_goto(self, event: AstrMessageEvent, near: str = "", x: float = 0, z: float = 0):
         """Walk somewhere. ASYNC -- it dispatches and she walks on her own;
         check coordinates later with mc_state.
@@ -971,7 +973,6 @@ class McBodyPlugin(Star):
             "过一会儿调 mc_state 看坐标，确认她是不是真的到了。"
         )
 
-    @filter.llm_tool(name="mc_place")
     async def mc_place(self, event: AstrMessageEvent, action: str = "list",
                        name: str = "", what: str = "", note: str = ""):
         """PLACE BOOK -- remember / list / self-check / forget "what is where".
@@ -1076,7 +1077,6 @@ class McBodyPlugin(Star):
         lines.append("⚠️ 「说不准」= 当初没记指纹、或现在读不到那个坐标 —— **不等于没变**。")
         return "地点自检：\n" + "\n".join(lines)
 
-    @filter.llm_tool(name="mc_follow")
     async def mc_follow(self, event: AstrMessageEvent, player: str):
         """Follow a player.
 
@@ -1106,7 +1106,6 @@ class McBodyPlugin(Star):
             "目标就在旁边时她不动是正常的。"
         )
 
-    @filter.llm_tool(name="mc_stop")
     async def mc_stop(self, event: AstrMessageEvent):
         """Emergency stop: CANCEL the current task, and stop all pathing / walking /
         following / using actions.
@@ -1129,7 +1128,6 @@ class McBodyPlugin(Star):
                                 hint="过几秒再用 mc_state 看她还在不在走")
         return f"已下发停止指令，她应该会停下来（惯性可能还会滑一小段）。{stopped}"
 
-    @filter.llm_tool(name="mc_baritone_raw")
     async def mc_baritone_raw(self, event: AstrMessageEvent, command: str):
         """Escape hatch: send a raw Baritone command. Only use it when the
         fixed tools cannot do the job.
@@ -1168,7 +1166,6 @@ class McBodyPlugin(Star):
                                 hint="先用 mc_state 看她在不在线")
         return f"已把 Baritone 命令下发出去：{clean}。过一会儿用 mc_state 看效果。"
 
-    @filter.llm_tool(name="mc_skill")
     async def mc_skill(self, event: AstrMessageEvent, name: str):
         """Read the FULL text of one of your skills.
 
@@ -1205,7 +1202,6 @@ class McBodyPlugin(Star):
 
     # ---- 背包与交互（生存必需）-------------------------------------------
 
-    @filter.llm_tool(name="mc_inventory")
     async def mc_inventory(self, event: AstrMessageEvent):
         """Look at your inventory: what you have, which hotbar slot is in hand,
         and your hunger. Check it before taking / eating / crafting anything."""
@@ -1217,7 +1213,6 @@ class McBodyPlugin(Star):
                                 hint="先用 mc_state 确认她在线")
         return render.describe_inventory(data)
 
-    @filter.llm_tool(name="mc_hold")
     async def mc_hold(self, event: AstrMessageEvent, slot: int):
         """Move HOTBAR slot 0-8 into your hand.
         If the item is somewhere in the backpack (unknown slot), use mc_equip instead.
@@ -1238,7 +1233,6 @@ class McBodyPlugin(Star):
                                 hint="先用 mc_state 确认她在线；格号是 0~8")
         return f"已经把手换到快捷栏第 {n} 格。"
 
-    @filter.llm_tool(name="mc_equip")
     async def mc_equip(self, event: AstrMessageEvent, item: str, where: str = "hand"):
         """Move an item you carry to a specific place -- just give the item name,
         no need to find which slot it is in first.
@@ -1269,7 +1263,6 @@ class McBodyPlugin(Star):
             return err
         return f"已经把 {name} 装到「{where}」了。"
 
-    @filter.llm_tool(name="mc_use")
     async def mc_use(self, event: AstrMessageEvent):
         """Use what is in your HAND: eat food, drink a potion, place a block, shoot a bow.
         
@@ -1282,7 +1275,6 @@ class McBodyPlugin(Star):
                                 hint="先用 mc_state 看她在不在线、手上是什么")
         return "已经用了一次手上的东西。过一会儿用 mc_inventory 或 mc_state 看效果。"
 
-    @filter.llm_tool(name="mc_use_on")
     async def mc_use_on(
         self, event: AstrMessageEvent, x: float, y: float, z: float, keep_open: bool = False
     ):
@@ -1357,7 +1349,6 @@ class McBodyPlugin(Star):
             "**别跟用户说放下了** —— 换个地方再试，或者直说没放成。"
         )
 
-    @filter.llm_tool(name="mc_menu")
     async def mc_menu(self, event: AstrMessageEvent):
         """See what is inside the CURRENTLY OPEN screen (chest / crafting table /
         inventory crafting grid): each slot's SLOT NUMBER plus its contents.
@@ -1372,7 +1363,6 @@ class McBodyPlugin(Star):
                                 hint="先用 mc_state 确认她在线")
         return render.describe_menu(data)
 
-    @filter.llm_tool(name="mc_click")
     async def mc_click(self, event: AstrMessageEvent, slot: int, mode: int = 1):
         """Click slot number N of the currently open screen -- this is how you take
         things out of a chest and how crafting happens. Use mc_menu first to see the slot numbers.
@@ -1434,7 +1424,6 @@ class McBodyPlugin(Star):
         after = await self._menu_snapshot()
         return render.describe_click_result(n, m, before, after)
 
-    @filter.llm_tool(name="mc_craft")
     async def mc_craft(self, event: AstrMessageEvent, item: str, count: int = 1):
         """MAKE something: give the item name and she works out the whole chain and
         does it step by step (including finding a crafting table, walking there, opening it).
@@ -1481,7 +1470,6 @@ class McBodyPlugin(Star):
         self.journal.add("craft", f"做 {name}×{n} —— {result.splitlines()[0]}")
         return result
 
-    @filter.llm_tool(name="mc_smelt")
     async def mc_smelt(self, event: AstrMessageEvent, item: str):
         """SMELT something: put raw material into a furnace and get the product
         (raw iron -> iron ingot, sand -> glass, raw meat -> cooked meat).
@@ -1506,7 +1494,6 @@ class McBodyPlugin(Star):
         except BridgeError as exc:
             return f"烧的过程中桥断了：{exc}"
 
-    @filter.llm_tool(name="mc_attack")
     async def mc_attack(self, event: AstrMessageEvent):
         """Attack whatever entity your CROSSHAIR is on (fight mobs, hit animals).
 
@@ -1555,7 +1542,6 @@ class McBodyPlugin(Star):
                                 hint="先用 mc_state 看她在不在线、手上是不是武器")
         return f"已攻击 {who}。过一会儿用 mc_state 看血量/效果。"
 
-    @filter.llm_tool(name="mc_threats")
     async def mc_threats(self, event: AstrMessageEvent):
         """See whether there are mobs nearby, how far, what kind, how much health,
         and whether they are aiming at you (the server reads the world directly, so this is accurate).
@@ -1573,7 +1559,6 @@ class McBodyPlugin(Star):
                                 hint="过几秒重试")
         return render.describe_threats(data)
 
-    @filter.llm_tool(name="mc_stance")
     async def mc_stance(self, event: AstrMessageEvent, mode: str):
         """Set your COMBAT STANCE. This decides whether you go LOOKING for mobs.
 
@@ -1609,7 +1594,6 @@ class McBodyPlugin(Star):
                     "注意：你（用户）一开口我就放下追怪做你的事。")
         return ("战斗姿态已设为 defend：我不主动找怪，只在挨打或怪瞄着我时还手。")
 
-    @filter.llm_tool(name="mc_retreat")
     async def mc_retreat(self, event: AstrMessageEvent, toward: str = "auto"):
         """BREAK OFF combat: stop fighting immediately and back away toward safety.
         Works even at full health (you are losing, do not want to fight, or want to come back and
@@ -1634,7 +1618,6 @@ class McBodyPlugin(Star):
 
     # ---- 任务层（多步行为）-----------------------------------------------
 
-    @filter.llm_tool(name="mc_task")
     async def mc_task(self, event: AstrMessageEvent, task: str, at: str = ""):
         """Send her off to do a MULTI-STEP job; the program carries it out step by step.
         Other tools are ONE ACTION; this is ONE JOB.
@@ -1674,7 +1657,6 @@ class McBodyPlugin(Star):
                 params["x"], params["z"] = px, pz
         return await self.tasks.start(name, **params)
 
-    @filter.llm_tool(name="mc_task_stop")
     async def mc_task_stop(self, event: AstrMessageEvent):
         """Throw away the current task and go back to idling.
         
@@ -1684,7 +1666,6 @@ class McBodyPlugin(Star):
             return deny
         return await self.tasks.stop()
 
-    @filter.llm_tool(name="mc_journal")
     async def mc_journal(self, event: AstrMessageEvent, count: int = 20):
         """Browse the STATE LOG: what just happened, by category
         (task / reflex / craft / body / error).
@@ -1706,7 +1687,6 @@ class McBodyPlugin(Star):
             return "日志是空的 —— 要么刚重启过，要么真的什么都还没发生。"
         return f"最近 {min(n, len(self.journal))} 条：\n{self.journal.render(n)}"
 
-    @filter.llm_tool(name="mc_events")
     async def mc_events(self, event: AstrMessageEvent, count: int = 20):
         """What just happened -- damage taken / deaths / who logged in or out /
         what appeared in or left your inventory.
@@ -1777,7 +1757,6 @@ class McBodyPlugin(Star):
             return {"job": "done", "status": status, "err": "结果不是数据"}
         return got
 
-    @filter.llm_tool(name="mc_around")
     async def mc_around(self, event: AstrMessageEvent, deep: str = ""):
         """Look at what is around you -- a wide overview: terrain + surface
         composition + nearby facilities.
@@ -1813,7 +1792,6 @@ class McBodyPlugin(Star):
         t2 = await self._around_t2(data if isinstance(data, dict) else {}, force)
         return render.describe_around(data, t2)
 
-    @filter.llm_tool(name="mc_where")
     async def mc_where(self, event: AstrMessageEvent, player: str):
         """Look up WHERE a player is -- yourself, or anyone on the server.
         
@@ -1838,7 +1816,6 @@ class McBodyPlugin(Star):
                                 hint="不带参数可以查主人；名字要用她的游戏 ID（不是显示名）")
         return render.describe_where(data, who)
 
-    @filter.llm_tool(name="mc_chat_log")
     async def mc_chat_log(self, event: AstrMessageEvent, count: int = 20):
         """Browse the IN-GAME PUBLIC CHAT -- who said what, and where they were
         standing at the time.
@@ -1870,7 +1847,6 @@ class McBodyPlugin(Star):
             return "游戏公屏是空的 —— 还没人说过话。"
         return f"游戏公屏最近 {min(n, len(lines))} 条：\n" + render.describe_chat(lines, n)
 
-    @filter.llm_tool(name="mc_aim")
     async def mc_aim(self, event: AstrMessageEvent, x: float = 0, y: float = 0,
                      z: float = 0, release: bool = False):
         """LOCK YOUR LINE OF SIGHT onto something -- keep looking at it even while
@@ -1917,7 +1893,6 @@ class McBodyPlugin(Star):
         return (f"视线锁在 ({tx}, {ty}, {tz}) 了 —— 接下来**就算走路也会一直看着那儿**，"
                 "而且是每 tick 重算，不会因为走远就偏。看完记得 `mc_aim(release=true)` 松开。")
 
-    @filter.llm_tool(name="mc_screenshot")
     async def mc_screenshot(self, event: AstrMessageEvent, question: str = ""):
         """TAKE A LOOK AROUND YOU -- capture your game screen and have it
         described to you in words.
@@ -1949,7 +1924,6 @@ class McBodyPlugin(Star):
             return "看东西的功能被管理员关掉了。"
         return await self.sight.look(str(question or ""))
 
-    @filter.llm_tool(name="mc_lookat")
     async def mc_lookat(self, event: AstrMessageEvent):
         """WHAT ARE YOU LOOKING AT RIGHT NOW -- the single thing under your
         crosshair, answered instantly.
