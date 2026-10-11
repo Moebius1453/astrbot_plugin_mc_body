@@ -1134,9 +1134,14 @@ class McBodyPlugin(Star):
         """Escape hatch: send a raw Baritone command. Only use it when the
         fixed tools cannot do the job.
         
-        Common ones: mine diamond_ore (mine), explore, farm, goto 100 64 -200
+        Common ones: ``mine <block_id>``, explore, farm, goto 100 64 -200
         (goto with Y), come, thisway 100.
-        
+
+        NEVER guess a block id from memory. If you were asked to chop or mine
+        something you can see, call mc_lookat FIRST to read which block your
+        crosshair is on, then pass THAT id to mine. A guessed id sends you off
+        hunting for a block that is not the one in front of you.
+
         Args:
             command(string): The Baritone command itself, WITHOUT the leading #."""
         if (deny := self._guard(event)):
@@ -1153,7 +1158,8 @@ class McBodyPlugin(Star):
             return (
                 f"error: 不允许「{verb}」这个 Baritone 动词 —— 它可能有能力一次改掉一大片方块。\n"
                 f"usage: 只允许 {' / '.join(sorted(BARITONE_VERBS))}\n"
-                "hint: 挖东西用 `mine <方块>`（例如 `mine oak_log`）；"
+                "hint: 挖/砍东西用 `mine <方块注册名>` —— 方块名不许凭印象写，"
+                "先 `mc_lookat` 看你准星指着的是什么方块，用它报的 id（去掉 `minecraft:` 前缀）；"
                 "想去某个地方用 `mc_goto`；想看周围用 `mc_around`。"
             )
         _, err = await self._claim_walk_user(clean, "mc_baritone_raw")
