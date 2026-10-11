@@ -34,6 +34,7 @@ from .mcb import containers as mcb_containers
 from .mcb.containers import ContainerIO
 from .mcb.craft import CraftRunner, Crafter
 from .mcb.events import EventFeed
+from .mcb.glance import IdleGlance
 from .mcb.hunt import HuntGuard
 from .mcb.idle import IdleGuard
 from .mcb.journal import Journal
@@ -245,6 +246,28 @@ class McBodyPlugin(Star):
             journal=self.journal,
         )
         self.reflex.bind_hunt(self.hunt)
+
+        # 空闲扫视 —— 她闲着时脑袋像人一样看来看去（身体层，不花 token）。
+        # 注意： 这是把退役的客户端脚本里 mcbIdleClaim 那段搬到插件里重写。
+        #    它走原版命令（execute as … tp …）设朝向，因为 Numen 不把"转头"
+        #    暴露给模型。详见 mcb/glance.py 的模块注释。
+        # 注意： 它自带循环，不挂反射那根节拍 —— 反射现在是关的。
+        self.glance = IdleGlance(
+            self.bridge,
+            enabled=bool(self._cfg("enable_idle_glance", True)),
+            companion_name=str(self._cfg("character_name", "Nanako")),
+            owner_name=str(self._cfg("owner_player_name", "") or ""),
+            after_seconds=float(self._cfg("glance_after_seconds", 20)),
+            hold_min=float(self._cfg("glance_hold_min", 4)),
+            hold_max=float(self._cfg("glance_hold_max", 7)),
+            look_at_player=float(self._cfg("glance_look_at_player", 0.6)),
+            near_player=float(self._cfg("glance_near_player", 8)),
+            yaw_span=float(self._cfg("glance_yaw_span", 35)),
+            pitch_span=float(self._cfg("glance_pitch_span", 15)),
+            step_yaw=float(self._cfg("glance_step_yaw", 8)),
+            step_pitch=float(self._cfg("glance_step_pitch", 4)),
+            step_interval=float(self._cfg("glance_step_interval", 0.15)),
+        )
         # 有人跟她说话时：闲逛重算安静计时，熟度重算冷却。
         # 走路类的指令不用接：它们会占住 walk 通道，闲逛自己让开；
         # 而"刚聊过"这件事对熟度有意义 —— 刚说完话不该马上又自己醒。
@@ -364,8 +387,9 @@ class McBodyPlugin(Star):
     # ---- 熟度：她什么时候该自己醒（见 mcb/ripeness.py）------------------
 
     def _on_user_activity(self) -> None:
-        """有人在跟她说话 —— 闲逛重算安静计时，熟度重算冷却。"""
+        """有人在跟她说话 —— 闲逛和空闲扫视都重算安静计时，熟度重算冷却。"""
         self.idle.note_activity()
+        self.glance.note_activity()
         self.ripeness.note_turn()
 
     def _on_world_event(self, raw: dict) -> None:
@@ -557,6 +581,12 @@ class McBodyPlugin(Star):
         else:
             logger.info(f"[{PLUGIN_NAME}] 防御反射已关闭（enable_reflex=false）")
 
+        # 空闲扫视自带循环，和反射不共用节拍 —— 单独开关，单独起停。
+        if self._cfg("enable_idle_glance", True):
+            self.glance.start()
+        else:
+            logger.info(f"[{PLUGIN_NAME}] 空闲扫视已关闭（enable_idle_glance=false）")
+
         # 事件流跟着反射一起开关 —— 两者都是"常驻在跑的后台感知"，没必要拆成两个开关
         if self._cfg("enable_reflex", True):
             self.events.start()
@@ -591,6 +621,7 @@ class McBodyPlugin(Star):
         #    会卡在这个 await 上。停任务顺带把她的寻路也取消掉。
         await self.tasks.stop(quiet=True)
         await self.reflex.stop()
+        await self.glance.stop()
         await self.events.stop()
         await self.uplink.stop()
         await self._drop_self_loop()

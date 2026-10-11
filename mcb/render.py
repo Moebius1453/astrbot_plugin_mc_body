@@ -839,6 +839,16 @@ WIRING_NOTE = (
     "In-game public chat reaches you under [mc:chat]; when someone calls your name you are "
     "woken with that line directly, and your reply is then posted to the public chat "
     "automatically — do not call `say` or `mc_say` yourself, the harness already sends it. "
+    # 注意： 2026-10-11 18:34 实测踩到的坑。Numen 自己的 MCP 说明里教她
+    #    "每 2 秒调一次 get_events"，她就照做了 —— 而 get_events 是长轮询，
+    #    一停最长 50 秒。她停在里面时这一轮 agent 不结束，uplink 那把
+    #    "一次只唤醒一个"的锁就一直被占着，主人在游戏里后面说的话全部排队，
+    #    等不到任何回应。症状看起来像"T 键打字没反应"。
+    #    而我们这条路不需要它：主人的话是走聊天上行（RCON 轮询）进插件的，
+    #    已经在她手上了。所以这里必须明确禁掉。
+    "Do NOT call `get_events` — not to poll, not to wait. The game chat already reaches you "
+    "through the harness on its own, and parking in `get_events` blocks the harness so the "
+    "owner's later messages never get answered. If you have nothing to do, answer and stop. ",
     "You live in a Numen companion body. Everything you DO there goes through the `lua` "
     "tool — walking, digging, placing, crafting, fighting. Write the steps as one Lua "
     "program and hand it to `lua`; look up a group's functions with "
