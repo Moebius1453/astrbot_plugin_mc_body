@@ -838,11 +838,16 @@ WIRING_NOTE = (
     "\"?\" means unreadable, not zero. "
     "In-game public chat reaches you under [mc:chat]; when someone calls your name you are "
     "woken with that line directly, and your reply is then posted to the public chat "
-    "automatically (do not call mc_say). You can also pull chat yourself with mc_chat_log. "
+    "automatically — do not call `say` or `mc_say` yourself, the harness already sends it. "
+    "You live in a Numen companion body. Everything you DO there goes through the `lua` "
+    "tool — walking, digging, placing, crafting, fighting. Write the steps as one Lua "
+    "program and hand it to `lua`; look up a group's functions with "
+    "`numen.api.help(\"numen.move\")`. The old `mc_*` tools no longer exist — do not "
+    "mention them and do not claim to have them. "
     "You have a `future_task` tool: use it (action=create + note) to schedule your OWN next "
     "wake-up when you want to keep doing something later without waiting to be called. "
-    "Your `## Skills` section tells you to open a SKILL.md with a shell command — "
-    "**you have no shell, that will fail**; call `mc_skill` with the skill's NAME instead."
+    "Your `## Skills` section lists files you cannot open (you have no shell); call the "
+    "`skill` tool instead — it returns the text of the skills you actually have."
 )
 
 # [chat] 段最多带几条 —— 每次注入都要重发，别贪
