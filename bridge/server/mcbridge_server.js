@@ -1410,6 +1410,11 @@ function mcbThreats(player, radius) {
     ) * 10) / 10
     // 敌对 = Monster 类 或 名字像怪 或 正瞄着我
     en.hostile = !!en._m || en.targeting || MCB_HOSTILE_RE.test(en.type)
+    // 主动清怪（hunt）只看这一条：是不是真正的 Monster 类。
+    // 为什么单独留一个字段："敌对"是三条并集 —— 为了保命宁可多算（狼、羊驼都算进去），
+    // 但"主动跑过去杀"不能按那个并集来：狼在 1.21 不是 Monster，
+    // 按并集去追就会把主人驯的狼一起打。见 mcb/hunt.py 的 _pick。
+    en.monster = !!en._m
     delete en._m
     arr.push(en)
   }

@@ -34,7 +34,7 @@ import time
 
 from astrbot.api import logger
 
-from .arbiter import LEVEL_REFLEX
+from .arbiter import COMBAT_TTL, LEVEL_COMBAT, LEVEL_REFLEX
 
 # 战斗态持续多久（秒）。这段时间内持续评估要不要跑。
 COMBAT_WINDOW_SECONDS = 12.0
@@ -210,6 +210,8 @@ class ReflexGuard:
         self.arbiter = None
         # 闲逛（见 mcb/idle.py）。挂上来之后借这个节拍走，不另起循环。
         self._idle = None
+        # 主动清怪（见 mcb/hunt.py）。同上：借节拍走，用的是这里已经扫到的那份 hostiles。
+        self._hunt = None
 
         self._task: asyncio.Task | None = None
 
@@ -265,17 +267,45 @@ class ReflexGuard:
         """
         self._idle = idle
 
-    # 注意： 反射的 walk 声明是最高优先级（保命 > 用户 > 任务）。
-    #    而且它只在声明、不删别人的 —— 所以脱战一 release，
+    def bind_hunt(self, hunt) -> None:
+        """挂上主动清怪（mcb/hunt.py）。
+
+        它和闲逛一样没有自己的循环 —— 借这个节拍走，而且用的是这一 tick
+        已经扫到的那份 hostiles，省一次 RCON 往返（见 mcb/hunt.py 的模块注释）。
+        """
+        self._hunt = hunt
+
+    # 注意： 反射的 walk 声明分两种层，别混（2026-10-11 拆的）：
+    #    · 保命的（逃跑 / 溺水 / 卡住 / 进战刹车）走 LEVEL_REFLEX —— 压过用户是对的
+    #    · 为打架而走的（追怪 / 走位）走 LEVEL_COMBAT —— 用户一开口就该让路
+    #    起因：用户实测"她在打怪时喊她做别的，指令下不去"，看着像反应不灵敏。
+    #    详见 arbiter.py 里 LEVEL_COMBAT 那段说明。
+    #
+    #    两种都只在声明、不删别人的 —— 所以脱战一 release，
     #    任务/用户的路线会自己恢复（"挂起不是取消"的落点）。
     #
     # 重点： 2026-10-10：每一条都带 ttl —— 到期由 expire_stale() 自动让位。
     #    这是"卡住把 walk 通道永久锁死"那个真 bug 的兜底，见 arbiter.py。
     async def _walk_claim(self, cmd: str, note: str, ttl: float = FLEE_TTL) -> None:
+        """保命位移：逃跑 / 溺水上浮。压过用户和任务。"""
         if self.arbiter is None:
             await self._cmd(f"mcb baritone {cmd}")
             return
         await self.arbiter.claim_walk(LEVEL_REFLEX, "reflex", cmd, note, ttl=ttl)
+
+    async def _walk_engage(self, cmd: str, note: str, ttl: float = COMBAT_TTL) -> None:
+        """交战位移：追怪 / 走位。只压过任务和闲逛，用户一开口就让路。
+
+        注意： owner 仍然是 "reflex"，故意不换成独立 owner ——
+        claim_walk 是"同 owner 后一条顶掉前一条"，靠这条，
+        进战时那句保命刹车（_walk_stop 的"停"）才会被紧接着的追怪顶掉。
+        换成独立 owner 的话，那条 level 0 的"停"会压在 level 15 的追怪上面，
+        进战后她会原地站 8 秒（STOP_TTL）才追 —— 实测踩过这个形状。
+        """
+        if self.arbiter is None:
+            await self._cmd(f"mcb baritone {cmd}")
+            return
+        await self.arbiter.claim_walk(LEVEL_COMBAT, "reflex", cmd, note, ttl=ttl)
 
     async def _walk_stop(self, note: str, ttl: float = STOP_TTL) -> None:
         """保命：顶掉别人的路线并停下。不是"我不要走了" —— 见 claim_walk 的注释。
@@ -498,6 +528,15 @@ class ReflexGuard:
                 # 原来 defend 一律 chase=False，于是骷髅站在 3 格外射她，她原地挨打。
                 chase = (self._stance == STANCE_HUNT) or self._engaged
                 await self._fight(data, target, hp, chase=chase)
+
+        # 主动清怪（mcb/hunt.py）—— 放在战斗状态机之后：
+        #    它要看这一 tick 最新的 _in_combat（打起来了就让位，别两边抢 walk）。
+        #    用的是上面已经扫到的那份 hostiles，不再问一次桥。
+        if self._hunt is not None:
+            await self._hunt.tick(
+                data, hostiles, stance=self._stance, in_combat=self._in_combat,
+                arrive_range=HUNT_RANGE,
+            )
 
         # 挨打通知（只在掉血时，不刷屏）
         if hurt:
@@ -835,7 +874,7 @@ class ReflexGuard:
                 logger.info(
                     f"[mc_body] ⚔ {nearest['name']} 在 {dist:g} 格外，走过去 ({tx},{ty},{tz})"
                 )
-                await self._walk_claim(f"goto {int(tx)} {int(tz)}", "打怪：靠近", ttl=STOP_TTL)
+                await self._walk_engage(f"goto {int(tx)} {int(tz)}", "打怪：靠近")
             else:
                 self._approach_wait -= 1
         else:
@@ -877,7 +916,7 @@ class ReflexGuard:
         bx = int(round(x + dx / norm * KITE_STEP))
         bz = int(round(z + dz / norm * KITE_STEP))
         self._kite_at = now
-        await self._walk_claim(f"goto {bx} {bz}", "砍完退半步", ttl=KITE_TTL)
+        await self._walk_engage(f"goto {bx} {bz}", "砍完退半步", ttl=KITE_TTL)
 
     async def _equip_best_weapon(self, data: dict) -> None:
         """进战时确保手上是最能打的那件。判据只看 atk（真实攻击力）。

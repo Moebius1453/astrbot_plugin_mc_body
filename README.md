@@ -212,6 +212,7 @@
 |---|---|
 | default_stance | 开局姿态：defend 被动 / hunt 主动清怪 |
 | enable_mc_stance_tool | 是否允许她自己在运行中改姿态 |
+| enable_hunt | hunt 姿态下是否真的主动去找怪（关掉则 hunt 只等于"打贴上来的"） |
 | owner_player_name | 用户的游戏 ID。脱战时"朝用户跑"要用它找人 |
 | retreat_toward | 濒死自动逃跑往哪跑：safe 背离怪 / owner 朝用户 |
 

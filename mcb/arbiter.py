@@ -18,7 +18,7 @@
 低的挂起不取消；高的释放后低的自动恢复。
 
 ```
-优先级（小的赢）：   反射（保命） > 用户指令 > 当前任务
+优先级（小的赢）：   反射（保命） > 用户指令 > 战斗位移 > 当前任务 > 闲逛
 ```
 
 这跟现有的 reflex.suspend()/resume() 是同一个语义 —— 只是从"反射 vs 任务"两条线
@@ -58,6 +58,7 @@ TTL 是这条的兜底：expire_stale() 每 tick 扫一遍，到点自动让位�
 |---|---|---|
 | 反射 | 必须显式传（FLEE_TTL / STOP_TTL） | 反射自己 touch_walk —— 它有自己的"作用时间"纪律 |
 | 用户 | USER_TTL | renew_active()：身体报告还在动就自动续 |
+| 战斗 | COMBAT_TTL（短） | 同 renew_active() —— 但目标没了身体就停，自然到点让位 |
 | 任务 | TASK_TTL | renew_active() + 任务自己的 checkpoint |
 
 续期的证据是身体的可观测状态，不是调用方的心情（renew_active 的注释里有理由）。
@@ -84,12 +85,32 @@ from astrbot.api import logger
 #   用分数表达相对顺序，换来的是主人预测不了她下一秒干什么。
 #   同一通道里两条声明要争时，让它们争不着（分开通道 / 分开 owner），
 #   不要给数字加小数点。
-LEVEL_REFLEX = 0     # 保命。挨打、濒死、卡住
+LEVEL_REFLEX = 0     # 保命。挨打停、濒死逃、溺水、卡住
 LEVEL_USER = 10      # 用户/LLM 的直接指令
+LEVEL_COMBAT = 15    # 为打架而移动（追怪、主动搜索接近）。见下面那条说明
 LEVEL_TASK = 20      # 正在跑的多步任务
 LEVEL_IDLE = 30      # 闲逛。没人管她的时候她自己动一动（身体层，不花 token）
 
-_LEVEL_CN = {LEVEL_REFLEX: "反射", LEVEL_USER: "用户", LEVEL_TASK: "任务", LEVEL_IDLE: "闲逛"}
+_LEVEL_CN = {LEVEL_REFLEX: "反射", LEVEL_USER: "用户", LEVEL_COMBAT: "战斗",
+             LEVEL_TASK: "任务", LEVEL_IDLE: "闲逛"}
+
+# 为什么"追怪"要单独一层，而不是留在反射层（2026-10-11）
+#
+# 反射层原来装了两类东西：保命的（挨打停 / 濒死逃 / 溺水 / 卡住）和进攻的（追怪靠近）。
+# 两类都走 LEVEL_REFLEX，于是"追怪"也压过了用户指令 —— 用户实测：
+# 她在打怪时喊她做别的，指令下不去，看着像"反应不灵敏"。
+# 但"偶尔"才不灵敏：怪贴脸（< ENGAGE_RANGE）时 _fight 只挥不占 walk，
+# 通道空着，指令能下去；怪在 3~6 格外时才占着。
+#
+# 保命压过用户是对的（那是命），追怪压过用户是错的（那只是进攻）。
+# 所以拆出这一层：
+#
+#   保命的四条  留在 LEVEL_REFLEX  —— 仍然压过用户
+#   为打架而移动 用 LEVEL_COMBAT   —— 用户一开口就让它让路
+#
+# 层序 10 < 15 < 20 还顺带定死了两条语义：
+#   · 用户指令能打断"正在追的怪"（该的）
+#   · 战斗位移能打断正在跑的任务（也该 —— 打架时她本来就要挂起任务）
 
 # 用户 / 任务的默认 TTL（秒）。它们不靠调用点释放，靠"身体还在动就续期"。
 #
@@ -97,6 +118,9 @@ _LEVEL_CN = {LEVEL_REFLEX: "反射", LEVEL_USER: "用户", LEVEL_TASK: "任务",
 # 任务在等熔炉），又不能长到让一把真正的死锁赖着不走。
 USER_TTL = 60.0
 TASK_TTL = 60.0
+# 战斗位移的默认 TTL。比用户/任务短得多 —— 追怪是"目标还在就追"，
+# 目标一没（被打死 / 跑出视野 / 她不想打了）就该尽快让位，别占着通道 60 秒。
+COMBAT_TTL = 20.0
 
 # 身体"确实在干活"的二值信号（客户端上报的 status，见 bridge/client/mcbridge.js）。
 # following-idle 也算 —— 跟随时目标就在旁边，Baritone 不走路，但那正是在跟随。
@@ -151,6 +175,7 @@ class Arbiter:
         |---|---|
         | 反射（保命） | 必须显式传（FLEE_TTL / STOP_TTL）—— "反射肯定有作用时间，加个限制不至于无限触发" |
         | 用户 | 不传就用 USER_TTL，由 renew_active 按身体状态续期 |
+        | 战斗 | 显式传短 TTL（见 hunt.py / reflex 的交战版）—— 目标没了要尽快让位 |
         | 任务 | 不传就用 TASK_TTL，同上 + 任务自己的 checkpoint 也会续 |
 
         注意： 反射不传 ttl 会抛异常，不给默认值 —— 静默兜一个默认值就是
@@ -162,7 +187,12 @@ class Arbiter:
                     "反射级的 walk 声明必须显式带 ttl（FLEE_TTL / STOP_TTL）—— "
                     "见 mcb/arbiter.py 的模块注释"
                 )
-            ttl = USER_TTL if level <= LEVEL_USER else TASK_TTL
+            if level <= LEVEL_USER:
+                ttl = USER_TTL
+            elif level <= LEVEL_COMBAT:
+                ttl = COMBAT_TTL
+            else:
+                ttl = TASK_TTL
         expire_at = time.monotonic() + float(ttl)
         self._walk = [c for c in self._walk if c.owner != owner]
         self._walk.append(_Claim(level, owner, cmd, note, expire_at, float(ttl)))

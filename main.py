@@ -34,6 +34,7 @@ from .mcb import containers as mcb_containers
 from .mcb.containers import ContainerIO
 from .mcb.craft import CraftRunner, Crafter
 from .mcb.events import EventFeed
+from .mcb.hunt import HuntGuard
 from .mcb.idle import IdleGuard
 from .mcb.journal import Journal
 from .mcb import permission
@@ -233,6 +234,16 @@ class McBodyPlugin(Star):
             journal=self.journal,
         )
         self.reflex.bind_idle(self.idle)
+
+        # 主动清怪 —— 去找怪打（和"挨打就还手"那条反射分开，见 mcb/hunt.py 的模块注释）。
+        # 只在 mc_stance 切到 hunt 时工作；走 LEVEL_COMBAT，用户一开口就让路。
+        self.hunt = HuntGuard(
+            self.bridge,
+            self.arbiter,
+            enabled=bool(self._cfg("enable_hunt", True)),
+            journal=self.journal,
+        )
+        self.reflex.bind_hunt(self.hunt)
         # 有人跟她说话时：闲逛重算安静计时，熟度重算冷却。
         # 走路类的指令不用接：它们会占住 walk 通道，闲逛自己让开；
         # 而"刚聊过"这件事对熟度有意义 —— 刚说完话不该马上又自己醒。
@@ -486,6 +497,7 @@ class McBodyPlugin(Star):
                 instincts=reflexes.overview(),
                 hold=render.describe_hold(data, self.uplink.hold_reason,
                                           self.uplink.hold_detail),
+                hunt=self.hunt.render(),
             )
             from astrbot.core.agent.message import TextPart
             req.extra_user_content_parts.append(TextPart(text=packet))
@@ -886,9 +898,10 @@ class McBodyPlugin(Star):
           scans nearby. This is the easiest form -- no coordinates needed.
         - x + z -- walk to exact coordinates (only when you read F3 or someone told you).
         
-        WARNING: searching by block name only covers ~16 blocks around her (server scan limit).
-        If it is further away it will not be found -- walk closer first, or record it in the place
-        book (mc_place) and then use near="name".
+        WARNING: searching by block name only covers a SMALL patch around her -- the server
+        caps the scan to about 11 blocks, not the whole area. If it is further away it will not
+        be found -- walk closer first, or record it in the place book (mc_place) and then use
+        near="name". NOT FINDING IT DOES NOT MEAN IT IS NOT THERE.
         
         Common block ids: minecraft:crafting_table, minecraft:furnace, minecraft:chest,
         minecraft:farmland, simpletomb:grave_cross.
@@ -963,9 +976,9 @@ class McBodyPlugin(Star):
                        name: str = "", what: str = "", note: str = ""):
         """PLACE BOOK -- remember / list / self-check / forget "what is where".
         
-        Your scan only covers ~16 blocks around you; outside that you are blind. Record the
-        important places, and mc_goto near="name" will take you there without anyone reporting
-        coordinates.
+        Your scan only covers about 11 blocks around you (the server caps it); outside that you
+        are blind. Record the important places, and mc_goto near="name" will take you there
+        without anyone reporting coordinates.
         
         - action="remember" -- record where you are standing right now (needs a name).
           Also write what (what this place is) so it makes sense when you read it later.
@@ -1066,10 +1079,17 @@ class McBodyPlugin(Star):
     @filter.llm_tool(name="mc_follow")
     async def mc_follow(self, event: AstrMessageEvent, player: str):
         """Follow a player.
-        
+
         WARNING: this means "stay within a few blocks", NOT "stick to them" -- if the target is
         right next to her, her not moving is normal.
-        
+
+        WARNING: following does NOT stop on its own -- she keeps following until something
+        takes over the walking. What DOES take over: any other walking instruction (mc_goto,
+        mc_baritone_raw, a task that walks) or mc_stop. What does NOT: tools that do not walk
+        (mc_craft, mc_use_on, mc_say, ...). So if she is following and you want her to go do
+        something, give her a walking instruction or mc_stop first -- do not assume the follow
+        will time out.
+
         Args:
             player(string): The player name to follow (in-game id; letters, digits, underscore)."""
         if (deny := self._guard(event)):
@@ -1462,7 +1482,8 @@ class McBodyPlugin(Star):
         
         She picks the recipe herself (the same product often has several), walks over, loads
         material and fuel, WAITS for it to finish, and takes the result.
-        WARNING: needs FUEL (coal / charcoal) and a furnace within 16 blocks. She loads the WHOLE
+        WARNING: needs FUEL (coal / charcoal) and a furnace nearby -- the server caps the search
+        to about 11 blocks, so a furnace "16 blocks away" may not be found. She loads the WHOLE
         stack of material -- you get however much comes out.
         If you are unsure whether to use this or mc_craft, try mc_craft first: it will say
         "this has to be smelted".
@@ -1482,10 +1503,17 @@ class McBodyPlugin(Star):
     @filter.llm_tool(name="mc_attack")
     async def mc_attack(self, event: AstrMessageEvent):
         """Attack whatever entity your CROSSHAIR is on (fight mobs, hit animals).
-        
+
         It first checks what the crosshair points at. If that is not an entity, it tells you clearly.
         To aim at something first, use mc_aim(x, y, z) to lock your view onto it.
-        (Usually you walk closer first with mc_goto / mc_follow to get the target into view.)"""
+        (Usually you walk closer first with mc_goto / mc_follow to get the target into view.)
+
+        WARNING: this goes through a safety gate. Hitting a player's pet (a tamed wolf, a
+        villager, someone's horse) may be REFUSED and you will be told so -- that is the gate
+        working, not a bug. Automatic counter-attacks when something hits you do NOT go through
+        this tool and do not ask.
+        WARNING: this hits ENTITIES only. To break blocks, use mc_baritone_raw with
+        "mine <block_id>"."""
         if (deny := self._guard(event)):
             return deny
         # 权限门（docs\22 §4）：准星制的 mc_attack 可能打到主人驯的宠物，所以先问服务端
@@ -1525,7 +1553,10 @@ class McBodyPlugin(Star):
     async def mc_threats(self, event: AstrMessageEvent):
         """See whether there are mobs nearby, how far, what kind, how much health,
         and whether they are aiming at you (the server reads the world directly, so this is accurate).
-        
+
+        Covers about 24 blocks around you -- "nothing found" only means nothing within that
+        range, not that the world is empty.
+
         Use it to judge "is it safe around here", "should I fight", "which way do I run".
         targeting=true means that mob is staring at you."""
         if (deny := self._guard(event)):
@@ -1538,18 +1569,26 @@ class McBodyPlugin(Star):
 
     @filter.llm_tool(name="mc_stance")
     async def mc_stance(self, event: AstrMessageEvent, mode: str):
-        """Set your COMBAT STANCE -- whether to hunt mobs is your decision.
-        
-        - defend (default) passive: only fights back when HIT or when a mob is AIMING at you;
-          does not CHASE things out of reach
-        - hunt actively clear mobs: attacks any hostile within 5 blocks, chases ones out of reach
-        
-        WARNING: under BOTH stances, being hit triggers an immediate automatic counterattack
-        (a reflex, it does not go through you), so defend will not get you killed.
-        Set defend to mine in peace; set hunt to clear an area.
-        
+        """Set your COMBAT STANCE. This decides whether you go LOOKING for mobs.
+
+        - defend (default) passive: you never go after anything. You still fight back
+          automatically the moment something hits you or aims at you (that part is a
+          reflex, it never goes through you), so defend will not get you killed.
+        - hunt aggressive: you actively SEEK OUT nearby hostile mobs -- you walk to them
+          and attack. Only real monsters are targeted (never tamed animals/pets).
+          You stop seeking when a mob is already in reach, or when your body cannot
+          get there safely (underground, or a big height difference).
+
+        WARNING: do NOT tell the user "I will go hunt mobs" unless you have switched to
+        hunt first -- under defend you stay put and only react. Also, hunt is NOT a
+        guarantee you will find anything: it searches the mobs your senses can see
+        (about 24 blocks), not the whole world.
+
+        WARNING: hunt loses to the user. The moment the user tells you to do something
+        else, you drop the chase and do that instead -- that is by design, not a bug.
+
         Args:
-            mode(string): Either "defend" (passive) or "hunt" (actively clear)."""
+            mode(string): Either "defend" (passive) or "hunt" (actively seek mobs)."""
         if (deny := self._guard(event)):
             return deny
         if not self._cfg("enable_mc_stance_tool", True):
@@ -1559,8 +1598,10 @@ class McBodyPlugin(Star):
         except ValueError as exc:
             return str(exc)
         if actual == "hunt":
-            return "战斗姿态已设为 **hunt**：我会主动打 5 格内的怪，够不着就追过去。"
-        return "战斗姿态已设为 **defend**：我不主动挑事，只在挨打或怪瞄着我时才还手。"
+            return ("战斗姿态已设为 hunt：我会在附近（约 24 格）主动找怪走过去打，"
+                    "只打真的怪，不碰驯服的动物。已经打起来的那种照旧自动还手。"
+                    "注意：你（用户）一开口我就放下追怪做你的事。")
+        return ("战斗姿态已设为 defend：我不主动找怪，只在挨打或怪瞄着我时还手。")
 
     @filter.llm_tool(name="mc_retreat")
     async def mc_retreat(self, event: AstrMessageEvent, toward: str = "auto"):
@@ -1603,8 +1644,9 @@ class McBodyPlugin(Star):
         WARNING: being hit / nearly dying interrupts her (survival first), but that is a SUSPENSION,
         not a cancellation -- she picks it back up once the danger passes.
         
-        WARNING: a field further than ~16 blocks is OUT OF SCAN RANGE and farm will come up empty --
-        use at to tell her where the field is.
+        WARNING: a field further away than the scan can reach (about 11 blocks -- the server
+        caps it) is OUT OF RANGE and farm will come up empty -- use at to tell her where the
+        field is.
         
         Args:
             task(string): The task name. An unknown name is rejected and the options are listed.
@@ -1666,6 +1708,8 @@ class McBodyPlugin(Star):
         When to use it:
         - Your inventory suddenly changed and you want to know WHO gave you something
           ("got diamond_sword x1")
+          WARNING: it does NOT say WHO gave it to you -- the log only records "you gained X",
+          never a source. If you need to know who, ask the user; do not guess.
         - You lost health but did not see what hit you ("hurt <- zombie -3.5hp left 12.7")
         - You want to know WHO IS ONLINE, or who just logged in
         - The user asks "has anyone been around"

@@ -1,6 +1,6 @@
 ---
 name: combat
-description: What to fight and what to run from — why the item in hand decides your damage, and which reflexes fire without you deciding anything.
+description: What to fight and what to run from — how the item in hand decides your damage, which reflexes fire without you deciding anything, and defend vs hunt.
 ---
 
 # 打架：什么该打，什么先跑
@@ -30,8 +30,15 @@ description: What to fight and what to run from — why the item in hand decides
 1. 先看是谁：mc_threats 会告诉你附近有什么、它是不是正瞄着你。
    注意： 只算"敌对生物"是不够的 —— 正在瞄准你的才算威胁。
 2. 打不打得过：手上有武器吗？血够吗？几只？
-3. 够不着别追：默认姿态（defend）只在挨打或有人瞄着你时还手，够不着不追。
-   要主动追击得显式切 hunt。
+3. 够不着追不追，分三种情况（别混）：
+   - defend（默认）—— 只是"附近有怪"：不追，站着等它过来。
+   - defend 但**它确实在打我**（正瞄着我 / 刚打了我）—— 追。正在打我还不还手是蠢，
+     不是"不挑事"。
+   - hunt —— **主动去附近找怪**：走到约 24 格内能看见的怪那儿去打，只打真的怪
+     （不碰驯服的动物）。找怪这一层比你（用户）的指令低，你一说话她就放下追怪。
+     够得着就交给自动战斗，不追远的。
+
+   ->  所以"我会主动去找怪"这句话，只有切到 hunt 才成立；defend 下说这话是虚的。
 
 ## 什么先跑
 

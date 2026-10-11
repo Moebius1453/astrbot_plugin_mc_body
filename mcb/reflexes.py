@@ -56,7 +56,8 @@ INSTINCTS: tuple[Instinct, ...] = (
     Instinct(
         id="combat",
         trigger="you take damage (hp went down), or a hostile is aiming at you",
-        action="stops whatever you were doing, enters combat, and fights back only if in reach",
+        action="stops whatever you were doing, enters combat; it attacks what is in reach and "
+               "closes the distance to whatever is actually attacking you",
         config_key=None,
     ),
     Instinct(
@@ -86,11 +87,13 @@ def overview() -> str:
     """拼成一行给模型看的"本能总览"。英文 —— 这段会进提示词。"""
     bits = [f"{i.id} ({i.trigger} -> {i.action})" for i in INSTINCTS]
     return (
-        "[instincts] Your body also has instincts that fire on their own, every 2 seconds, "
-        "without you deciding and without costing you anything: "
+        "[instincts] Your body also has instincts that fire on their own, once a second "
+        "(four times a second while you are fighting), without you deciding and without "
+        "costing you anything: "
         + "; ".join(bits)
-        + ". They are reflexes -- you cannot switch them off. What you DO control is the "
-        "higher-level intent (stance with `mc_stance`, tasks with `mc_task`). "
+        + ". They are reflexes -- you cannot switch them off yourself (the server owner can "
+        "disable some of them in the plugin config). What you DO control is the higher-level "
+        "intent (stance with `mc_stance`, tasks with `mc_task`). "
         "If one of them interrupts something you were doing, that is why."
     )
 

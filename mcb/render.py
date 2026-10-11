@@ -704,7 +704,8 @@ def _num(value, fmt: str = "g") -> str:
 
 def state_packet(data: dict, stance: str = "defend", work: dict | None = None,
                  journal=None, places=None, chat=None, *, log_lines: int = 4,
-                 wiring: bool = True, instincts: str = "", hold: str = "") -> str:
+                 wiring: bool = True, instincts: str = "", hold: str = "",
+                 hunt: str = "") -> str:
     """紧凑的状态数据包 —— 纯数据，给白当处境感知用。
 
     形如：
@@ -776,6 +777,10 @@ def state_packet(data: dict, stance: str = "defend", work: dict | None = None,
     path = data.get("task") if isinstance(data.get("task"), dict) else {}
     if path.get("available"):
         act.append(f"path={path.get('status') or '?'}")
+    # 主动清怪 —— 程序替她做的决定，状态包里得有，否则她自己看不见（律4）。
+    # 只有真在追的时候才有这个字段，平时不占字数（见 hunt.py 的 render）。
+    if hunt:
+        act.append(hunt)
     lines.append("[mc:act] " + " | ".join(act))
     if hold:
         lines.append(hold)
