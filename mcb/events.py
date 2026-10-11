@@ -183,7 +183,15 @@ class EventFeed:
                 with contextlib.suppress(Exception):
                     self.on_event(raw)
         max_seq = _as_int(data.get("max"))
-        if max_seq > self._last_seq:
+        if max_seq < self._last_seq:
+            # 同 uplink：mcbEvSeq 活在服务端内存里，服务端重启或 /reload 就归零。
+            #   游标不退的话事件流会永久瞎掉（挨打/进出服/给东西全都收不到）。
+            logger.warning(
+                f"[mc_body] 服务端事件 seq 从 {self._last_seq} 退回 {max_seq}"
+                "（服务端重启或 /reload），游标归零重新取"
+            )
+            self._last_seq = 0
+        elif max_seq > self._last_seq:
             self._last_seq = max_seq
 
         # 背包 diff 跟着同一个循环走 —— 多一次 RCON 调用而已（服务端不读方块，很便宜）

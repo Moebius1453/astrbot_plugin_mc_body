@@ -235,7 +235,17 @@ class ChatUplink:
             if self._is_wake(text):
                 wake_trigger = head
 
-        if max_seq > self._last_seq:
+        if max_seq < self._last_seq:
+            # 服务端重启（以及 KubeJS /reload）会让 mcbChatSeq 归零 ——
+            #   那个计数器活在服务端内存里，我们这个游标活在插件内存里，不会跟着退。
+            #   不退就等于永远在问"给我 seq 大于旧高位 的聊天"，一条也拿不到：
+            #   症状是她完全不回应，而消息明明躺在服务端的环形缓冲里（2026-10-11 真踩）。
+            logger.warning(
+                f"[mc_body] 服务端聊天 seq 从 {self._last_seq} 退回 {max_seq}"
+                "（服务端重启或 /reload），游标归零重新取"
+            )
+            self._last_seq = 0
+        elif max_seq > self._last_seq:
             self._last_seq = max_seq
 
         if wake_trigger is not None:
