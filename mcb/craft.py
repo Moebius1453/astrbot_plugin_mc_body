@@ -283,13 +283,14 @@ class CraftRunner:
     这一层只负责"按什么顺序组合"。加新容器请改那张表，别在这儿写分支。
     """
 
-    def __init__(self, bridge, *, delay: float = 0.4) -> None:
+    def __init__(self, bridge, *, delay: float = 0.4, arbiter=None) -> None:
         self.bridge = bridge
+        self.arbiter = arbiter
         self.io = ContainerIO(bridge, delay=delay)
 
     async def _open_table(self) -> tuple[bool, str]:
         return await open_block(self.bridge, "minecraft:crafting_table",
-                                self.io, want_cls="CraftingMenu")
+                                self.io, want_cls="CraftingMenu", arbiter=self.arbiter)
 
     async def run_step(self, step: CraftStep) -> tuple[int, str]:
         """做一步。返回 (成功次数, 人话说明)。"""
@@ -305,10 +306,23 @@ class CraftRunner:
         targets = self._targets(step, cells, layout)
         done = 0
         for _ in range(step.times):
+            before = (await Crafter(self.bridge).inventory()).get(step.item, 0)
             for slot, cands in targets:
                 if not await self.io.put_one(layout, slot, cands):
                     return done, f"{_short(step.item)}：摆料摆不进去（材料没了？）"
-            await self.io.take_all(int(layout["result"]))
+            menu = await self.io.menu()
+            result_slot = int(layout["result"])
+            per = int(step.recipe.get("outN") or 1)
+            if not menu or menu.get("id") != layout.get("id"):
+                return done, f"{_short(step.item)}：合成界面发生变化，未取产物"
+            product = next((it for it in menu.get("items", [])
+                            if int(it.get("i", -1)) == result_slot), None)
+            if not product or product.get("id") != step.item or int(product.get("c") or 0) != per:
+                return done, f"{_short(step.item)}：产物格不是预期物品或数量，未取产物"
+            await self.io.take_all(result_slot)
+            after = (await Crafter(self.bridge).inventory()).get(step.item, 0)
+            if after - before != per:
+                return done, f"{_short(step.item)}：背包增加 {after - before}，预期 {per}，未确认合成成功"
             done += 1
         return done, f"{_short(step.item)} ×{done * int(step.recipe.get('outN') or 1)}"
 

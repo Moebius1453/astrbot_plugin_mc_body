@@ -525,6 +525,9 @@ class ChatUplink:
             logger.warning(f"[mc_body] 出站净化失败（这一轮按原样发）：{exc}")
 
         runner = result.agent_runner
+        initial_messages = runner.run_context.messages
+        turn_start = next((m for m in reversed(initial_messages)
+                           if getattr(m, "role", "") == "user"), None)
         async for _ in runner.step_until_done(self.max_steps):
             pass
         # 注意： 必须自己把这一轮存下来 —— 否则游戏里的对话从来不进她的历史。
@@ -537,7 +540,7 @@ class ChatUplink:
         #    后果（用户 2026-10-10 报的）："游戏里面的交流……看上去就像是两个对话一样"。
         #    实测证据：全库搜唤醒标记 来自 Minecraft 游戏内聊天，0 次命中 ——
         #    她在游戏里说的每一句，都不在她的对话历史里。她记不住、也对不上。
-        await self._save_turn(req, runner)
+        await self._save_turn(req, runner, turn_start=turn_start)
 
         final = runner.get_final_llm_resp()
         if final is None:
@@ -577,7 +580,7 @@ class ChatUplink:
             return parsed if isinstance(parsed, list) else []
         return list(raw) if isinstance(raw, list) else []
 
-    async def _save_turn(self, req, runner) -> None:
+    async def _save_turn(self, req, runner, *, turn_start=None) -> None:
         """把这一轮写回会话 —— 照 pipeline 的做法，但必须保证"只增不减 + 类型全对"。
 
         注意： 2026-10-10 血案（两次，同一个函数）：
@@ -624,12 +627,14 @@ class ChatUplink:
                 return
 
             run_msgs = list(getattr(getattr(runner, "run_context", None), "messages", []) or [])
-            # 第一条 system 不要 —— 那是每轮重建的人格/提示词，存了会把历史撑爆
-            fresh = [m for m in run_msgs if getattr(m, "role", "") != "system"]
-            fresh_dicts = dump_messages_with_checkpoints(fresh)
-
-            # ── 只追加：不做"谁更长"的猜测（见方法说明第 1 条）──────────
-            appended = [m for m in fresh_dicts if m not in stored]
+            boundary = next((i for i, message in enumerate(run_msgs)
+                             if message is turn_start), None) if turn_start is not None else None
+            if boundary is None:
+                logger.error("[mc_body] 拒绝写回：本轮起点缺失或被上下文处理移除，历史保持不变")
+                return
+            fresh = [m for m in run_msgs[boundary:]
+                     if getattr(m, "role", "") != "system" and not getattr(m, "_no_save", False)]
+            appended = dump_messages_with_checkpoints(fresh)
             combined = stored + appended
 
             # ── 第1道闸：只增不减 ────────────────────────────────────────

@@ -23,8 +23,11 @@ from __future__ import annotations
 
 import asyncio
 import math
+import uuid
 
 from astrbot.api import logger
+
+from .arbiter import LEVEL_TASK
 
 # clickSlot 的参数（对应原版 ClickType）
 BTN_LEFT = 0
@@ -374,10 +377,22 @@ class ContainerIO:
         if src is None:
             logger.warning(f"[mc_body] 摆料：身上没有 {candidates[0] if candidates else '?'}")
             return False
+        before = await self.menu()
+        if not before or before.get("id") != layout.get("id"):
+            return False
+        old = next((it for it in before.get("items", [])
+                    if int(it.get("i", -1)) == dest_slot), {})
+        old_count = int(old.get("c") or 0)
         await self.click(src, BTN_LEFT, MODE_PICKUP)
         await self.click(dest_slot, BTN_RIGHT, MODE_PICKUP)
         await self.click(src, BTN_LEFT, MODE_PICKUP)
-        return True
+        after = await self.menu()
+        if not after or after.get("id") != before.get("id"):
+            return False
+        placed = next((it for it in after.get("items", [])
+                       if int(it.get("i", -1)) == dest_slot), {})
+        return (placed.get("id") in candidates
+                and int(placed.get("c") or 0) == old_count + 1)
 
     async def put_stack(self, layout: dict, dest_slot: int, candidates: list[str]) -> bool:
         """把整叠候选材料放进 dest_slot（冶炼/烧炼要一次放一堆，不是放一个）。
@@ -622,7 +637,7 @@ STOP_DEBOUNCE = 2
 
 async def wait_baritone(bridge, *, timeout: float = 60.0, target=None,
                         checkpoint=None) -> str:
-    """等 Baritone 走完。返回 "arrived" / "timeout"。
+    """等待停止并核对目标，返回 arrived、stopped、unconfirmed 或 timeout。
 
     注意：注意： 必须熬过"刚下发还没起步"那几秒（2026-10-09 实战踩到）：
     刚 goto 完时 Baritone 的 isPathing() 还是 false ——
@@ -655,9 +670,13 @@ async def wait_baritone(bridge, *, timeout: float = 60.0, target=None,
             still = 0
         else:
             still += 1
-            if moved and still >= STOP_DEBOUNCE:
-                return "arrived"
-            if not moved and target is not None and _within(st, target, ARRIVE_RADIUS):
+            ready = bool(st.get("online")) and bool(task.get("available"))
+            near = target is not None and _within(st, target, ARRIVE_RADIUS)
+            if ready and moved and still >= STOP_DEBOUNCE:
+                if near:
+                    return "arrived"
+                return "stopped" if target is not None else "unconfirmed"
+            if ready and not moved and near:
                 return "arrived"
         await asyncio.sleep(1.0)
         waited += 1.0
@@ -696,7 +715,7 @@ async def find_block(bridge, block_id: str, radius: int = 16) -> list[int] | Non
 
 
 async def open_block(bridge, block_id: str, io: "ContainerIO",
-                     want_cls: str, radius: int = 16) -> tuple[bool, str]:
+                     want_cls: str, radius: int = 16, *, arbiter=None) -> tuple[bool, str]:
     """走过去 + 右键打开指定方块，并确认开出来的界面类型对得上。
 
     返回 (成功?, 原因) —— 注意： 原因必须具体到是哪一步断的。
@@ -714,28 +733,51 @@ async def open_block(bridge, block_id: str, io: "ContainerIO",
         return False, f"附近 {radius} 格内没找到 {block_id}"
     x, y, z = pos
     logger.info(f"[mc_body] 走向 {block_id} ({x},{y},{z})")
-    await bridge.call("mcb closeGui")
-    await bridge.call(f"mcb baritone goto {x} {z}")
-    # 注意： 用共用的等待原语 —— 别在这儿再写一遍循环。
-    #    这里原来写的是"睡 2 秒看一次，idle 就 break"，同样会误判：
-    #    刚下发时 Baritone 还没起步，第一次轮询就是 idle，2 秒后就当到了。
-    got = await wait_baritone(bridge, timeout=30.0, target=(float(x), float(z)))
-    logger.info(f"[mc_body] 走到 {block_id} 附近：{got}")
-    await bridge.call("mcb stop")
-    if got != "arrived":
-        return False, f"{block_id} 在 ({x},{y},{z})，但**走不过去**（寻路超时）"
-    await asyncio.sleep(0.5)
-    await bridge.call(f"mcb useOnAt {x} {y} {z}")
-    await asyncio.sleep(1.2)
-    menu = await io.menu()
-    cls = str((menu or {}).get("cls") or "")
-    if want_cls in cls:
-        return True, ""
-    logger.warning(f"[mc_body] 开了 {cls}，不是期望的 {want_cls}")
-    return False, (
-        f"走到 ({x},{y},{z}) 也右键了，但开出来的是 `{cls or '(空)'}`、不是 {want_cls}"
-        f" —— 多半是**手上还开着别的容器顶不掉**"
-    )
+    if arbiter is None:
+        return False, "移动仲裁未接线，未移动或打开容器"
+    holder = arbiter.walk_holder()
+    if holder is not None and holder.level <= LEVEL_TASK:
+        return False, "身体正执行其他路线，未移动或打开容器"
+    owner = "container:" + uuid.uuid4().hex
+
+    async def checkpoint():
+        holder = arbiter.walk_holder()
+        if holder is None or holder.owner != owner:
+            raise InterruptedError("容器路线被抢占或撤销")
+        if arbiter.last_error:
+            raise InterruptedError("容器路线下发失败：" + arbiter.last_error)
+
+    try:
+        await arbiter.claim_walk(LEVEL_TASK, owner, f"goto {x} {z}", "打开容器")
+        await checkpoint()
+        await bridge.call("mcb closeGui")
+        await checkpoint()
+        got = await wait_baritone(bridge, timeout=30.0, target=(float(x), float(z)),
+                                  checkpoint=checkpoint)
+        logger.info(f"[mc_body] 走到 {block_id} 附近：{got}")
+        if got != "arrived":
+            return False, f"{block_id} 在 ({x},{y},{z})，但未确认到达（{got}）"
+        await checkpoint()
+        await arbiter.claim_walk(LEVEL_TASK, owner, None, "容器交互")
+        await checkpoint()
+        await asyncio.sleep(0.5)
+        await checkpoint()
+        await bridge.call(f"mcb useOnAt {x} {y} {z}")
+        await asyncio.sleep(1.2)
+        await checkpoint()
+        menu = await io.menu()
+        cls = str((menu or {}).get("cls") or "")
+        if want_cls in cls:
+            return True, ""
+        logger.warning(f"[mc_body] 开了 {cls}，不是期望的 {want_cls}")
+        return False, (
+            f"走到 ({x},{y},{z}) 也右键了，但开出来的是 `{cls or '(空)'}`、不是 {want_cls}"
+            f" —— 多半是**手上还开着别的容器顶不掉**"
+        )
+    except InterruptedError as exc:
+        return False, str(exc)
+    finally:
+        await arbiter.release_walk(owner)
 
 
 async def run_process(io: "ContainerIO", layout: dict, inputs: list[list[str]],

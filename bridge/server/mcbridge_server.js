@@ -2687,6 +2687,19 @@ ServerEvents.basicCommand('mcb', event => {
     return
   }
 
+  if (action === 'claudecode') {
+    if (!arg || arg.length > 256) {
+      mcbErr(event, action, '测试消息需要 1 至 256 字符')
+      return
+    }
+    mcbChatSeq = mcbChatSeq + 1
+    mcbChatBuf.push({ seq: mcbChatSeq, t: mcbNowMs(), who: 'ClaudeCode', text: arg })
+    while (mcbChatBuf.length > MCB_CHAT_MAX) mcbChatBuf.shift()
+    console.info('[mcb] chat #' + mcbChatSeq + ' <ClaudeCode> ' + arg)
+    mcbOk(event, action, { seq: mcbChatSeq, who: 'ClaudeCode' })
+    return
+  }
+
   if (action === 'ping') {
     mcbOk(event, 'ping', { pong: true })
     return

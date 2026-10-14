@@ -793,6 +793,7 @@ function mcbSnapshot() {
         try { mSlots = Number(menu.slots.size()) } catch (eM2) { }
         var isDefault = (mId === 0)
         var cells = []
+        var itemRegistry = Java.loadClass('net.minecraft.core.registries.BuiltInRegistries').ITEM
         try {
           var lo = 0
           var hi = isDefault ? 5 : mSlots
@@ -804,7 +805,7 @@ function mcbSnapshot() {
             if (!(cc > 0)) continue
             var nn = null
             try { nn = String(st.hoverName.string) } catch (eN1) { nn = null }
-            cells.push({ i: si, n: nn, c: cc })
+            cells.push({ i: si, n: nn, c: cc, id: String(itemRegistry.getKey(st.getItem())) })
           }
         } catch (eL) { }
         // 注意： 必须带上界面类型名：光看 id/格数分不出"工作台"和"箱子"，

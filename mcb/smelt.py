@@ -51,9 +51,10 @@ POLL = 2.0
 class Smelter:
     """一趟冶炼。用完就扔，不持有状态。"""
 
-    def __init__(self, bridge, journal=None) -> None:
+    def __init__(self, bridge, journal=None, *, arbiter=None) -> None:
         self.bridge = bridge
         self.journal = journal
+        self.arbiter = arbiter
 
     def _note(self, text: str) -> None:
         if self.journal is not None:
@@ -152,7 +153,7 @@ class Smelter:
 
         io = ContainerIO(self.bridge)
         ok, why = await open_block(self.bridge, FURNACE_BLOCK, io, FURNACE_CLS,
-                                   radius=FURNACE_RADIUS)
+                                   radius=FURNACE_RADIUS, arbiter=self.arbiter)
         if not ok:
             # 注意： 报具体哪一步断的，别混成一句 —— 见 containers.open_block 的说明
             return (

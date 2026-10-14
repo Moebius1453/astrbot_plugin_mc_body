@@ -1462,7 +1462,7 @@ class McBodyPlugin(Star):
             return "合成功能被管理员关掉了。"
 
         crafter = Crafter(self.bridge)
-        runner = CraftRunner(self.bridge)
+        runner = CraftRunner(self.bridge, arbiter=self.arbiter)
         try:
             plan = await crafter.plan(name, n)
         except BridgeError as exc:
@@ -1502,7 +1502,7 @@ class McBodyPlugin(Star):
         if not self._cfg("enable_craft", True):
             return "冶炼功能被管理员关掉了。"
         try:
-            return await Smelter(self.bridge, self.journal).smelt(str(item or ""))
+            return await Smelter(self.bridge, self.journal, arbiter=self.arbiter).smelt(str(item or ""))
         except BridgeError as exc:
             return f"烧的过程中桥断了：{exc}"
 
