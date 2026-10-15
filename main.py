@@ -140,6 +140,7 @@ class McBodyPlugin(Star):
             wake_keywords=self._wake_keywords(),
             ambient_limit=int(self._cfg("ambient_context_lines", 20)),
             self_name=str(self._cfg("character_name", "Nanako")),
+            state_path=Path(__file__).resolve().parent / "data" / "uplink_state.json",
         )
         # 状态日志 —— 白「记得自己刚才干了什么」的那本账（见 mcb/journal.py）。
         # 注意： 存内存（用户 2026-10-09 拍板）：插件热重载会丢，任务本身也一样。
@@ -587,13 +588,12 @@ class McBodyPlugin(Star):
         )
 
     async def terminate(self) -> None:
-        # 注意： 先停任务再停反射 —— 反过来的话任务可能正在等反射放开它，
-        #    会卡在这个 await 上。停任务顺带把她的寻路也取消掉。
-        await self.tasks.stop(quiet=True)
-        await self.reflex.stop()
+        # 在途游戏轮收尾前保留任务、反射和桥，避免工具在卸载一半的身体上继续执行。
         await self.events.stop()
         await self.uplink.stop()
         await self._drop_self_loop()
+        await self.tasks.stop(quiet=True)
+        await self.reflex.stop()
         await self.bridge.close()
         logger.info(f"[{PLUGIN_NAME}] 已卸载，RCON 连接已关闭")
 

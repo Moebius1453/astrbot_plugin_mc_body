@@ -21,6 +21,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+from collections import deque
+from pathlib import Path
 
 from astrbot.api import logger
 
@@ -124,6 +126,7 @@ class ChatUplink:
         ambient_limit: int = 20,
         self_name: str = "Nanako",
         max_steps: int = 30,
+        state_path: str | Path | None = None,
     ) -> None:
         self.bridge = bridge
         self.context = context
@@ -138,16 +141,61 @@ class ChatUplink:
         self._last_seq = 0
         self._ambient: list[str] = []       # 没被点名、攒着当上下文的话
         self._ambient_dropped = 0            # 被挤掉了几条（要告诉她，别无声丢弃）
+        self._ambient_trimmed = 0
         self._recent_self: list[str] = []   # Nanako 最近说的，最多 2 句
         self._busy = asyncio.Lock()         # 一次只唤醒一个，别叠
-        # 跑着的时候又被点名了  ->  记在这儿，这一轮完事立刻补一轮（不是丢掉）
-        self._pending: str | None = None
+        self._pending: deque[tuple[str, str | None]] = deque()
+        self._failed: list[tuple[str, str | None]] = []
+        self._active = False
+        self._retry_at = 0.0
+        self._wake_task: asyncio.Task | None = None
+        self._stopping = False
+        self._state_path = Path(state_path) if state_path is not None else None
+        self._load_state()
         self._fail_streak = 0
         self.hold_reason: str | None = None
         self.hold_detail = ""
         # 有人在跟她说活时叫一下这个 —— 闲逛拿它重算安静计时（见 mcb/idle.py）。
         # 用可赋值属性而不是构造参数：闲逛是在 uplink 之后才建出来的。
         self.on_activity = None
+
+    def _load_state(self) -> None:
+        if self._state_path is None or not self._state_path.exists():
+            return
+        raw = json.loads(self._state_path.read_text(encoding="utf-8"))
+        if (not isinstance(raw, dict) or raw.get("umo") != self.umo
+                or type(raw.get("last_seq")) is not int or raw["last_seq"] < 0
+                or type(raw.get("dropped")) is not int or raw["dropped"] < 0
+                or not isinstance(raw.get("ambient"), list)
+                or not all(isinstance(v, str) for v in raw["ambient"])
+                or type(raw.get("active")) is not bool
+                or not isinstance(raw.get("pending"), list)
+                or not isinstance(raw.get("failed"), list)
+                or not all(isinstance(v, list) and len(v) == 2
+                           and isinstance(v[0], str)
+                           and (v[1] is None or isinstance(v[1], str))
+                           for v in raw["pending"] + raw["failed"])):
+            raise ValueError("聊天消费状态类型或会话不匹配，拒绝覆盖")
+        self._last_seq = raw["last_seq"]
+        self._ambient = raw["ambient"]
+        self._ambient_dropped = raw["dropped"]
+        self._pending.extend((v[0], v[1]) for v in raw["pending"])
+        self._failed = [(v[0], v[1]) for v in raw["failed"]]
+        if raw["active"] and self._pending:
+            self._failed.append(self._pending.popleft())
+            logger.warning("[mc_body] 发现中断轮次，留存为待人工核对，不自动重跑工具")
+
+    def _save_state(self) -> None:
+        if self._state_path is None:
+            return
+        state = {"umo": self.umo, "last_seq": self._last_seq,
+                 "ambient": self._ambient, "dropped": self._ambient_dropped,
+                 "pending": list(self._pending), "failed": self._failed,
+                 "active": self._active}
+        self._state_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self._state_path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+        temporary.replace(self._state_path)
 
     # ---- 生命周期 -------------------------------------------------------
 
@@ -159,6 +207,7 @@ class ChatUplink:
                 "[mc_body] 未配置唤醒词 —— 游戏里说话永远不会唤醒白。"
                 "请在插件配置的 wake_keywords 里填上（例如 Nanako、白）。"
             )
+        self._stopping = False
         self._task = asyncio.create_task(self._loop(), name="mc_body_uplink")
         logger.info(
             f"[mc_body] 聊天上行已启动：每 {self.poll_interval:g} 秒拉一次，"
@@ -166,13 +215,18 @@ class ChatUplink:
         )
 
     async def stop(self) -> None:
+        self._stopping = True
         task = self._task
         self._task = None
-        if task is None:
-            return
-        task.cancel()
-        with contextlib.suppress(asyncio.CancelledError, Exception):
-            await task
+        if task is not None:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
+        if self._wake_task is not None:
+            # 正常重载等待在途轮结束，避免取消后把已执行的工具当成未消费指令重跑。
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._wake_task
+        self._save_state()
         logger.info("[mc_body] 聊天上行已停止")
 
     # ---- 轮询主循环 -----------------------------------------------------
@@ -201,20 +255,28 @@ class ChatUplink:
 
     async def _poll_once(self) -> None:
         reply = await self.bridge.call(f"mcb chat {self._last_seq}")
-        if not reply.get("ok"):
-            raise RuntimeError(reply.get("error") or "mcb chat 返回失败")
+        if not reply.get("ok") or reply.get("action") != "chat":
+            raise RuntimeError(reply.get("error") or "mcb chat 响应动作不匹配，未推进游标")
 
         data = reply.get("data") or {}
         lines = data.get("lines") or []
         max_seq = _as_int(data.get("max"))
 
-        wake_trigger: str | None = None
+        if max_seq < self._last_seq:
+            logger.warning(f"[mc_body] 服务端聊天 seq 从 {self._last_seq} 退回 {max_seq}，重新取聊天")
+            self._last_seq = 0
+            self._save_state()
+            self._kick_wakes()
+            return
+
+        wake_triggers: list[str] = []
         for line in lines:
             if not isinstance(line, dict):
                 continue
             seq = _as_int(line.get("seq"))
-            if seq > self._last_seq:
-                self._last_seq = seq
+            if seq <= self._last_seq:
+                continue
+            self._last_seq = seq
 
             who = str(line.get("who") or "")
             text = str(line.get("text") or "").strip()
@@ -228,31 +290,24 @@ class ChatUplink:
                 continue
 
             head = _speaker_line(who, text, line)
-            self._ambient.append(head)
-            # 注意： 挤掉的要记账 —— 原来是 pop(0) 一扔了事，一声不吭。
-            #    不说的话她会把"还剩的这几条"当成全部聊天记录。
-            self._ambient_dropped += _trim_head(self._ambient, self.ambient_limit)
             if self._is_wake(text):
-                wake_trigger = head
+                wake_triggers.append(head)
+            else:
+                # 点名只进待处理队列，不能被前一轮当作旁听提前执行后再执行一次。
+                self._ambient.append(head)
+                dropped = _trim_head(self._ambient, self.ambient_limit)
+                self._ambient_dropped += dropped
+                self._ambient_trimmed += dropped
 
-        if max_seq < self._last_seq:
-            # 服务端重启（以及 KubeJS /reload）会让 mcbChatSeq 归零 ——
-            #   那个计数器活在服务端内存里，我们这个游标活在插件内存里，不会跟着退。
-            #   不退就等于永远在问"给我 seq 大于旧高位 的聊天"，一条也拿不到：
-            #   症状是她完全不回应，而消息明明躺在服务端的环形缓冲里（2026-10-11 真踩）。
-            logger.warning(
-                f"[mc_body] 服务端聊天 seq 从 {self._last_seq} 退回 {max_seq}"
-                "（服务端重启或 /reload），游标归零重新取"
-            )
-            self._last_seq = 0
-        elif max_seq > self._last_seq:
-            self._last_seq = max_seq
-
-        if wake_trigger is not None:
+        self._last_seq = max(self._last_seq, max_seq)
+        if wake_triggers:
             if self.on_activity is not None:
                 with contextlib.suppress(Exception):
                     self.on_activity()
-            await self._wake(wake_trigger)
+            # 同一页聊天合成一轮，但保留每条点名，不让末条覆盖前面的要求。
+            self._pending.append(("\n".join(wake_triggers), None))
+        self._save_state()
+        self._kick_wakes()
 
     # ---- 判定 -----------------------------------------------------------
 
@@ -262,24 +317,54 @@ class ChatUplink:
 
     # ---- 唤醒 -----------------------------------------------------------
 
-    async def _wake(self, trigger: str, prompt: str | None = None) -> None:
-        if self._busy.locked():
-            # 注意： 不丢这条，记账（抄 Numen AgentLoop.pump() 的 pumpAgain）——
-            #    原来直接 return，用户连发两句时第二句永远不会被回应，
-            #    而且日志里只说"先只进上下文"，看起来像有意为之。
-            self._pending = (trigger, prompt)
-            logger.info("[mc_body] 上一次唤醒还没跑完，这条先记下，跑完补一轮")
+    def _kick_wakes(self) -> None:
+        if (self._stopping or not self._pending
+                or asyncio.get_running_loop().time() < self._retry_at
+                or (self._wake_task is not None and not self._wake_task.done())):
             return
+        self._wake_task = asyncio.create_task(self._drain_wakes(), name="mc_body_wakes")
+        self._wake_task.add_done_callback(self._wake_done)
+
+    def _wake_done(self, task: asyncio.Task) -> None:
+        if not task.cancelled() and task.exception() is not None:
+            logger.error(f"[mc_body] 唤醒队列执行失败，保留待处理项：{task.exception()}")
+            self._retry_at = asyncio.get_running_loop().time() + MAX_BACKOFF_SECONDS
+
+    async def _wake(self, trigger: str, prompt: str | None = None) -> None:
+        self._pending.append((trigger, prompt))
+        self._save_state()
+        busy = self._busy.locked()
+        self._kick_wakes()
+        if not busy and self._wake_task is not None:
+            await asyncio.shield(self._wake_task)
+
+    async def _drain_wakes(self) -> None:
         async with self._busy:
-            current: tuple[str, str | None] | None = (trigger, prompt)
             rounds = 0
-            while current is not None and rounds < MAX_FOLLOWUP_WAKES:
-                self._pending = None
-                await self._one_wake(current[0], current[1])
-                current = self._pending        # 跑的过程中又被点名了  ->  再补一轮
+            while self._pending and rounds < MAX_FOLLOWUP_WAKES and not self._stopping:
+                if self._active:
+                    self._failed.append(self._pending.popleft())
+                    self._active = False
+                    self._save_state()
+                    logger.warning("[mc_body] 上轮结果未确认，留存待核对，不自动重跑")
+                    continue
+                current = self._pending[0]
+                self._active = True
+                self._save_state()
+                if not await self._one_wake(current[0], current[1]):
+                    # 失败可能发生在工具副作用之后，保留证据但不自动重试整轮。
+                    self._failed.append(self._pending.popleft())
+                    self._active = False
+                    self._save_state()
+                    break
+                self._pending.popleft()
+                self._active = False
+                self._save_state()
                 rounds += 1
-            if self._pending is not None:
-                logger.warning("[mc_body] 连续补唤醒到上限，这条留给下一轮轮询")
+                if self._stopping:
+                    break
+            if self._pending:
+                logger.info(f"[mc_body] 待处理唤醒剩余 {len(self._pending)} 项，后续轮询继续")
 
     async def wake_with_events(self, prompt: str) -> None:
         """事件攒熟了 —— 拿这段现成的提示词唤醒她跑一轮（见 mcb/ripeness.py）。
@@ -289,7 +374,10 @@ class ChatUplink:
         """
         await self._wake("[mc:events]", prompt=prompt)
 
-    async def _one_wake(self, trigger: str, prompt: str | None = None) -> None:
+    async def _one_wake(self, trigger: str, prompt: str | None = None) -> bool:
+        ambient_count = len(self._ambient)
+        trimmed_before = self._ambient_trimmed
+        dropped_before = self._ambient_dropped
         self.hold_reason = None
         self.hold_detail = ""
         if prompt is None:
@@ -311,19 +399,23 @@ class ChatUplink:
             self.hold_reason = "failed"
             self.hold_detail = "game_turn_failed"
             logger.error(f"[mc_body] 唤醒白失败：{exc}", exc_info=True)
-            return
+            return False
 
-        # 被阻断时保留旁听上下文，下一次点名重新检查。
         if self.hold_reason is not None:
-            return
-        self._ambient.clear()
-        # 挤掉的条数已经报给她了，这一轮就算交代过，别一直挂着
-        self._ambient_dropped = 0
+            return False
+        consumed = max(0, ambient_count - (self._ambient_trimmed - trimmed_before))
+        del self._ambient[:consumed]
+        self._ambient_dropped -= dropped_before
 
         if not reply_text:
             logger.info("[mc_body] 白这次没有输出文本，不往游戏里发")
-            return
-        await self._say_in_game(reply_text)
+            return True
+        try:
+            await self._say_in_game(reply_text)
+        except Exception as exc:
+            # 模型已执行完，公屏发送失败不能重跑整轮工具。
+            logger.warning(f"[mc_body] 游戏回复发送失败，不重跑已完成轮次：{exc}")
+        return True
 
     def _with_ambient(self, text: str) -> str:
         """在一段提示词后面接上"她旁听到的聊天"。没有就原样返回。"""
@@ -509,6 +601,8 @@ class ChatUplink:
                 logger.info(
                     "[mc_body] 有 on_llm_request 钩子终止了这一轮 —— 照 pipeline 的语义不往下跑"
                 )
+                self.hold_reason = "blocked"
+                self.hold_detail = "request_hook_blocked"
                 return ""
         except Exception as exc:  # noqa: BLE001 - 钩子是加分项，不该让整轮挂掉
             logger.warning(f"[mc_body] 跑 on_llm_request 钩子失败（这一轮当没有它）：{exc}")
