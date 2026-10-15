@@ -159,6 +159,14 @@ class ChatUplink:
         # 用可赋值属性而不是构造参数：闲逛是在 uplink 之后才建出来的。
         self.on_activity = None
 
+    def render(self) -> str:
+        queued = len(self._pending) - int(self._active and bool(self._pending))
+        text = (f"[mc:uplink] active={str(self._active).lower()} queued={queued} "
+                f"failed={len(self._failed)}")
+        if self._failed:
+            text += " | 有失败或中断轮次待人工核对，未自动重试；不要据此重跑旧指令"
+        return text
+
     def _load_state(self) -> None:
         if self._state_path is None or not self._state_path.exists():
             return

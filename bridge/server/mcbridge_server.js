@@ -164,8 +164,11 @@ function mcbReply(event, text) {
   }
 }
 
-// 统一信封
+var mcbReplyToken = null
+
+// 命令在服务端线程同步执行，回执标识在每次入口重置。
 function mcbEnvelope(event, obj) {
+  if (mcbReplyToken !== null) obj.request = mcbReplyToken
   var body = ''
   try {
     body = JSON.stringify(obj)
@@ -202,10 +205,26 @@ var mcbUpData = null    // { status, task, goal, dist, eta, posX, posY, posZ }
 var mcbUpAtMs = 0
 var mcbUpHasMenu = false   // 诊断：客户端到底有没有把 menu 字段发上来
 var mcbUpMenuLen = 0       // 诊断：那串 JSON 有多长
+var mcbSayReceipts = {}
+var mcbSayOrder = []
 
 NetworkEvents.dataReceived(MCB_CHANNEL_UP, event => {
   try {
     var tag = event.data
+    if (mcbTagStr(tag, 'receipt') === 'say') {
+      var sender = event.player
+      if (sender === null || String(sender.username) !== MCB_TARGET) return
+      var receiptId = mcbTagStr(tag, 'receiptId')
+      var receipt = mcbSayReceipts[receiptId]
+      if (receipt && receipt.state === 'sent') {
+        var receiptState = mcbTagStr(tag, 'result')
+        if (receiptState === 'executed' || receiptState === 'failed') {
+          receipt.state = receiptState
+          receipt.error = mcbTagStr(tag, 'error')
+        }
+      }
+      return
+    }
     mcbUpSeq = mcbUpSeq + 1
     mcbUpAtMs = mcbNowMs()
     mcbUpData = {
@@ -2659,7 +2678,14 @@ function mcbChatData(since, me) {
 // --- 命令 -----------------------------------------------------------------
 
 ServerEvents.basicCommand('mcb', event => {
-  var parts = mcbSplit(event.input)
+  var input = String(event.input)
+  mcbReplyToken = null
+  var tagged = /^@([a-f0-9]{32})\s+([\s\S]+)$/.exec(input)
+  if (tagged !== null) {
+    mcbReplyToken = tagged[1]
+    input = tagged[2]
+  }
+  var parts = mcbSplit(input)
   var action = parts[0]
   var arg = parts[1]
   console.info('[mcb] 收到命令: action=' + action + ' arg="' + arg + '"')
@@ -3031,10 +3057,35 @@ ServerEvents.basicCommand('mcb', event => {
         mcbErr(event, action, '寻路意图格式错误')
         return
       }
-      player.sendData(MCB_CHANNEL_DOWN, { action: 'baritone', arg: intent.cmd })
+      player.sendData(MCB_CHANNEL_DOWN, { action: 'walk', arg: JSON.stringify(intent) })
       mcbWalkIntent = { token: intent.token, owner: intent.owner }
       mcbOk(event, action, { sent: true, token: intent.token })
     } catch (eWalk) { mcbErr(event, action, '寻路下发失败: ' + eWalk) }
+    return
+  }
+
+  if (action === 'receipt') {
+    var foundReceipt = mcbSayReceipts[arg]
+    mcbOk(event, action, foundReceipt || { state: 'unknown' })
+    return
+  }
+
+  if (action === 'say') {
+    if (mcbReplyToken === null) {
+      mcbErr(event, action, '说话需要关联请求标识，未下发')
+      return
+    }
+    var sayId = mcbReplyToken
+    mcbSayReceipts[sayId] = { state: 'sent', action: 'say', error: '' }
+    mcbSayOrder.push(sayId)
+    while (mcbSayOrder.length > 128) delete mcbSayReceipts[mcbSayOrder.shift()]
+    try {
+      player.sendData(MCB_CHANNEL_DOWN, { action: 'say', arg: arg, receiptId: sayId })
+      mcbOk(event, action, { sent: true, receiptId: sayId })
+    } catch (sayError) {
+      mcbSayReceipts[sayId].state = 'failed'
+      mcbErr(event, action, '说话下发失败: ' + sayError)
+    }
     return
   }
 

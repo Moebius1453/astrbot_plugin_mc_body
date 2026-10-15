@@ -307,9 +307,30 @@ class CraftRunner:
         done = 0
         for _ in range(step.times):
             before = (await Crafter(self.bridge).inventory()).get(step.item, 0)
-            for slot, cands in targets:
-                if not await self.io.put_one(layout, slot, cands):
-                    return done, f"{_short(step.item)}：摆料摆不进去（材料没了？）"
+            recipe_id = str(step.recipe.get("id") or "")
+            if recipe_id:
+                initial = await self.io.menu()
+                if not initial or initial.get("id") != layout.get("id"):
+                    return done, "合成界面已改变，未请求配方摆料"
+                occupied = set(layout["grid"]) | {int(layout["result"])}
+                if any(int(it.get("i", -1)) in occupied and int(it.get("c") or 0) > 0
+                       for it in initial.get("items", [])):
+                    return done, "合成格已有物品，未请求配方摆料，请先人工核对"
+                reply = await self.bridge.call(f"mcb placeRecipe {recipe_id}")
+                if not reply.get("ok"):
+                    return done, "配方摆料请求失败，未确认合成，不自动重试"
+                for _ in range(8):
+                    await asyncio.sleep(0.25)
+                    snapshot = await self.io.menu()
+                    if not snapshot or snapshot.get("id") != layout.get("id"):
+                        return done, "配方摆料期间界面改变，未取产物"
+                    if any(int(it.get("i", -1)) == int(layout["result"])
+                           and int(it.get("c") or 0) > 0 for it in snapshot.get("items", [])):
+                        break
+            else:
+                for slot, cands in targets:
+                    if not await self.io.put_one(layout, slot, cands):
+                        return done, f"{_short(step.item)}：摆料摆不进去（材料没了？）"
             menu = await self.io.menu()
             result_slot = int(layout["result"])
             per = int(step.recipe.get("outN") or 1)

@@ -30,6 +30,7 @@ import contextlib
 import json
 import logging
 import struct
+import uuid
 
 try:  # 在 AstrBot 里跑时用它的 logger；单独拿出来测时退回标准库
     from astrbot.api import logger
@@ -73,47 +74,33 @@ class BridgeError(RuntimeError):
     """
 
 
-def parse_envelope(raw: str) -> dict:
-    """把服务端返回的文本拆成信封字典。
-
-    服务端契约（见项目文档 09）：
-        MCB {"ok":true,  "action":"state", "data":{...}}
-        MCB {"ok":false, "action":"state", "error":"Nanako 不在线"}
-
-    解析不了就抛 BridgeError —— 绝不假装成功。
-
-    注意： 容错：万一还是收到了多个信封粘在一起（理论上传输层已经排干净了），
-    取最后一个 —— 残渣一定在前，新响应在后。
-    """
+def parse_envelope(raw: str, *, request: str | None = None,
+                   action: str | None = None) -> dict:
+    """没有关联标识时只接受唯一信封，有标识时只接受唯一匹配回执。"""
     text = (raw or "").strip()
-    if not text:
-        raise BridgeError(
-            "桥返回了空响应。可能是 RCON 打到了别的服务，或服务端脚本没加载。"
-        )
-
-    if ENVELOPE_PREFIX not in text:
-        raise BridgeError(
-            f"桥返回了非信封内容：{text!r}。"
-            "可能是 RCON 打到了别的服务，或服务端脚本版本不对。"
-        )
-
-    # 取最后一个 MCB 开头的那段
-    idx = text.rfind(ENVELOPE_PREFIX)
-    if idx > 0:
-        logger.warning(f"[mc_body] RCON 响应里有粘包，取最后一段（前 {idx} 字节丢弃）")
-    body = text[idx + len(ENVELOPE_PREFIX) :].strip()
-    # 去掉可能尾随的下一个信封（理论上不该有）
-    nl = body.find("\n")
-    if nl >= 0:
-        body = body[:nl].strip()
-
-    try:
-        obj = json.loads(body)
-    except json.JSONDecodeError as exc:
-        raise BridgeError(f"桥返回的信封不是合法 JSON：{body!r}") from exc
-    if not isinstance(obj, dict) or "ok" not in obj:
-        raise BridgeError(f"桥返回的信封缺少 ok 字段：{obj!r}")
-    return obj
+    objects = []
+    decoder = json.JSONDecoder()
+    offset = 0
+    while True:
+        index = text.find(ENVELOPE_PREFIX, offset)
+        if index < 0:
+            break
+        start = index + len(ENVELOPE_PREFIX)
+        body = text[start:].lstrip()
+        try:
+            obj, used = decoder.raw_decode(body)
+        except json.JSONDecodeError as exc:
+            raise BridgeError("桥回执不完整或不是合法JSON，未确认命令结果") from exc
+        if not isinstance(obj, dict) or type(obj.get("ok")) is not bool:
+            raise BridgeError("桥回执类型不合法，未确认命令结果")
+        objects.append(obj)
+        offset = len(text) - len(body) + used
+    matches = [obj for obj in objects
+               if (request is None or obj.get("request") == request)
+               and (action is None or obj.get("action") == action)]
+    if len(matches) != 1:
+        raise BridgeError("桥回执缺失或不唯一，未确认命令结果；不自动重发")
+    return matches[0]
 
 
 def _looks_complete(text: str) -> bool:
@@ -121,18 +108,21 @@ def _looks_complete(text: str) -> bool:
 
     用来做"收工"判据 —— 别靠等时间猜，能解析就是收全了。
     """
-    idx = text.find(ENVELOPE_PREFIX)
-    if idx < 0:
-        return False
-    body = text[idx + len(ENVELOPE_PREFIX) :].strip()
-    nl = body.find("\n")
-    if nl >= 0:
-        body = body[:nl].strip()
-    try:
-        obj = json.loads(body)
-    except json.JSONDecodeError:
-        return False
-    return isinstance(obj, dict) and "ok" in obj
+    decoder = json.JSONDecoder()
+    remaining = text.strip()
+    found = False
+    while remaining:
+        if not remaining.startswith(ENVELOPE_PREFIX):
+            return False
+        try:
+            obj, used = decoder.raw_decode(remaining[len(ENVELOPE_PREFIX):])
+        except json.JSONDecodeError:
+            return False
+        if not isinstance(obj, dict) or type(obj.get("ok")) is not bool:
+            return False
+        found = True
+        remaining = remaining[len(ENVELOPE_PREFIX) + used:].strip()
+    return found
 
 
 class RconBridge:
@@ -180,7 +170,8 @@ class RconBridge:
             await self._connect_locked()
             try:
                 return await self._exchange_locked(command)
-            except BridgeError:
+            except (BridgeError, asyncio.CancelledError):
+                await self._drop_locked()
                 raise
             except asyncio.TimeoutError as exc:
                 await self._drop_locked()
@@ -204,7 +195,29 @@ class RconBridge:
         只管传输与解析：信封里 ok:false 也照样返回（那是桥的正常回复，
         比如"Nanako 不在线"）。只有连不上/解析不了才抛 BridgeError。
         """
-        return parse_envelope(await self.run(command))
+        words = command.strip().split(maxsplit=2)
+        if len(words) < 2 or words[0] != "mcb":
+            raise BridgeError("call只接受mcb命令，原版命令请使用run")
+        token = uuid.uuid4().hex
+        tagged = f"mcb @{token} " + command.strip()[4:]
+        reply = parse_envelope(await self.run(tagged), request=token, action=words[1])
+        if words[1] != "say" or not reply.get("ok"):
+            return reply
+        receipt_id = (reply.get("data") or {}).get("receiptId")
+        if receipt_id != token:
+            raise BridgeError("说话已下发但缺少执行回执标识，不自动重发")
+        deadline = asyncio.get_running_loop().time() + 5.0
+        while asyncio.get_running_loop().time() < deadline:
+            receipt = await self.call(f"mcb receipt {receipt_id}")
+            data = receipt.get("data") or {}
+            state = data.get("state")
+            if not receipt.get("ok") or state in ("failed", "unknown"):
+                return {"ok": False, "action": "say", "error": "说话执行未确认，不自动重发：" + str(data.get("error") or state)}
+            if state == "executed":
+                reply["data"]["executed"] = True
+                return reply
+            await asyncio.sleep(0.1)
+        raise BridgeError("说话已下发，但客户端执行回执超时，结果未知，不自动重发")
 
     async def close(self) -> None:
         async with self._lock:
@@ -252,20 +265,30 @@ class RconBridge:
 
         parts: list[str] = []
         wait = self.timeout   # 第一个包等满超时（/reload 这类慢命令靠它）
-        while len(parts) < _MAX_PACKETS:
+        seen = 0
+        deadline = asyncio.get_running_loop().time() + self.timeout
+        while seen < _MAX_PACKETS:
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                raise asyncio.TimeoutError
             try:
-                body, rid = await self._read_packet(wait)
+                body, rid = await self._read_packet(min(wait, remaining))
             except asyncio.TimeoutError:
+                if not parts or self._buf:
+                    raise
                 break
-            wait = _IDLE_GAP_SECONDS
+            seen += 1
             if rid != pid:
-                continue          # 上一轮的残渣，丢掉
+                continue
+            wait = _IDLE_GAP_SECONDS
             parts.append(body)
             # 收工判据（确定性的，不靠猜时机）：
             #   这一包不是"满包"（<4096  ->  MC 没在拆）且已经拼出一段完整信封。
             if len(body) < _SPLIT_HINT and _looks_complete("".join(parts)):
                 break
 
+        if seen >= _MAX_PACKETS:
+            raise BridgeError("RCON响应包数超限，未确认命令结果")
         return "".join(parts).strip()
 
     async def _drain_locked(self) -> None:
@@ -309,15 +332,18 @@ class RconBridge:
         自己维护 self._buf：超时只影响"等多久"，已经收到的字节一个都不丢，
         下次接着从缓冲区里取。
         """
-        header = await self._fill(4, timeout)
-        (length,) = struct.unpack("<i", header)
+        await self._fill(4, timeout, consume=False)
+        (length,) = struct.unpack("<i", self._buf[:4])
         if not 10 <= length <= 4_200_000:
             raise BridgeError(f"RCON 包长度不合理（{length}），流已经错位了")
-        data = await self._fill(length, _BODY_TIMEOUT)
+        packet = await self._fill(length + 4, _BODY_TIMEOUT)
+        data = packet[4:]
         req_id, _type = struct.unpack("<ii", data[:8])
+        if data[-2:] != b"\x00\x00":
+            raise BridgeError("RCON包终止符不合法")
         return data[8:-2].decode("utf-8", "replace"), req_id
 
-    async def _fill(self, need: int, timeout: float) -> bytes:
+    async def _fill(self, need: int, timeout: float, *, consume: bool = True) -> bytes:
         """凑够 need 个字节。超时抛 asyncio.TimeoutError，已收的字节留在缓冲区。"""
         assert self._reader is not None
         while len(self._buf) < need:
@@ -330,7 +356,8 @@ class RconBridge:
             self._buf += chunk
             timeout = _BODY_TIMEOUT   # 已经在收了，后面的字节给足时间
         out = bytes(self._buf[:need])
-        del self._buf[:need]
+        if consume:
+            del self._buf[:need]
         return out
 
     async def _drop_locked(self) -> None:

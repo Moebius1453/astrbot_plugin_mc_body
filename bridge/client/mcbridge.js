@@ -965,7 +965,35 @@ function mcbProbe() {
 
 // --- 动作分发 -------------------------------------------------------------
 
+var mcbWalkBreakBefore = null
+
+function mcbRestoreWalkBreak() {
+  if (mcbWalkBreakBefore === null) return
+  $BaritoneAPI.getSettings().allowBreak.value = mcbWalkBreakBefore
+  mcbWalkBreakBefore = null
+}
+
 function mcbHandle(action, arg) {
+  if (action === 'walk') {
+    var walkIntent = JSON.parse(arg)
+    var walkBaritone = mcbPrimary()
+    if (walkBaritone === null) throw new Error('walk: Baritone不可用')
+    walkBaritone.getPathingBehavior().cancelEverything()
+    mcbRestoreWalkBreak()
+    if (walkIntent.noBreak === true) {
+      mcbWalkBreakBefore = $BaritoneAPI.getSettings().allowBreak.value
+      $BaritoneAPI.getSettings().allowBreak.value = false
+    }
+    try {
+      walkBaritone.getCommandManager().execute(walkIntent.cmd)
+    } catch (walkError) {
+      mcbRestoreWalkBreak()
+      throw walkError
+    }
+    console.info('[mcbridge] walk noBreak=' + (walkIntent.noBreak === true)
+      + ' allowBreak=' + $BaritoneAPI.getSettings().allowBreak.value)
+    return
+  }
   if (action === 'ping') {
     console.info('[mcbridge] PONG（客户端活着）')
     return
@@ -974,8 +1002,7 @@ function mcbHandle(action, arg) {
   if (action === 'say') {
     var mc = mcbMc()
     if (mc === null || mc.player === null) {
-      console.error('[mcbridge] say 失败：没进世界')
-      return
+      throw new Error('say: 没进世界')
     }
     mc.player.connection.sendChat(arg)
     console.info('[mcbridge] 已说话: ' + arg)
@@ -986,6 +1013,7 @@ function mcbHandle(action, arg) {
     var b = mcbPrimary()
     if (b === null) return
     b.getPathingBehavior().cancelEverything()
+    mcbRestoreWalkBreak()
     console.info('[mcbridge] 已取消所有寻路')
     return
   }
@@ -993,6 +1021,10 @@ function mcbHandle(action, arg) {
   if (action === 'baritone') {
     var b2 = mcbPrimary()
     if (b2 === null) return
+    if (mcbWalkBreakBefore !== null) {
+      b2.getPathingBehavior().cancelEverything()
+      mcbRestoreWalkBreak()
+    }
     b2.getCommandManager().execute(arg)
     console.info('[mcbridge] 已执行 baritone: "' + arg + '"')
     return
@@ -1371,14 +1403,7 @@ function mcbHandle(action, arg) {
             if (prDiag.length < 3) prDiag.push('entry 连 id() 都没有')
             continue
           }
-          // 命中判据：完全相等，或者"物品名 == 配方 id 的末段"
-          // （原版大部分配方就是这么命名的：minecraft:oak_planks 的配方 id 也叫这个）
           var prHit = (prRid === prWant)
-          if (!prHit) {
-            var prTail = prRid.indexOf(':') >= 0 ? prRid.substring(prRid.indexOf(':') + 1) : prRid
-            var prWantTail = prWant.indexOf(':') >= 0 ? prWant.substring(prWant.indexOf(':') + 1) : prWant
-            prHit = (prTail === prWantTail)
-          }
           if (!prHit) continue
           prSeen++
           if (prFirst === null) prFirst = { entry: prEntry, rid: prRid }
@@ -1729,11 +1754,28 @@ NetworkEvents.dataReceived(MCB_CHANNEL_DOWN, event => {
   var action = mcbStr(tag, 'action')
   var arg = mcbStr(tag, 'arg')
   console.info('[mcbridge] 收到服务端数据: action=' + action + ' arg="' + arg + '"')
+  var receiptId = mcbStr(tag, 'receiptId')
+  var receiptResult = 'executed'
+  var receiptError = ''
   try {
     mcbHandle(action, arg)
     console.info('[mcbridge] NETWORK_RECV_OK')
   } catch (e) {
+    receiptResult = 'failed'
+    receiptError = String(e)
     console.error('[mcbridge] 处理动作失败: ' + e)
+  }
+  if (action === 'say' && receiptId) {
+    var receiptMc = mcbMc()
+    if (receiptMc !== null && receiptMc.player !== null) {
+      try {
+        receiptMc.player.sendData(MCB_CHANNEL_UP, {
+          receipt: 'say', receiptId: receiptId, result: receiptResult, error: receiptError
+        })
+      } catch (receiptSendError) {
+        console.error('[mcbridge] 说话回执上行失败: ' + receiptSendError)
+      }
+    }
   }
 })
 

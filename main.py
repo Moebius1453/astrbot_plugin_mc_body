@@ -501,6 +501,7 @@ class McBodyPlugin(Star):
                 hunt=self.hunt.render(),
                 wander=self.idle.render(),
             )
+            packet += "\n" + self.uplink.render()
             from astrbot.core.agent.message import TextPart
             req.extra_user_content_parts.append(TextPart(text=packet))
         except Exception as exc:  # noqa: BLE001 - 注入失败绝不能让她这条消息也发不出去
@@ -868,7 +869,7 @@ class McBodyPlugin(Star):
         return render.describe_state(
             data, self.reflex.stance, self.tasks.status(), self.journal,
             hold=render.describe_hold(data, self.uplink.hold_reason, self.uplink.hold_detail),
-        )
+        ) + "\n" + self.uplink.render()
 
     @filter.llm_tool(name="mc_say")
     async def mc_say(self, event: AstrMessageEvent, text: str):
@@ -885,8 +886,8 @@ class McBodyPlugin(Star):
         _, err = await self._call(f"mcb say {clean}")
         if err:
             return render.reword(err, "没能在游戏里说话", kind=render.Kind.BRIDGE,
-                                hint="过几秒重试一次")
-        return f"已经用 Nanako 的身体在游戏里说了：{clean}"
+                                hint="结果未知时先查公屏记录，不要自动重发")
+        return f"客户端已执行 Nanako 的聊天发送：{clean}"
 
     @filter.llm_tool(name="mc_goto")
     async def mc_goto(self, event: AstrMessageEvent, near: str = "", x: float = 0, z: float = 0):
@@ -1637,7 +1638,8 @@ class McBodyPlugin(Star):
 
     @filter.llm_tool(name="mc_task")
     async def mc_task(self, event: AstrMessageEvent, task: str, at: str = "",
-                      rounds: int = 6, spacing: int = 8, direction: str = "east"):
+                      rounds: int = 6, spacing: int = 8, direction: str = "east",
+                      no_break: bool = False):
         """Send her off to do a MULTI-STEP job; the program carries it out step by step.
         Other tools are ONE ACTION; this is ONE JOB.
         
@@ -1664,7 +1666,9 @@ class McBodyPlugin(Star):
                 most one torch; blocked positions are skipped, so this is an upper limit.
             spacing(int): Blocks between torch attempts, 3 to 32, default 8.
             direction(string): Torch route: east, west, south or north; default east.
-                These route options apply only to torch. They do not disable block breaking."""
+                These route options apply only to torch.
+            no_break(bool): For torch only, forbid Baritone block breaking on this task's routes.
+                Default false. Does not restrict survival reflexes or other tasks."""
         if (deny := self._guard(event)):
             return deny
         if not self._cfg("enable_mc_task", True):
@@ -1673,6 +1677,9 @@ class McBodyPlugin(Star):
         if not name:
             return "要派哪件事？现在能派的有：\n" + render.describe_catalog(self.tasks.catalog())
         params: dict = {}
+        if type(no_break) is not bool or (no_break and name != "torch"):
+            return render.fail(render.Kind.BAD_ARGUMENT, "不挖地参数不合法，未更换任务",
+                               detail="no_break必须为布尔值，当前仅照明任务支持")
         if name == "torch":
             heading = str(direction or "").strip().lower()
             if (type(rounds) is not int or not 1 <= rounds <= 32
@@ -1684,6 +1691,8 @@ class McBodyPlugin(Star):
                            "direction 必须是 east/west/south/north",
                 )
             params.update(rounds=rounds, spacing=spacing, dir=heading)
+            if no_break:
+                params["no_break"] = True
         # at = "x z"。解析失败就忽略 —— 任务自己会退化成"就地干"。
         parts = str(at or "").replace(",", " ").split()
         if len(parts) >= 2:

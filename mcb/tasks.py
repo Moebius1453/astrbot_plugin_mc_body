@@ -206,8 +206,11 @@ class TaskContext:
         arb = self._runner.arbiter
         if arb is not None:
             await arb.claim_walk(LEVEL_TASK, "task",
-                                 f"goto {int(x)} {int(z)}", "任务路线")
+                                 f"goto {int(x)} {int(z)}", "任务路线",
+                                 no_break=bool(self.params.get("no_break")))
         else:
+            if self.params.get("no_break"):
+                return "unconfirmed"
             await self.call(f"mcb baritone goto {int(x)} {int(z)}")
         return await self.wait_path(timeout, target=(float(x), float(z)))
 
@@ -295,26 +298,37 @@ async def _step_light_along(ctx: TaskContext) -> str | None:
               "north": (0, -1), "+x": (1, 0), "-x": (-1, 0)}[heading]
     tid = ctx.data.get("torch")
 
-    placed = 0
-    for i in range(rounds):
+    progress = ctx.data.setdefault("lighting", {"attempted": 0, "target": None})
+    ctx.data.setdefault("placed", 0)
+    while progress["attempted"] < rounds or progress["target"] is not None:
         await ctx.checkpoint()
-        if await ctx.place_torch_here(tid):
-            placed += 1
-            ctx.note(f"第 {i + 1}/{rounds} 处：插上了（共 {placed} 根）")
-        else:
-            ctx.note(f"第 {i + 1}/{rounds} 处：这里插不了，跳过")
-        if i + 1 >= rounds:
+        if progress["target"] is not None:
+            nx, nz = progress["target"]
+            arrival = await ctx.goto(nx, nz, timeout=45)
+            await ctx.checkpoint()
+            if ctx.params.get("no_break") and arrival != "arrived":
+                return "不挖地路线未确认到达，已停止照明"
+            progress["target"] = None
+        if progress["attempted"] >= rounds:
             break
         st = await ctx.state()
         try:
             nx = float(st["x"]) + dx * spacing
             nz = float(st["z"]) + dz * spacing
         except (KeyError, TypeError, ValueError):
-            break
-        await ctx.goto(nx, nz, timeout=45)
+            return "读不到位置，已停止照明"
+        await ctx.checkpoint()
+        # 放置可能已产生副作用，先占用本次额度；抢占后不重试同一处。
+        progress["attempted"] += 1
+        if progress["attempted"] < rounds:
+            progress["target"] = (nx, nz)
+        if await ctx.place_torch_here(tid):
+            ctx.data["placed"] += 1
+            ctx.note(f"第 {progress['attempted']}/{rounds} 处：插上了（共 {ctx.data['placed']} 根）")
+        else:
+            ctx.note(f"第 {progress['attempted']}/{rounds} 处：这里插不了，跳过")
 
-    ctx.data["placed"] = placed
-    if placed <= 0:
+    if ctx.data["placed"] <= 0:
         return "一根都没插上（可能脚下不是实地，或者火把被用光了）"
     return None
 

@@ -128,7 +128,7 @@ ACTIVE_STATUSES = frozenset({"moving", "following-idle"})
 
 
 class _Claim:
-    __slots__ = ("level", "owner", "cmd", "note", "expire_at", "ttl", "token")
+    __slots__ = ("level", "owner", "cmd", "note", "expire_at", "ttl", "token", "no_break")
 
     def __init__(self, level: int, owner: str, cmd: str | None, note: str,
                  expire_at: float | None = None, ttl: float | None = None) -> None:
@@ -141,6 +141,7 @@ class _Claim:
         # 这条声明的 TTL 本身 —— renew_active 靠它算续期后的新到期时刻
         self.ttl = ttl
         self.token = ""
+        self.no_break = False
 
 
 class Arbiter:
@@ -162,7 +163,8 @@ class Arbiter:
     # ---- walk 通道 ------------------------------------------------------
 
     async def claim_walk(self, level: int, owner: str, cmd: str | None,
-                         note: str = "", ttl: float | None = None) -> None:
+                         note: str = "", ttl: float | None = None, *,
+                         no_break: bool = False) -> None:
         """声明"我要走"。cmd=None 表示要求停下（不是"我不要了"，是"现在别走"）。
 
         注意： 这条区别很重要：反射要保命时用的是 cmd=None ——
@@ -195,7 +197,9 @@ class Arbiter:
                 ttl = TASK_TTL
         expire_at = time.monotonic() + float(ttl)
         self._walk = [c for c in self._walk if c.owner != owner]
-        self._walk.append(_Claim(level, owner, cmd, note, expire_at, float(ttl)))
+        claim = _Claim(level, owner, cmd, note, expire_at, float(ttl))
+        claim.no_break = no_break
+        self._walk.append(claim)
         # 稳定排序：小的在前，同级按插入顺序（list 顺序天然是插入序）
         self._walk.sort(key=lambda c: c.level)
         await self._sync_walk("claim:" + owner)
@@ -312,7 +316,8 @@ class Arbiter:
         cmd = "mcb stop"
         if want:
             top.token = uuid.uuid4().hex
-            payload = {"token": top.token, "owner": top.owner, "cmd": want}
+            payload = {"token": top.token, "owner": top.owner, "cmd": want,
+                       "noBreak": top.no_break}
             cmd = "mcb walk " + json.dumps(payload, ensure_ascii=True)
         self.last_error = None
         try:
