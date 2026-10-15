@@ -1,6 +1,9 @@
-# Minecraft 身体
+# Minecraft 身体 · AstrBot 插件
 
 本插件必须额外运行一份 Minecraft 客户端，并让该客户端作为玩家加入服务器。仅安装 AstrBot 插件和 Minecraft 服务端不能使用。
+
+![AstrBot](https://img.shields.io/badge/AstrBot-%3E%3D4.27-4B8BBE.svg)
+![Minecraft 1.21.1](https://img.shields.io/badge/Minecraft-1.21.1-62B47A.svg)
 
 通过 AstrBot、RCON、KubeJS 和 Baritone，让智能体控制一个真实在线的 Minecraft 玩家，完成聊天、移动、感知、物品交互、合成和程序任务。角色使用独立客户端，不是服务端生成的 NPC。
 
