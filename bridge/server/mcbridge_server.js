@@ -307,7 +307,7 @@ PlayerEvents.chat(event => {
 })
 
 // 聊天独立缓冲，不能再录事件流造成重复。
-// 机制抄 mcpfabric 的 EventBus：环形缓冲 + 单调 seq + 按 sinceId 增量拉取。
+// 环形缓冲以单调 seq 按 sinceId 增量拉取。
 // 未知事件注册会使脚本加载失败，每个钩子独立保护。
 const MCB_EV_MAX = 600
 
@@ -890,7 +890,7 @@ function mcbStackInfo(stack) {
     }
   }
 
-  // 能不能吃、吃了顶多少 —— 判据跟车万女仆的 isHealMeal 对齐：
+  // 按可食用性与恢复量筛选。
   var food = null
   var foodErr = null
   try {
@@ -1089,9 +1089,9 @@ function mcbScan(player, radius) {
   return out
 }
 
-// 抄的是原版那套（女仆的 MaidHostilesSensor 也是抄原版）：
+// 敌对性需结合实体类别与攻击目标判断。
 
-// 注意： 只按类判"是不是怪"是不够的 —— 抄 Kindred 的坑 #1：
+
 var MCB_HOSTILE_RE = /zombie|skeleton|creeper|spider|witch|slime|phantom|drowned|husk|stray|pillager|vindicator|ravager|blaze|ghast|magma|endermite|silverfish|guardian|shulker|wither|hoglin|piglin|zoglin|warden|bogged|breeze|creaking|monster|wolf|bear|llama|hog|piranha|revenant|necromancer|undead/i
 
 function mcbEntityPos(e) {
@@ -1156,7 +1156,7 @@ function mcbThreats(player, radius) {
       if (pos === null) continue
       var tn = ''
       try { tn = String(e.type) } catch (eT) { }
-      // 它是不是正瞄着白？抄 Kindred 坑 #1 的修复。
+      // 检查实体是否瞄准当前玩家。
       var targeting = false
       try {
         var tg = null
@@ -1185,7 +1185,7 @@ function mcbThreats(player, radius) {
     out.err.push('Monster: ' + e1)
   }
 
-  //    注意：注意： 这一步不能省 —— 抄 Kindred 的坑 #1：他们的同伴被狼咬死，
+  // 补查所有实体，避免遗漏狼等非 Monster 威胁。
   try {
     collect(level.getEntities(player, box), false)
     out.via.push('all-entities')
@@ -1365,7 +1365,7 @@ function mcbFaceFromDelta(dx, dy, dz) {
 }
 
 // OUTLINE 会挡住玻璃等可透视方块，这里改用 canOcclude 表达视觉遮挡。
-//    这是视觉语义，跟碰撞箱（getCollisionShape，mcpfabric 用的那个）不是一回事。
+// 视觉遮挡与 getCollisionShape 的碰撞语义不同。
 // seen 是首个可见非空气，occluder 是真正挡住视线的方块。
 function mcbRayBlock(level, ex, ey, ez, lx, ly, lz, maxDist) {
   var out = { seen: null, occluder: null, steps: 0 }
@@ -1604,7 +1604,7 @@ function mcbLookAt(player, reach) {
   return out
 }
 
-//    种类、数量、摆法、要不要工作台，全在里面。抄它就不会漏 mod。
+// 配方种类、数量和布局以服务端配方数据为准，兼容模组。
 
 var mcbRecipeIdx = null
 
@@ -1832,7 +1832,7 @@ function mcbEnv(level) {
   return out
 }
 
-// 注意：注意： 为什么不照抄 mcpfabric 的半径：
+// 扫描半径受服务端预算限制。
 function mcbScanProbe(player, arg) {
   var out = { err: [], ok: [], api: {}, bench: {} }
   var level = null
@@ -1956,7 +1956,7 @@ function mcbScanProbe(player, arg) {
 }
 
 // byepregen 替换 PalettedContainer，此映射 count() 不能可靠聚合。
-//    mcpfabric 那个"用 palette 一次聚合"的省法在这儿不成立（实测 count() 只数出 1）。
+// 实测 count() 只计出 1，不能用于聚合。
 // 按最近边判 chunk 是否越界，保守保留边缘 chunk。
 function mcbRingOut(ox, oz, RR) {
   var nx = ox > 0 ? ox : (ox + 16 < 0 ? ox + 16 : 0)
@@ -2127,7 +2127,7 @@ function mcbBlockInfo(player, x, y, z) {
   try { out.lightBlock = Number(st.getLightBlock()) } catch (e5) {
     try { out.lightBlock = Number(st.getLightBlock(level, new $BP(x, y, z))) } catch (e6) { }
   }
-  // 对照：碰撞语义（mcpfabric 的 exposed 用的就是它）—— 实测玻璃
+  // 碰撞语义单独报告，不等同于视觉遮挡。
   try { out.collisionEmpty = !!st.getCollisionShape(level, new $BP(x, y, z)).isEmpty() } catch (e7) { }
   return out
 }

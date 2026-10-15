@@ -23,7 +23,7 @@ class Journal:
 
     def __init__(self, capacity: int = CAPACITY) -> None:
         self._buf: deque[dict] = deque(maxlen=max(20, int(capacity)))
-        # 注意： 挤掉的条数要记账（抄 Numen EventQueue.flushDropped）。
+        # 记录缓冲挤掉的条数。
         self._dropped = 0
 
 

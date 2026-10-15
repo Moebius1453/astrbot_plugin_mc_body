@@ -1,10 +1,4 @@
-r"""依赖 AstrBot 内部 API；自身发言不唤醒；游戏回复只回游戏。
-规则（用户 2026-10-09 定）：
-  * 被点名才唤醒 —— 游戏里的消息总是进白的环境感知，但只有含唤醒词才真跑一次 agent；
-    其余的攒着当上下文，下次被唤醒时一并附上
-  * 按来源路由（确定性代码） —— 从游戏来的回复用 mc_say 打回游戏公屏，不回 QQ。
-    用户原话："不太信任 AI 的判断，程序规范靠谱点"
-  * Nanako 自己的发言永不唤醒（防自激），只作 你刚才在游戏里说过 前缀"""
+r"""仅点名触发模型调用，其余聊天排队；回复按来源回游戏，自身发言不唤醒，避免自激。依赖 AstrBot 内部 API。"""
 
 from __future__ import annotations
 
@@ -556,13 +550,7 @@ class ChatUplink:
         return list(raw) if isinstance(raw, list) else []
 
     async def _save_turn(self, req, runner, *, turn_start=None) -> None:
-        r"""update_conversation 是替换语义；先核类型再合并，校验只增不减及膨胀。
-        重点： 2026-10-10 深夜按 Numen 的纪律加固（方案：docs §2.2）。核心两处：
-
-        > 重点： 先天差距要说清：AstrBot 的 update_conversation(history=…) 是替换语义，
-        > 我们做不到真正的 append-only（Numen 的 ConvoLog 是 JSONL 追加 + 派生视图）。
-        > 所以这里只能把"读-改-写"这条路守得更死 —— 守不出追加，只能守出"不敢乱写"。
-        """
+        r"""update_conversation 是替换语义，须先核类型再合并，并检查只增不减及异常膨胀；不等同于 JSONL 追加。"""
         try:
             from astrbot.core.agent.message import dump_messages_with_checkpoints
 

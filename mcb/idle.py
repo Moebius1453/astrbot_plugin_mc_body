@@ -1,7 +1,4 @@
-r"""一个大活人不会站在原地像尊石像。**而且这一层不花 token** —— 这是关键：
-"经常动"是身体层的事，不该拿模型调用去买。Numen 的宪法里说得最清楚
-（docs/architecture-mind-model.md §一）：身体每 tick 竞价，本能链是硬编码不花 token 的，
-"LLM 是出价最低的竞价者"。我们照这个分层："""
+r"""闲逛由身体层执行，不消耗模型调用，且让位于其他通道声明。"""
 
 from __future__ import annotations
 

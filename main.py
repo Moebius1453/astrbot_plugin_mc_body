@@ -50,7 +50,7 @@ PLAYER_NAME_RE = re.compile(r"^[A-Za-z0-9_]{1,16}$")
 MAX_SAY_LEN = 200
 MAX_RAW_LEN = 200
 
-# ---- 重点： 抄 Numen 的纪律：Baritone 原始命令走白名单，不走黑名单 ------------
+# Baritone 原始命令只允许白名单。
 BARITONE_VERBS = frozenset({
     "goto", "follow", "come", "thisway", "explore", "path", "surface",
     "mine", "farm",
@@ -302,19 +302,7 @@ class McBodyPlugin(Star):
 
     @filter.on_llm_request(priority=999)
     async def sanitize_wire(self, event: AstrMessageEvent, req) -> None:
-        """出口净化（第 2 批 2.1）—— QQ 这条路的最后一道。
-
-        注意： 和 uplink 里那条是同一件事的两半：uplink 管"游戏内唤醒"那条路
-        （我们绕过 pipeline，钩子得自己调），这条管 QQ 走 pipeline 的正常路。
-        单独挂一个钩子、不塞进 inject_body_state —— 后者的开关是 enable_body_state，
-        关掉状态包不该连带把净化也关了。
-
-        priority=999 是想让它排在其他钩子之后跑（别的钩子可能还在往请求里塞东西），
-        净化要看着最终那一份做。
-
-        注意： 它管不到 runner 之后那一次截断（那在框架内部，按 docs\\25 11.2 不动它）。
-        所以是补强不是止血；坏形状由 protocol.audit() 记日志，先在真实流量里攒证据。
-        """
+        r"""出站净化独立于状态包开关，排在其他请求钩子之后；仅处理当前视图，不覆盖框架后续截断。"""
         try:
             issues = protocol.audit(getattr(req, "contexts", None))
             if issues:
@@ -331,16 +319,7 @@ class McBodyPlugin(Star):
 
     @filter.on_llm_request(priority=100)
     async def inject_body_state(self, event: AstrMessageEvent, req) -> None:
-        """每 N 次 LLM 请求，把状态数据包附在她这条用户消息的末尾。
-
-        用户 2026-10-09 定："状态最少得三到四轮对话主动告诉她一次"，
-        并且不接受程序文本 —— 所以这里只挂 §render.state_packet 那份纯数据。
-
-        注意： 挂 extra_user_content_parts（用户消息侧）而不是 system_prompt ——
-        状态每轮都在变，塞进 system 会把提示词缓存全打掉。
-        （先例：astrbot_plugin_dafeiyu_pet 也在 on_llm_request 里注身体状态，
-          但它挂的是 system_prompt；我们数据更碎，走用户侧更划算。）
-        """
+        r"""按配置轮次在用户消息侧注入状态数据，避免动态状态破坏 system_prompt 缓存。来源先例：astrbot_plugin_dafeiyu_pet 的状态注入。"""
         if not self._cfg("enable_body_state", True):
             return
         # 新聊天不受状态包 every 节流，避免延迟对话。
@@ -748,7 +727,7 @@ class McBodyPlugin(Star):
             if hit is not None:
                 name, place = hit
                 tx, tz = int(float(place["x"])), int(float(place["z"]))
-                #    抄 mcpfabric memory.ts 的 valid/changed/gone。
+                
                 status = self.places.check(
                     name, await self._block_at(place.get("x"), place.get("y"), place.get("z"))
                 )

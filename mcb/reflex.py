@@ -1,11 +1,4 @@
-r"""设计来自前人验证过的做法（见 universal-modder 的 Kindred 笔记）：
-> "Reflexes over inference" —— 攻击/撤退、捡东西、吃东西全部不调 LLM 直接执行，
-> 只有高层规划和对话才交给模型。
-
-  1. 挨打  ->  立刻 mcb stop（别再顺着原路线一头撞进去），并进入战斗态；然后还手
-  2. 战斗  ->  逃（濒死） / 走过去 / 挥。姿态由白选（见下）
-  3. 卡住（在寻路但坐标长时间不动） ->  mcb stop，别死等
-  4. 饿了  ->  自己找东西吃（抄女仆 MaidHealSelfTask）"""
+r"""战斗、撤退、脱困和进食由反射执行，不调用模型。"""
 
 from __future__ import annotations
 
@@ -29,13 +22,13 @@ DROWN_AIR = 180.0
 DROWN_TICKS = 3          
 DROWN_RETRY_TICKS = 10   
 
-# 怪贴到这个距离内就进入战斗（不等到挨打）—— 抄 Kindred 的修复思路
+# 近距离且瞄准自身的威胁可触发战斗。
 NEAR_HOSTILE_RANGE = 5.0
 
-# 够得着就打，够不着就过去（抄女仆的 SetWalkTargetFromAttackTargetIfTargetOutOfReach）
+# 够不着时接近目标。
 ENGAGE_RANGE = 3.0
 
-# 连续多少 tick 看不到怪就脱战（抄女仆的 StopAttackingIfTargetInvalid）
+# 连续丢失目标后脱战。
 COMBAT_EXIT_TICKS = 3
 
 # 脱战保留滞后，防止边界反复切态。
@@ -65,9 +58,9 @@ STANCES = (STANCE_DEFEND, STANCE_HUNT)
 
 HUNT_RANGE = 5.0
 
-# 吃饭（抄女仆 MaidHealSelfTask）：饥饿低于这个值就吃
+# 饥饿低于阈值时进食。
 HUNGER_LOW = 16
-# 限频 —— 抄女仆的 setMaxCheckRate：吃完隔一会儿再看，别每 tick 查背包
+# 进食后限频检查背包。
 EAT_COOLDOWN_TICKS = 5
 
 # 立即换手会打断正在使用的物品。
@@ -322,7 +315,7 @@ class ReflexGuard:
         targeting = next((h for h in hostiles if h.get("targeting")), None)
         engaging = bool(hurt or targeting is not None)
 
-        # ---- 战斗状态机（抄女仆：StartAttacking / 走过去 / 挥 / 脱战）----
+        # 战斗按索敌、接近、攻击、脱战推进。
         if not self._in_combat:
             why = self._combat_trigger(hurt, closest, targeting)
             if why:
@@ -380,7 +373,7 @@ class ReflexGuard:
 
         await self._check_drowning(data)
 
-        # 吃饭 —— 抄女仆 MaidHealSelfTask：饿了就吃，不经过 LLM
+        # 进食不调用模型。
         await self._maybe_eat(data)
 
     async def _check_drowning(self, data: dict) -> None:
@@ -413,11 +406,7 @@ class ReflexGuard:
             await self._walk_stop("溺水但不知道往哪浮")
 
     async def _maybe_eat(self, data: dict) -> None:
-        r"""低血量也需吃以恢复；使用中禁止重发 use，避免重置进度。
-        抄了女仆这几个细节：
-          · 限频（setMaxCheckRate）—— 吃完隔几 tick 再看，别每 tick 翻背包
-          · 记住原来手上拿的是什么，吃完换回来（memoryHandItemStack）
-        受伤时优先挑饱食度高的（saturation，回血看它）；只是饿了就挑顶饱的（nutrition）。"""
+        r"""低血量也需进食；使用中禁止重发 use，吃完限频检查并恢复手持。受伤优先饱食度，否则优先营养值。"""
         await self._restore_hand()
 
         if self._eat_cool > 0:
@@ -489,7 +478,7 @@ class ReflexGuard:
             self._restore_slot = None
 
     async def _restore_hand(self) -> None:
-        r"""吃完了把手换回原来那格（抄女仆 memoryHandItemStack）。"""
+        r"""进食结束后恢复手持，避免中断使用。"""
         if self._restore_slot is None:
             return
         if self._restore_wait > 0:
@@ -562,7 +551,7 @@ class ReflexGuard:
                 return f"{nearest.get('name')} 在 {nearest.get('dist'):g} 格内（hunt 主动出击）"
             return None
 
-        # 抄前人验证过的做法（Kindred 的坑 #1）：只算"敌对实体"不够，
+        # 不能仅按实体类别判断威胁，还需检查攻击目标。
         if targeting is not None and targeting.get("dist", 1e9) <= NEAR_HOSTILE_RANGE:
             return f"{targeting.get('name')} 正瞄着我，贴到 {targeting.get('dist'):g} 格"
         return None
@@ -592,10 +581,7 @@ class ReflexGuard:
     async def _fight(
         self, data: dict, nearest: dict, hp: float | None, *, chase: bool = True
     ) -> None:
-        r"""        chase=False（defend 姿态）：够不着就站着等，不追出去。
-        chase=True（hunt 姿态）：够不着就走过去（抄女仆的
-        SetWalkTargetFromAttackTargetIfTargetOutOfReach）。
-        """
+        r"""defend 不追击够不着的目标，hunt 则接近目标。"""
         if hp is not None and hp <= self.hp_critical:
             # 逃跑声明可能到期或被停止声明替换，丢失时需重算。
             if self.arbiter is not None and not self.arbiter.holds_route("reflex"):

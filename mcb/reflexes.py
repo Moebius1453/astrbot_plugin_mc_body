@@ -1,10 +1,4 @@
-r"""本能名册 —— 加一条反射只写反射本身（抄 Numen ReflexRegistry，docs\25 §三 1.2）。
-
-1. 给她看：overview() 拼成一行塞进接线说明 —— 让她知道"我的身体有这些本能"。
-2. 给我们看：这张表是唯一的事实来源。加一条反射、删一条反射，
-   只改这里 + 反射本身，不许再散在 render / schema 里各写一份。
-
-## 注意： 抄 Numen 的一条纪律（ReflexRegistry.java:17-20 原话）"""
+r"""本能名册是能力自述的唯一来源，须与反射实现同步。"""
 
 from __future__ import annotations
 
@@ -13,11 +7,7 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class Instinct:
-    """一条本能。
-
-    trigger / action 是给模型看的英文（这段会进提示词，按 docs\\25 §七 的口径）。
-    中文解释写在注释里。
-    """
+    r"""trigger / action 是进入模型提示词的英文能力说明。"""
 
     id: str
     trigger: str                  

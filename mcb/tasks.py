@@ -1,14 +1,4 @@
-r"""## 抄的是车万女仆（TLM）的分层，不是它的代码
-
-TLM 的任务不能照抄代码 —— IMaidTask.createBrainTasks(EntityMaid) 要一个
-EntityMaid 对象，返回的 BehaviorControl 喂给原版 Brain 系统、跑在服务端实体
-tick 循环里。白是真实客户端玩家，喂不进去（这一点已扒 jar 核实）。
-
-我们也只给 LLM 两个出口：mc_task <名字> / mc_task stop。干活全在程序侧。
-（TLM 那套结果码 Already on task / missing item / unknown task_id 也照抄了语义。）
-
-被打断 ≠ 被丢弃。 反射抢占时任务挂起，反射过去自己回来接着做
-（女仆的 MaidPanicTask 也是这个语义）。用户叫停才是真停。"""
+r"""程序侧执行任务；反射抢占时挂起并在释放后恢复，用户停止才取消。"""
 
 from __future__ import annotations
 
@@ -49,7 +39,7 @@ class Task:
     name: str
     summary: str          
     steps: list[Step] = field(default_factory=list)
-    # 重点： 受理前检查（抄 Numen Task.prepare / TaskDispatch.setTask）。
+    # 受理前检查，失败不能取消旧任务。
     precheck: StepFn | None = None
 
 
@@ -419,7 +409,7 @@ class TaskRunner:
 
 
     def catalog(self) -> list[dict]:
-        r"""可选的任务清单（给工具描述用 —— 抄 TLM 的 getTaskIdParameterDesc）。"""
+        r"""任务清单用于工具描述。"""
         return [{"id": t.id, "name": t.name, "summary": t.summary} for t in TASKS.values()]
 
     def status(self) -> dict:
@@ -450,7 +440,7 @@ class TaskRunner:
             )
 
         if self.busy and self._job is not None and self._job.id == task.id:
-            # 抄 TLM 的 Already on task %s
+            
             return f"已经在做「{task.name}」了 —— 没换。"
 
         # 先检查新任务再停旧任务，失败不能丢掉旧活。
@@ -513,14 +503,14 @@ class TaskRunner:
     async def checkpoint(self) -> None:
         if self._paused:
             raise Paused
-        # 注意： 另一个挂起来源：walk 通道被别人（反射/用户）抢走了。
+        # 注意： 另一个挂起
         arb = self.arbiter
         if arb is not None:
             top = arb.walk_holder()
             if top is not None and top.owner != "task":
                 raise Paused
             # checkpoint 续期任务声明，任务消失后由 TTL 释放。
-            # 注意： 这不是"释放"的来源，是"我还想要"的来源：
+            # 注意： 这不是"释放"的来源，是"我还想要"的
             await arb.touch_walk("task", TASK_TTL)
 
     def note(self, text: str) -> None:

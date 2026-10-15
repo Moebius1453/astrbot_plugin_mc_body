@@ -1,5 +1,5 @@
-r"""环形缓冲 + 单调 seq + 按 sinceId 增量拉取（抄 mcpfabric 的 EventBus）。
-不用推送：推送没法重连、没法去重、断一次就丢；拉取式天然可重放。"""
+r"""环形缓冲以单调 seq 增量拉取，支持断线重放与去重。"""
+# 事件声明结构对应 Numen EventTypes；来源与许可待核项见仓库根 THIRD_PARTY_NOTICES.md。
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ KEEP = 60
 MAX_BACKOFF_SECONDS = 30.0
 
 class Joins:
-    r"""一条事件随哪次调用进上下文（抄 Numen EventTypes.Delivery.joins）。"""
+    r"""声明事件随哪次调用进入上下文。"""
 
     ANY = "any"      
     OWN = "own"      
@@ -26,13 +26,7 @@ class Joins:
 
 @dataclass(frozen=True)
 class KindSpec:
-    """一种事件的四列声明（抄 Numen EventTypes：投递方式写进类型表）。
-
-    注意： 为什么要有这张表（docs\\21 §1.4）：
-        Numen 的 EventQueue 里没有一处按档名 switch ——
-        "这条急不急、要不要叫醒她、进不进聊天流"全查声明。
-        我们原来是散落的字符串判断，改一条要动好几处。
-    """
+    r"""事件类型集中声明投递属性，避免分散判断。来源：Numen EventTypes。"""
 
     label: str                    
     wakes: bool                   
@@ -72,7 +66,7 @@ class EventFeed:
         self._task: asyncio.Task | None = None
         self._last_seq = 0
         self._recent: list[dict] = []
-        # 注意： 挤掉的条数要记账（抄 Numen EventQueue.flushDropped）——
+        # 记录缓冲挤掉的事件数。
         self._dropped = 0
         self._fail_streak = 0
         self._inv_snap: dict[str, int] | None = None
@@ -301,7 +295,7 @@ def _g(v: object) -> str:
 
 
 def _age_note(row: dict, now: float) -> str:
-    r"""躺太久的旧事件前面标一句"多久以前"（抄 Numen EventQueue.annotateAge）。"""
+    r"""标注旧事件距今时长。"""
     t = row.get("t")
     if not isinstance(t, (int, float)) or isinstance(t, bool):
         return ""

@@ -258,8 +258,7 @@ class ContainerIO:
         return None
 
     async def put_one(self, layout: dict, dest_slot: int, candidates: list[str]) -> bool:
-        r"""        抄 mineflayer：拿起整叠  ->  右键放一个  ->  剩下的放回原处。
-        """
+        r"""拿起整叠、右键放一个，再放回剩余物品。"""
         src = None
         for cand in candidates:
             src = await self.slot_of(cand, layout)

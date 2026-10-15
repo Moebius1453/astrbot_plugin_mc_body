@@ -1,3 +1,4 @@
+// 命中候选与槽位分类存在 Numen 实现对应；来源与许可待核项见仓库根 THIRD_PARTY_NOTICES.md。
 // 交互走 mc.gameMode，由原版维护窗口、stateId 和 sequence。
 // player.gameMode 在此映射为 null，使用 mc.gameMode。
 // Rhino 禁用 cls 变量名、函数内 const/let 和 Java getClass 反射。
@@ -41,8 +42,8 @@ try {
   console.error('[mcbridge] Rotation 类不可见: ' + eRot)
 }
 
-// 抄的是原版 Brain 的 memory 模型：LOOK_TARGET 和 WALK_TARGET 由不同的 sink
-// （也见 AltoClef 的 chains/：多个带优先级的 chain 并行跑，高优先级抢占。）
+// LOOK_TARGET 与 WALK_TARGET 分通道处理。
+
 var mcbSlots = {
   // temp 到期自动释放，防止交互俯角残留。
   // 无声明时需空闲朝向兜底，避免残留上次交互方向。
@@ -195,7 +196,7 @@ function mcbLookTempAt(x, y, z, pitchMax) {
 
 var mcbLastUsePos = null
 
-// 给一格方块挑"手该点在哪一点"—— 抄 Numen Look.point 的三档候选（第 3 批 3.1）。
+// 交互落点采用三档候选。
 // 不规则形状和侧面交互不能固定点顶面中心。
 // point 必须落在 face 上，否则服务端可能拒绝交互。
 function mcbPickHit(mc, bp, state) {
@@ -297,7 +298,7 @@ function mcbFacePoint(face, minX, minY, minZ, maxX, maxY, maxZ, ratio, ex, ey, e
 }
 
 // 槽位角色整表发送，包含空槽，否则无法识别可摆料位置。
-// 判据全部按槽位对象的类型推，不按界面类名（抄 Numen GuiOps.window）：
+// 按槽位对象类型而非界面类名推断布局。
 // 先判 ResultSlot，再判 CraftingContainer，避免产物误归输入。
 var mcbRoleClasses = null
 
@@ -893,7 +894,7 @@ function mcbHandle(action, arg) {
     var tx2 = Number(q[0]), ty2 = Number(q[1]), tz2 = Number(q[2])
     if (isNaN(tx2) || isNaN(ty2) || isNaN(tz2)) { console.error('[mcbridge] attackAt 参数非法: ' + arg); return }
 
-    // 攻击冷却 —— 抄原版 Minecraft.startAttack() 的逻辑：
+    // 攻击需满足冷却条件。
     var scale = 1.0
     try { scale = Number(mcT.player.getAttackStrengthScale(0.5)) } catch (eC) { scale = 1.0 }
     if (!(scale >= 0.9)) {
@@ -950,7 +951,7 @@ function mcbHandle(action, arg) {
       var tbp = new $BP(qx, qy, qz)
       var tstate = null
       try { tstate = mcX.level.getBlockState(tbp) } catch (eSt) { tstate = null }
-      // 第 3 批 3.1：三档候选挑"点哪一点"（抄 Numen Look.point），
+      // 交互落点采用三档候选。
       var pick = mcbPickHit(mcX, tbp, tstate)
       var thit = new $BHR(pick.point, pick.face, tbp, false)
       // 临时注视必须到期释放，避免交互后长期低头。
@@ -1060,7 +1061,7 @@ function mcbHandle(action, arg) {
   }
 
   if (action === 'placeRecipe') {
-    // 一个包就能让服务端按配方摆好。抄的是 MC_baritone 的 processPendingCraft。
+    // 配方摆放交由服务端处理。
     // 此版本旧 getResultItem 不可用，按稳定 RecipeHolder.id() 匹配。
     var mcPR = mcbMc()
     if (mcPR === null || mcPR.player === null || mcPR.gameMode === null) {
@@ -1307,7 +1308,7 @@ function mcbHandle(action, arg) {
 
   if (action === 'clickSlot') {
     // 容器点击交给 gameMode，窗口与 stateId 不能自行构造。
-    // 抄的是 mineflayer 的 bot.clickWindow(slot, button, mode) —— 它整套 craft 逻辑
+    
     var mcC = mcbMc()
     if (mcC === null || mcC.player === null || mcC.gameMode === null) {
       console.error('[mcbridge] clickSlot: 不可用'); return
@@ -1412,7 +1413,7 @@ let $mcbTick = 0
 ClientEvents.tick(() => {
   $mcbTick = $mcbTick + 1
 
-  //    各自管各自的通道。抄的是原版 Brain 的 memory 模型
+  // 逐通道更新声明。
   mcbTickSlots()
 
   $uplinkTick = $uplinkTick + 1

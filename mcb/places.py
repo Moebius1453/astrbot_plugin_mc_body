@@ -50,10 +50,7 @@ class PlaceBook:
     def remember(self, name: str, x: float, y: float, z: float, *,
                  dim: str = "", what: str = "", note: str = "",
                  fp: str = "") -> str:
-        r"""        fp = 指纹：记的这一刻，那个坐标上是什么方块（方块 id）。
-        下次再查到它就能知道那地方变了没（check()）。
-        注意： 抄的是 mcpfabric memory.ts 的 fingerprint + valid/changed/gone 自检。
-        """
+        r"""fp 保存方块 ID，供 check 检测地点变化。"""
         key = _clean(name, MAX_NAME)
         if not key:
             return "得给这个地方起个名字。"

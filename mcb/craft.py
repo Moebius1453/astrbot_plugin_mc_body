@@ -1,6 +1,4 @@
-r"""mineflayer-crafting-util 的思路：递归解析依赖。
-mineflayer 自己的 craft.js 只负责"把一条配方变成一串点格子"，
-多步依赖是调用方的责任 —— 所以这一层我们自己写。算法："""
+r"""递归解析配方依赖，点格子由容器操作执行。"""
 
 from __future__ import annotations
 

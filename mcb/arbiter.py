@@ -1,8 +1,4 @@
-r"""## 模型（抄原版 Brain 的 memory 抢占 + AltoClef 的 TaskChain）
-
-续期的证据是身体的可观测状态，不是调用方的心情（renew_active 的注释里有理由）。
-显式 release_walk 仍然是立刻生效 —— 不照 Numen 的"release 只是不再续命"，
-那会让"停"慢一个 TTL 才停。"""
+r"""通道按层抢占，续期依据可观测状态；release_walk 立即释放，避免停止操作延迟一个 TTL。"""
 
 from __future__ import annotations
 
@@ -12,8 +8,8 @@ import uuid
 
 from astrbot.api import logger
 
-# 重要： 纪律（2026-10-11 抄 Numen 定，别破坏）：层是固定的，层内不许有分数。
-#   Numen TaskSelector 的 javadoc 标题就是「为什么没有优先级数字」—— 原话：
+# 层级固定，层内不设分数。
+
 LEVEL_REFLEX = 0     
 LEVEL_USER = 10      
 LEVEL_COMBAT = 15    

@@ -2,12 +2,12 @@
 from __future__ import annotations
 
 
-# ---- 失败的三段式（抄 Numen，见 docs\25 §三 1.1）----------------------
-#    Numen 的做法（docs\19 §一.3）：失败不是 JSON，是固定形状的几行文本。
-#    Numen 的 ToolOutcome 类注释专门骂过旧实现 contains("\"error\"") 的误判：
+# 失败按固定文本结构输出，避免按 JSON 子串误判。
+
+
 
 class Kind:
-    r"""失败的种类。抄 Numen ErrorKind 的子集（它 14 个，挑我们真有的）。"""
+    r"""失败类型取所需子集。"""
 
     BAD_ARGUMENT = "bad_argument"    
     NOT_FOUND = "not_found"          
@@ -62,10 +62,7 @@ def _menu_items(menu) -> dict[int, tuple[str, int]] | None:
 
 
 def describe_click_result(slot, mode, before, after) -> str:
-    r"""    抄 Numen ContainerOps.route/place（点完当场 diff 前后格子并回一句人话），
-    理由（docs\25 §三 1.8）：原来只回"过一会儿用 mc_inventory 自己看" ——
-    那是把验证甩给一个不会去验证的人（docs\17 D3 那条教训）。
-    """
+    r"""点击后比较前后槽位，直接报告可验证结果。"""
     a = _menu_items(after)
     if a is None:
         return (

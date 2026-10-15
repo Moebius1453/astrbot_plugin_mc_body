@@ -1,10 +1,5 @@
-r"""抄 Numen 的三样（依据 docs\22）：事实（这一格是谁放的）、唯一裁决口（Gate.decide）、
-规则是数据（Rule / RuleSet）。身体层一行不抄。
-
-注意： 我们做到的粒度比 Numen 粗一档，这是承认的差距（docs\22 §3 第 5 条）：
-    它插桩在每一格挖掘的落点上；我们挖靠 Baritone，插不进去。
-    逐格破坏的裁决仍在服务端 BlockEvents.broken 里（已部署、已实测），
-    本模块管的是"派发工具之前"这一层。两层不重复，是纵深。"""
+r"""工具派发前统一裁决；逐格破坏另由服务端 BlockEvents.broken 检查。"""
+# 部分权限解析、裁决、默认规则及说明对应 Numen；来源与许可待核项见仓库根 THIRD_PARTY_NOTICES.md。
 
 from __future__ import annotations
 
@@ -15,7 +10,7 @@ from pathlib import Path
 
 
 class Mode:
-    r"""每个同伴一个，主人设。抄 Numen Mode。"""
+    r"""每个同伴独立设置权限模式。"""
 
     ASK = "ask"          
     BYPASS = "bypass"    
@@ -43,7 +38,7 @@ class Kind:
 
 @dataclass(frozen=True)
 class Action:
-    """一个要被裁决的动作。不带工具名、不带 JSON（Numen Action 的简化版）。"""
+    r"""待裁决动作不依赖工具名或 JSON。来源：Numen Action。"""
 
     kind: str
     pos: tuple[int, int, int] | None = None
@@ -135,7 +130,7 @@ class Facts:
         )
 
 
-# 每个信号只回答一个通用问题、各自独立、无状态（抄 Numen Signals 的立意）。
+# 信号独立、无状态，各回答一个通用问题。
 
 
 @dataclass(frozen=True)
@@ -161,7 +156,7 @@ def _block_entity(a: Action, f: Facts) -> bool:
 def _contents(a: Action, f: Facts) -> bool:
     if not f.block_entity:
         return False
-    # 读不到（没有通道）按"有"算 —— 拆了东西洒一地会消失，撤不回（Numen 同一条）
+    # 内容未知按有内容处理，避免不可逆损失。
     return True if f.contents is None else bool(f.contents)
 
 
@@ -229,10 +224,7 @@ UNCOVERED = "没有任何一行规则覆盖这个动作"
 
 @dataclass(frozen=True)
 class Verdict:
-    """一次裁决的答复。抄 Numen Verdict 的三分：放行 / 拒绝 / 去问。
-
-    cause 是给回执的整句理由（放行为空串）。
-    """
+    r"""裁决分为放行、拒绝、询问；cause 为回执理由，放行时为空。来源：Numen Verdict。"""
 
     kind: str
     cause: str = ""
@@ -257,8 +249,8 @@ class Verdict:
 ALLOWED = Verdict(VerdictKind.ALLOW)
 
 
-# 一行字符串：动作(项 & 项 & !项)，与 Claude Code 的 Tool(specifier) 同形（抄 Numen Rule）。
-# 注意： 与 Numen 的两处差异，都是"我们没有那个通道"，不是偷懒：
+# 规则格式为动作(项 & 项 & !项)。
+
 
 
 class RuleError(ValueError):
@@ -374,7 +366,7 @@ def _parse_term(raw: str, rule: str) -> _Term:
     return _Term("signal", negated, signal=signal, text=body)
 
 
-# 一层三张表：deny / allow / ask，层内顺序 deny -> allow -> ask（抄 Numen RuleSet）。
+# 层内按 deny、allow、ask 顺序查询。
 # allow 先于 ask，供窄范围授权命中。
 # 出厂 allow 必须排除受保护对象，否则会抢先于 ask 放行。
 
@@ -394,13 +386,13 @@ FACTORY_ASK = (
     "attack(named)",
     "attack(villager)",
     "place(hazard_item)",
-    # 注意： 从容器里拿东西一律问 —— 这一条是我们和 Numen 立场不同的地方。
-    #     Numen 把 take(*) 放进出厂 allow（它的理由是"相当于 Claude Code 读项目文件"）。
+    # 容器取物默认询问。
+    
     "take(*)",
 )
 
-# 注意： 出厂表里为什么没有 near_placed（Numen 用的是 place(hazard_item & near_placed)）：
-#     等哪天有了邻域查询，再照 Numen 收窄成"附近没有别人的东西才放行"。
+# 邻域查询不可用，危险放置统一询问。
+
 
 
 @dataclass
@@ -463,17 +455,7 @@ def load_owner_rules(path: str | Path) -> RuleSet:
 
 @dataclass
 class Judge:
-    """唯一裁决口。任何"这个动作能不能做"的答案都从这里出，别在工具里另写一套。
-
-    查的顺序（抄 Numen Gate.decide，全篇最该抄的一段）：
-        模式 -> 主人层(deny -> allow -> ask) -> 出厂层(deny -> allow -> ask) -> 都不中也问。
-    第一处命中即定。主人层整体先于出厂层：主人手写的行压得过出厂的。
-
-    代码里不写死"能"也不写死"不能"：
-        放行只来自 allow 行与主人选的 bypass；
-        拒绝只来自 deny 行与主人选的 observe；
-        其余一律问。
-    """
+    r"""唯一裁决入口，按模式、主人层、出厂层依次检查；层内 deny、allow、ask 首次命中即定，未命中则询问。来源：Numen Gate.decide。"""
 
     mode: str = Mode.ASK
     owner: RuleSet = field(default_factory=lambda: EMPTY)
