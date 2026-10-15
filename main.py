@@ -119,8 +119,8 @@ MAX_SKILL_CHARS = 24000   # SKILL.md 是给人读的说明书，超长的多半�
 @register(
     "astrbot_plugin_mc_body",
     "Moebius1453",
-    "让 AstrBot 的智能体在 Minecraft 里长出手脚：查询角色状态、说话、移动。",
-    "0.39.0",
+    "需要独立 Minecraft 客户端，通过配套桥接实现聊天、感知、移动、交互和合成。",
+    "0.40.0",
 )
 class McBodyPlugin(Star):
     def __init__(self, context: Context, config: dict | None = None) -> None:
