@@ -457,12 +457,22 @@ class ChatUplink:
             plugin_context=self.context,
             config=build_cfg,
             req=req,
+            apply_reset=False,
         )
         if not result:
             self.hold_reason = "blocked"
             self.hold_detail = "agent_build_unavailable"
             return ""
 
+        reset_coro = result.reset_coro
+        try:
+            return await self._run_built_turn(event, req, result, reset_coro)
+        finally:
+            if reset_coro.cr_frame is not None:
+                reset_coro.close()
+
+    async def _run_built_turn(self, event, req, result, reset_coro) -> str:
+        # runner 快照必须在请求钩子与净化之后构建，否则新增状态与记忆不会进入本轮。
         # 注意： 结构性防止"说两遍"：必须在 build 之后摘 ——
         #    build_main_agent 会把人格式的工具集 merge 进 req.func_tool（同名覆盖），
         #    提前摘没用。而 runner 是在工具执行时才读 req.func_tool 的
@@ -524,6 +534,7 @@ class ChatUplink:
         except Exception as exc:  # noqa: BLE001 - 净化失败不该让这一轮发不出去
             logger.warning(f"[mc_body] 出站净化失败（这一轮按原样发）：{exc}")
 
+        await reset_coro
         runner = result.agent_runner
         initial_messages = runner.run_context.messages
         turn_start = next((m for m in reversed(initial_messages)
@@ -610,6 +621,8 @@ class ChatUplink:
         try:
             from astrbot.core.agent.message import dump_messages_with_checkpoints
 
+            if turn_start is not None and getattr(runner, "_mcb_saved_turn", None) is turn_start:
+                return
             conv = getattr(req, "conversation", None)
             if conv is None:
                 return
@@ -648,7 +661,7 @@ class ChatUplink:
             # ── 第2道闸：追加段的 role 只能是这三种 ──────────────────────
             bad_roles = [
                 m.get("role") for m in appended
-                if m.get("role") not in ("user", "assistant", "tool")
+                if m.get("role") not in ("user", "assistant", "tool", "_checkpoint")
             ]
             if bad_roles:
                 logger.error(
@@ -676,6 +689,7 @@ class ChatUplink:
             await self.context.conversation_manager.update_conversation(
                 self.umo, conv.cid, history=combined
             )
+            runner._mcb_saved_turn = turn_start
             logger.info(
                 f"[mc_body] 游戏内这一轮已写回会话：历史 {len(stored)} → {len(combined)} 条"
             )

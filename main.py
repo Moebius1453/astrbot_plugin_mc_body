@@ -498,6 +498,7 @@ class McBodyPlugin(Star):
                 hold=render.describe_hold(data, self.uplink.hold_reason,
                                           self.uplink.hold_detail),
                 hunt=self.hunt.render(),
+                wander=self.idle.render(),
             )
             from astrbot.core.agent.message import TextPart
             req.extra_user_content_parts.append(TextPart(text=packet))
@@ -1635,7 +1636,8 @@ class McBodyPlugin(Star):
     # ---- 任务层（多步行为）-----------------------------------------------
 
     @filter.llm_tool(name="mc_task")
-    async def mc_task(self, event: AstrMessageEvent, task: str, at: str = ""):
+    async def mc_task(self, event: AstrMessageEvent, task: str, at: str = "",
+                      rounds: int = 6, spacing: int = 8, direction: str = "east"):
         """Send her off to do a MULTI-STEP job; the program carries it out step by step.
         Other tools are ONE ACTION; this is ONE JOB.
         
@@ -1657,7 +1659,12 @@ class McBodyPlugin(Star):
         Args:
             task(string): The task name. An unknown name is rejected and the options are listed.
             at(string): Optional location for the task, format "x z" (e.g. "-50 120").
-                For farming, use it to point at the field."""
+                For farming, use it to point at the field.
+            rounds(int): Torch placement attempts, 1 to 32, default 6. Each attempt places at
+                most one torch; blocked positions are skipped, so this is an upper limit.
+            spacing(int): Blocks between torch attempts, 3 to 32, default 8.
+            direction(string): Torch route: east, west, south or north; default east.
+                These route options apply only to torch. They do not disable block breaking."""
         if (deny := self._guard(event)):
             return deny
         if not self._cfg("enable_mc_task", True):
@@ -1666,6 +1673,17 @@ class McBodyPlugin(Star):
         if not name:
             return "要派哪件事？现在能派的有：\n" + render.describe_catalog(self.tasks.catalog())
         params: dict = {}
+        if name == "torch":
+            heading = str(direction or "").strip().lower()
+            if (type(rounds) is not int or not 1 <= rounds <= 32
+                    or type(spacing) is not int or not 3 <= spacing <= 32
+                    or heading not in ("east", "west", "south", "north")):
+                return render.fail(
+                    render.Kind.BAD_ARGUMENT, "照明参数不合法，未启动或更换任务",
+                    detail="rounds 必须是 1–32 的整数，spacing 必须是 3–32 的整数，"
+                           "direction 必须是 east/west/south/north",
+                )
+            params.update(rounds=rounds, spacing=spacing, dir=heading)
         # at = "x z"。解析失败就忽略 —— 任务自己会退化成"就地干"。
         parts = str(at or "").replace(",", " ").split()
         if len(parts) >= 2:

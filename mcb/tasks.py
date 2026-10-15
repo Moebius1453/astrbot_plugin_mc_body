@@ -287,14 +287,12 @@ async def _step_hold_torch(ctx: TaskContext) -> str | None:
 
 
 async def _step_light_along(ctx: TaskContext) -> str | None:
-    """沿 +X 方向走，路边隔一段插一根火把。
-
-    注意： 方向写死 +X 是刻意的 v1 取舍 —— 挑方向要读朝向，而朝向那套还没接。
-    想改方向就传 dir 参数（目前只认 x 轴正负）。
-    """
+    """按指定方向与间距尝试放置火把，次数包含被阻挡的位置。"""
     rounds = max(1, int(ctx.params.get("rounds") or 6))
     spacing = max(3, int(ctx.params.get("spacing") or 8))
-    sign = -1 if str(ctx.params.get("dir") or "+x").lower() in ("-x", "west") else 1
+    heading = str(ctx.params.get("dir") or "east").lower()
+    dx, dz = {"east": (1, 0), "west": (-1, 0), "south": (0, 1),
+              "north": (0, -1), "+x": (1, 0), "-x": (-1, 0)}[heading]
     tid = ctx.data.get("torch")
 
     placed = 0
@@ -309,8 +307,8 @@ async def _step_light_along(ctx: TaskContext) -> str | None:
             break
         st = await ctx.state()
         try:
-            nx = float(st["x"]) + sign * spacing
-            nz = float(st["z"])
+            nx = float(st["x"]) + dx * spacing
+            nz = float(st["z"]) + dz * spacing
         except (KeyError, TypeError, ValueError):
             break
         await ctx.goto(nx, nz, timeout=45)

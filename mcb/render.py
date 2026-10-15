@@ -705,7 +705,7 @@ def _num(value, fmt: str = "g") -> str:
 def state_packet(data: dict, stance: str = "defend", work: dict | None = None,
                  journal=None, places=None, chat=None, *, log_lines: int = 4,
                  wiring: bool = True, instincts: str = "", hold: str = "",
-                 hunt: str = "") -> str:
+                 hunt: str = "", wander: str = "") -> str:
     """紧凑的状态数据包 —— 纯数据，给白当处境感知用。
 
     形如：
@@ -781,6 +781,8 @@ def state_packet(data: dict, stance: str = "defend", work: dict | None = None,
     # 只有真在追的时候才有这个字段，平时不占字数（见 hunt.py 的 render）。
     if hunt:
         act.append(hunt)
+    if wander:
+        act.append(wander)
     lines.append("[mc:act] " + " | ".join(act))
     if hold:
         lines.append(hold)
