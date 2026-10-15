@@ -1,42 +1,16 @@
-"""熟度 —— 她什么时候该自己醒一轮。
-
-## 抄什么（Numen EventQueue.ripeness，依据 docs\\21 §四 / §7.1.1）
-
-三种理由之一就开一轮，按顺序判：
-
-    1 URGENT      有急件                  -> 立刻
-    2 ENOUGH      叫醒她的条目攒够 N 条    -> N 就是档位
-    3 LONG_ENOUGH 最老那条躺够 60000*N^2/3 毫秒
-                                          1 档约 20 秒 · 3 档 3 分钟 · 10 档约 33 分钟
-
-三条用的是**同一段条目**（还没交出去的那些），所以熟了开出来的那一轮一定取得到东西。
-
-## 我们加的那条总闸：主人在线
-
-用户 2026-10-11 定："进出服务器来裁定这个不停跑的进程应不应该关掉。"
+r"""## 抄什么（Numen EventQueue.ripeness，依据 docs\21 §四 / §7.1.1）
 
 这条不是照抄，是我们自己的立场，因为我们的定位是**陪玩**不是自主同伴
-（docs\\21 §7.1.1：Numen 的纯计时判据成立的前提是"她自己在玩"）。
+（docs\21 §7.1.1：Numen 的纯计时判据成立的前提是"她自己在玩"）。
 "用户不在场，她醒来说给谁听？" —— 所以主人在线才醒；不在就只进队列，
 等他回来那一下（join 会翻转这道闸）积压的条目自己就熟了。
-
-## 哪条算"叫醒她的条目"
-
-`wakes()` 和 `is_urgent()` 是纯函数，判据只有一条：**"用户此刻不在场、或不关心，
-这次唤醒还有意义吗？"** 没意义就不该醒（docs\\21 §7.1.1 原话）。
 
 - 主人挨打 —— 有具体的事、而且天然"他在场"（他刚挨打）。够格。
   血线以上只是记一笔；掉到 `hurt_hp_line` 以下才算急件（Numen 的 owner_hurt "按血线"）。
 - 她自己挨打 —— **不叫醒**。反射层管这个，而且不花 token。
-  用 LLM 去做反射能做的事，是最贵的错（docs\\21 §7.1.1 那张表）。
+  用 LLM 去做反射能做的事，是最贵的错（docs\21 §7.1.1 那张表）。
 - 死亡 / 进出服 —— 主人那几条够格；她自己的死亡记下但不急。
-- 背包变动 / 权限拒绝 / 出手 —— 不叫醒，攒着等下次有人叫她时一起带上。
-
-## 冷却
-
-急件也不许连续炸。`cooldown` 秒内已经醒过就不再醒 —— 否则主人在怪堆里，
-每一击都是一轮 agent。
-"""
+- 背包变动 / 权限拒绝 / 出手 —— 不叫醒，攒着等下次有人叫她时一起带上。"""
 
 from __future__ import annotations
 
@@ -45,29 +19,23 @@ from dataclasses import dataclass
 
 from astrbot.api import logger
 
-# 主人挨打掉到这个血线以下才算急件
 DEFAULT_HURT_HP_LINE = 8.0
 
 # 默认档位。和 Numen 一样是 3（≈ 攒 3 条或等 3 分钟）
 DEFAULT_LEVEL = 3
 
-# 队列上限。满了丢最老的**非急件**；全是急件就丢最老的。丢了要记账。
+# 队列满时优先丢非急件，并报告丢弃数。
 KEEP = 40
 
 
 def wait_seconds(level: int) -> float:
-    """这一档"最老一条躺够多久"就开一轮。抄 Numen：60000*N^2/3 毫秒。"""
+    r"""这一档"最老一条躺够多久"就开一轮。抄 Numen：60000*N^2/3 毫秒。"""
     lv = max(1, min(10, int(level)))
     return 60000.0 * lv * lv / 3.0 / 1000.0
 
 
 def wakes(kind: str, victim: str, owner: str, char: str) -> bool:
-    """这一条算不算"叫醒她的条目"（只有这些参与熟度）。
-
-    注意： 判的是 **victim** —— "谁遭了这件事"，不是"谁引起的"。
-        hurt 事件的 who 是打人的那个（可能是僵尸），victim 才是挨打的人。
-        两个混了的话，"主人挨打"会被判成"僵尸挨打"。
-    """
+    r"""victim 是受害者；who 是引发者，不能混用。"""
     if kind == "hurt":
         return bool(owner) and victim == owner
     if kind == "death":
@@ -79,14 +47,11 @@ def wakes(kind: str, victim: str, owner: str, char: str) -> bool:
 
 def is_urgent(kind: str, victim: str, hp, owner: str, char: str,
               hurt_hp_line: float = DEFAULT_HURT_HP_LINE) -> bool:
-    """急件 = 立刻叫醒她，不看熟度。"""
     if kind == "hurt":
         if not owner or victim != owner:
             return False
-        # 血线以上只是记一笔 —— 挨一下就叫醒会把 token 烧在"哦你被打了"上
         return isinstance(hp, (int, float)) and float(hp) <= float(hurt_hp_line)
     if kind == "death":
-        # 只有主人死了算急件；她自己死了解不开（死着不能动），记下就行
         return bool(owner) and victim == owner
     return False
 
@@ -94,15 +59,14 @@ def is_urgent(kind: str, victim: str, hp, owner: str, char: str,
 @dataclass
 class Waker:
     kind: str
-    victim: str        # 谁遭了这件事（熟度判的就是它）
-    who: str           # 谁引起的（只用来显示，比如"僵尸"）
+    victim: str        
+    who: str           
     text: str
     at: float
     urgent: bool = False
 
 
 class RipenessDesk:
-    """攒着"叫醒她的条目"，按熟度决定什么时候开一轮。"""
 
     def __init__(self, *, level: int = DEFAULT_LEVEL, owner_name: str = "",
                  char_name: str = "Nanako", hurt_hp_line: float = DEFAULT_HURT_HP_LINE,
@@ -117,31 +81,22 @@ class RipenessDesk:
         self._pending: list[Waker] = []
         self._owner_online = False
         self._last_wake = 0.0
-        self._dropped = 0           # 被挤掉的条数，要记账
+        self._dropped = 0           
 
-    # ---- 状态 -----------------------------------------------------------
 
     def note_owner(self, online: bool) -> None:
-        """主人上下线。这就是那道总闸 —— 用户 2026-10-11 定的。"""
         self._owner_online = bool(online)
 
     @property
     def owner_online(self) -> bool:
         return self._owner_online
 
-    # ---- 收条目 ---------------------------------------------------------
 
     def add(self, kind: str, victim: str, who: str, text: str, *,
             hp=None, at: float | None = None) -> bool:
-        """记一条事件。返回"它够不够格叫醒她"（不管此刻醒不醒得了）。
-
-        victim = 谁遭了这件事（挨打的 / 死的 / 进服的那个）；
-        who    = 谁引起的（打人的那个；进服/退服时和 victim 一样）。
-        """
         if not wakes(kind, victim, self.owner_name, self.char_name):
             return False
         if kind == "join" and victim == self.owner_name:
-            # 主人回来了 —— 开闸。积压的条目马上会因为 LONG_ENOUGH 自己熟
             self.note_owner(True)
         if kind == "leave" and victim == self.owner_name:
             self.note_owner(False)
@@ -156,22 +111,19 @@ class RipenessDesk:
 
     def _trim(self) -> None:
         while len(self._pending) > self.keep:
-            # 先丢最老的非急件；全是急件才丢最老的
             idx = next((i for i, w in enumerate(self._pending) if not w.urgent), 0)
             self._pending.pop(idx)
             self._dropped += 1
 
-    # ---- 判熟 -----------------------------------------------------------
 
     def why(self, now: float | None = None) -> str | None:
-        """熟了返回理由（'urgent' / 'enough' / 'long_enough'），没熟返回 None。"""
         if not self._owner_online:
             return None
         if not self._pending:
             return None
         t = time.monotonic() if now is None else float(now)
         if any(w.urgent for w in self._pending):
-            # 急件也要过冷却 —— 否则主人在怪堆里，每一击都是一轮 agent
+            # 急件也受冷却，防止每次受击触发一轮模型。
             if self.cooldown and (t - self._last_wake) < self.cooldown:
                 return None
             return "urgent"
@@ -184,21 +136,15 @@ class RipenessDesk:
             return "long_enough"
         return None
 
-    # ---- 取走 -----------------------------------------------------------
 
     def take(self) -> list[Waker]:
-        """把攒着的条目全取走（取走即清）。"""
         out = self._pending
         self._pending = []
         self.note_turn()
         return out
 
     def note_turn(self) -> None:
-        """她刚跑过一轮（不管是被点名还是被事件叫醒）—— 冷却从这一刻起算。
-
-        必须两条路都记：只记事件唤醒的话，被点名刚跑完一轮、下一个急件立刻又开一轮，
-        冷却形同虚设。
-        """
+        r"""点名与事件唤醒都要重置冷却，避免连续开轮。"""
         self._last_wake = time.monotonic()
 
     def dropped(self) -> int:
@@ -209,7 +155,6 @@ class RipenessDesk:
         return n
 
     def render(self) -> str:
-        """一行摘要，给状态包看。只摆事实。"""
         if not self._owner_online:
             return f"ripeness=owner-offline(queued {len(self._pending)})"
         why = self.why()
@@ -223,7 +168,6 @@ class RipenessDesk:
 
 
 def render_prompt(entries: list[Waker], dropped: int = 0) -> str:
-    """把攒着的事件拼成给她的那一段（纯函数，好单测）。"""
     lines = [
         "[mc:events] 游戏世界里发生了这些事（是游戏里的事，与用户现实处境无关）：",
         "",

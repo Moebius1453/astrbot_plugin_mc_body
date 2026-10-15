@@ -1,26 +1,10 @@
-"""权限层：唯一裁决口 —— 「这个动作能不能改世界」。
-
-抄 Numen 的三样（依据 docs\\22）：事实（这一格是谁放的）、唯一裁决口（Gate.decide）、
+r"""抄 Numen 的三样（依据 docs\22）：事实（这一格是谁放的）、唯一裁决口（Gate.decide）、
 规则是数据（Rule / RuleSet）。身体层一行不抄。
 
-分工定死（docs\\22 必答一）：
-    服务端只回答事实 —— 这一格是谁放的（桥命令 mcb placed）。
-    插件只回答裁决 —— 这个动作能不能做（本模块）。
-裁决不写在服务端 tick 里，因为"去问主人"要挂起等待，那不是 tick 里能做的事。
-
-注意： 别和 main.py 的 _guard/_authorize 混为一谈（docs\\22 §1 第 9 行）：
-    _guard 管的是"谁有资格下命令"（发送者白名单）；
-    本模块管的是"这个动作能不能改世界"。
-    并列两道门，分开命名、分开日志。
-
-注意： 我们做到的粒度比 Numen 粗一档，这是承认的差距（docs\\22 §3 第 5 条）：
+注意： 我们做到的粒度比 Numen 粗一档，这是承认的差距（docs\22 §3 第 5 条）：
     它插桩在每一格挖掘的落点上；我们挖靠 Baritone，插不进去。
     逐格破坏的裁决仍在服务端 BlockEvents.broken 里（已部署、已实测），
-    本模块管的是"派发工具之前"这一层。两层不重复，是纵深。
-
-这个模块是纯的：不碰网络、不碰磁盘（load_owner_rules 除外）、不 import 插件其它部分 ——
-所以能离线单测（plugin-check\\check.py 第 17 节）。
-"""
+    本模块管的是"派发工具之前"这一层。两层不重复，是纵深。"""
 
 from __future__ import annotations
 
@@ -28,33 +12,26 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
-# ---- 模式 -----------------------------------------------------------
 
 
 class Mode:
-    """每个同伴一个，主人设。抄 Numen Mode。"""
+    r"""每个同伴一个，主人设。抄 Numen Mode。"""
 
-    ASK = "ask"          # 走规则表（默认）
-    BYPASS = "bypass"    # 全放行：单机不想被打扰时用
-    OBSERVE = "observe"  # 只看不动：拒绝一切改世界的动作，等于 plan mode
+    ASK = "ask"          
+    BYPASS = "bypass"    
+    OBSERVE = "observe"  
 
     ALL = (ASK, BYPASS, OBSERVE)
 
     @staticmethod
     def by_name(name: str) -> str:
-        """认不出就回 ASK。注意： 别改成"认不出回 BYPASS" —— 配错一个字母就等于全放行。"""
         low = str(name or "").strip().lower()
         return low if low in Mode.ALL else Mode.ASK
 
 
-# ---- 动作 -----------------------------------------------------------
 
 
 class Kind:
-    """动作的动词。只留我们真有的四个（docs\\22 §1 第 2 行）。
-
-    use_block 并进 place 了；drop / command 我们没有对应的工具，砍掉。
-    """
 
     BREAK = "break"
     PLACE = "place"
@@ -70,27 +47,20 @@ class Action:
 
     kind: str
     pos: tuple[int, int, int] | None = None
-    # 目标格上的方块注册名（break / take 看它）
     block: str | None = None
-    # 手上的东西（place 看它）—— 服务端给的是注册名，不是显示名
     item: str | None = None
-    # 目标实体的 uuid（attack 看它）
     entity: str | None = None
 
     def subject_id(self) -> str | None:
-        """规则里写种类 id（minecraft:chest）时认的那个 id。
-
-        读不到的返回 None —— 别拿"读不到"当"不是它"，那会让 allow 行误命中。
-        """
+        r"""未知返回 None，避免 allow 误命中。"""
         if self.kind in (Kind.BREAK, Kind.TAKE):
             return self.block
         if self.kind == Kind.PLACE:
             return self.item
-        # ATTACK 要认的是实体种类，我们这一版没有读取通道（docs\\22 §5 未核实项）
+        # ATTACK 尚无实体种类读取通道。
         return None
 
 
-# ---- 事实 -----------------------------------------------------------
 
 
 @dataclass
@@ -101,32 +71,23 @@ class Facts:
     信号函数再按"哪种答案更保守"决定拿 None 怎么办。
     """
 
-    actor: str = ""                    # 她自己的 uuid（服务端给的 entity.uuid）
+    actor: str = ""                    
     pos: tuple[int, int, int] | None = None
     dim: str = ""
-    block: str | None = None           # 目标格上的方块注册名
-    placed_by: str | None = None       # 这一格的放置记录记的是谁（uuid）
-    placed_name: str = ""              # 记的那个人的名字（给她看）
-    block_entity: bool = False         # 这一格是不是带方块实体（容器/设施）
-    contents: bool | None = None       # 容器里有没有东西（None = 没通道读，按"有"算）
-    near_placed: bool | None = None    # 附近有没有别人放的方块（None = 没通道读，按"有"算）
-    entity_owned: bool | None = None   # 目标实体有没有主人
-    entity_named: bool | None = None   # 目标实体有没有名字
+    block: str | None = None           
+    placed_by: str | None = None       
+    placed_name: str = ""              
+    block_entity: bool = False         
+    contents: bool | None = None       # 内容未知按有内容处理。
+    near_placed: bool | None = None    # 邻域未知按有放置处理。
+    entity_owned: bool | None = None   
+    entity_named: bool | None = None   
     entity_villager: bool | None = None
     entity_hostile: bool | None = None
 
     @classmethod
     def from_placed_reply(cls, reply: dict, actor: str = "") -> "Facts":
-        """把桥命令 mcb placed 的回执翻成事实。
-
-        回执形状（服务端 mcbPlacedFact）：pos / dim / block / placed / blockEntity / actor。
-        actor 是"她自己"的 uuid —— self_placed 那个信号靠它把"我放的"和"别人放的"分开。
-        旧版服务端没这个字段时退回外面传进来的 actor（拿不到就是空串：self_placed 恒不成立，
-        裁决会偏保守，不会偏放行）。
-
-        placed 为 None = 这一格没有放置记录。它有两种意思，别混：
-            真没人放过（天然方块），或者放过但那格后来被换掉了（服务端读到 block 对不上会清记录）。
-        """
+        r"""placed=None 既可能天然，也可能旧记录因方块变化被清理。"""
         if not isinstance(reply, dict):
             return cls(actor=actor)
         raw_pos = reply.get("pos")
@@ -154,14 +115,7 @@ class Facts:
 
     @classmethod
     def from_attack_reply(cls, reply: dict, actor: str = "") -> "Facts":
-        """把桥命令 mcb attackTarget 的回执翻成事实（准星指着的那只实体）。
-
-        关键是别把"不是可驯服的实体"和"读不到"混成一件事：
-            ownerVia == "absent"  ->  这类实体没有主人这个概念，确定没主人（owned=False）；
-            ownerVia 有值但 owner 空 ->  确定没主人；
-            ownerVia 空            ->  读不到，留 None（信号按"有"算 -> 会去问）。
-        同理 custom / villager 为 null 就是读不到。
-        """
+        r"""ownerVia=absent 表示无主人概念；未读到 ownerVia 则未知。"""
         if not isinstance(reply, dict):
             return cls(actor=actor)
         owner_via = str(reply.get("ownerVia") or "")
@@ -181,14 +135,7 @@ class Facts:
         )
 
 
-# ---- 信号 -----------------------------------------------------------
-#
 # 每个信号只回答一个通用问题、各自独立、无状态（抄 Numen Signals 的立意）。
-# 不按方块或生物种类枚举 —— "玩家放的 / 带方块实体 / 有主人 / 有名字"这几个信号
-# 覆盖原版和任何模组，不用一个模组一个模组适配。
-#
-# "读不到"取哪个值，判据只有一条：取会让裁决更保守的那个。
-# 也就是宁可多问一次主人，也别悄悄放行。
 
 
 @dataclass(frozen=True)
@@ -196,7 +143,7 @@ class Signal:
     name: str
     label: str
     irreversible: bool
-    test: object  # (Action, Facts) -> bool
+    test: object  
 
 
 def _placed(a: Action, f: Facts) -> bool:
@@ -219,12 +166,12 @@ def _contents(a: Action, f: Facts) -> bool:
 
 
 def _near_placed(a: Action, f: Facts) -> bool:
-    # 读不到（我们还没有邻域查询）按"有"算 —— 只影响危险物品那一行
+    # 邻域无读取通道，按有处理。
     return True if f.near_placed is None else bool(f.near_placed)
 
 
 def _owned(a: Action, f: Facts) -> bool:
-    # 读不到按"有主人"算 —— 宁可问一句也别打死谁的宠物
+    # 主人未知按有主人处理。
     return True if f.entity_owned is None else bool(f.entity_owned)
 
 
@@ -269,7 +216,6 @@ SIGNALS: dict[str, Signal] = {
 }
 
 
-# ---- 裁决 -----------------------------------------------------------
 
 
 class VerdictKind:
@@ -311,15 +257,8 @@ class Verdict:
 ALLOWED = Verdict(VerdictKind.ALLOW)
 
 
-# ---- 规则 -----------------------------------------------------------
-#
 # 一行字符串：动作(项 & 项 & !项)，与 Claude Code 的 Tool(specifier) 同形（抄 Numen Rule）。
-# 全仓只在这一个类里解析 —— 别在调用方自己 split。
-#
 # 注意： 与 Numen 的两处差异，都是"我们没有那个通道"，不是偷懒：
-#     1. 标签项（#minecraft:beds）不支持 —— 我们读不到方块的标签，解析时直接报教学式错误。
-#        写一个永远不会命中的规则，比报错更糟（那正是"看着有、实际没有"）。
-#     2. 指令项（command(...)）不支持 —— 我们没有向 LLM 暴露任意游戏指令的工具。
 
 
 class RuleError(ValueError):
@@ -328,7 +267,7 @@ class RuleError(ValueError):
 
 @dataclass(frozen=True)
 class _Term:
-    type: str          # any / signal / id / entity
+    type: str          
     negated: bool
     signal: Signal | None = None
     id: str | None = None
@@ -359,7 +298,7 @@ class _Term:
 @dataclass(frozen=True)
 class Rule:
     text: str
-    kind: str | None            # None = 任何动作
+    kind: str | None            
     terms: tuple[_Term, ...]
 
     @staticmethod
@@ -391,7 +330,6 @@ class Rule:
         return all(t.matches(a, f) for t in self.terms)
 
     def irreversible(self) -> bool:
-        """命中这条规则的动作撤不回（它的正项里有撤不回的信号）。"""
         return any(
             not t.negated and t.type == "signal" and t.signal is not None
             and t.signal.irreversible
@@ -399,7 +337,6 @@ class Rule:
         )
 
     def describe(self) -> str:
-        """命中时给回执的短语：各正项的自述。"""
         parts = [t.describe() for t in self.terms if not t.negated and t.describe()]
         return "，".join(parts) if parts else self.text
 
@@ -437,52 +374,33 @@ def _parse_term(raw: str, rule: str) -> _Term:
     return _Term("signal", negated, signal=signal, text=body)
 
 
-# ---- 规则表 ---------------------------------------------------------
-#
 # 一层三张表：deny / allow / ask，层内顺序 deny -> allow -> ask（抄 Numen RuleSet）。
-# allow 排在 ask 前面，是为了以后"允许并记住"抠出来的细 allow 行能轮得到。
-#
-# 注意： 出厂 allow 行必须写得比 ask 行窄 —— 自然方块那一行要把有人放过的、
-#     带方块实体的排除在外，它们才轮得到 ask 表。改这几行之前先想清楚这件事。
+# allow 先于 ask，供窄范围授权命中。
+# 出厂 allow 必须排除受保护对象，否则会抢先于 ask 放行。
 
 
 FACTORY_ALLOW = (
-    # 挖自然方块：谁都没放过、她自己也没放过、没有方块实体
     "break(!placed & !self_placed & !block_entity)",
-    # 拆她自己搭的：垫的柱子、搭的桥。里面装着东西的容器除外，那个走 ask
     "break(self_placed & !contents)",
-    # 放不危险的东西
     "place(!hazard_item)",
-    # 打没主人、没名字、不是村民的（敌对生物与野生动物）
     "attack(!owned & !named & !villager)",
 )
 
 FACTORY_ASK = (
-    # 装着东西的容器先于通用的"别人放的" —— 更具体的在前
     "break(self_placed & contents)",
     "break(placed)",
     "break(block_entity)",
-    # 攻击有主的、有名字的、村民
     "attack(owned)",
     "attack(named)",
     "attack(villager)",
-    # 危险物品一律问（岩浆/打火石/火焰弹/TNT/水桶）。
-    # 注意： 这里没写 near_placed，理由见下面那段注释。
     "place(hazard_item)",
     # 注意： 从容器里拿东西一律问 —— 这一条是我们和 Numen 立场不同的地方。
     #     Numen 把 take(*) 放进出厂 allow（它的理由是"相当于 Claude Code 读项目文件"）。
-    #     那是它的立场，不是我们的：对我们来说"她翻箱子把东西拿走"恰恰是要防的。
-    #     抄机制，不抄这条立场（docs\\22 §3 第 2 条）。
     "take(*)",
 )
 
 # 注意： 出厂表里为什么没有 near_placed（Numen 用的是 place(hazard_item & near_placed)）：
-#     我们还没有读邻域的通道，near_placed 只能按"有"算。照抄那一条的话命中它的永远是它，
-#     回执就会写成"附近有别人放的方块" —— 那是在陈述一个我们根本没查过的事实
-#     （"缺失不等于假"那条硬约束）。
-#     所以这里直接写 place(hazard_item)：裁决一样是问，但理由说的是真的。
 #     等哪天有了邻域查询，再照 Numen 收窄成"附近没有别人的东西才放行"。
-#     near_placed 这个信号本身留着 —— 主人自己那层规则可以直接用它。
 
 
 @dataclass
@@ -526,12 +444,7 @@ def _first_match(table: tuple[Rule, ...], a: Action, f: Facts) -> Rule | None:
 
 
 def load_owner_rules(path: str | Path) -> RuleSet:
-    """读主人自己写的那一层。文件不存在或读不动就当没写过（EMPTY），不抛。
-
-    形状：{"deny": [...], "allow": [...], "ask": [...]} —— 三张表都可以缺。
-    写错的规则会抛 RuleError，由调用方决定怎么办（别静默吞掉：一条永远不会命中的规则
-    比一个报错更糟）。
-    """
+    r"""规则写错必须抛 RuleError，不静默当空规则。"""
     try:
         text = Path(path).read_text(encoding="utf-8")
     except OSError:
@@ -546,7 +459,6 @@ def load_owner_rules(path: str | Path) -> RuleSet:
     )
 
 
-# ---- 唯一裁决口 -----------------------------------------------------
 
 
 @dataclass

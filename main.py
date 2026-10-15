@@ -1,20 +1,4 @@
-"""让白（Minecraft 里的 Nanako）长出手脚。
-
-数据流：
-    QQ ── ->  白 ── ->  本插件的 @filter.llm_tool ── ->  RCON 隧道 ── ->  R820 服务端桥
-                                                              ── ->  Nanako 的客户端
-                                                              ── ->  Baritone
-
-这一版就这些工具，全部走已经跑通的客户端动作（say / baritone / stop），
-不需要改客户端、不需要重启 Nanako 的客户端。
-
-注意： 动作类工具只能报告"已下发"，不能报告"完成了"。 服务端只知道动作发给了她的客户端；
-客户端到底执行到哪一步，得靠 mc_state 复核坐标。所以动作类工具的返回值里都带着
-"过一会儿用 mc_state 确认"的提示 —— 她也得像人一样先做、再去看结果。
-
-授权：默认拒绝。必须在插件配置的 allowed_sender_ids 里列出允许的发送者 ID。
-这是刻意的 —— 这组工具能让一个角色在世界里走动、说话、挖东西。
-"""
+r"""动作下发不等于完成；授权默认拒绝。"""
 
 from __future__ import annotations
 
@@ -52,68 +36,32 @@ from .mcb import render
 
 PLUGIN_NAME = "mc_body"
 
-# ---- 自主心跳（没人叫她的时候自己醒来）--------------------------------------
-#
-# 注意： 这会花钱 —— 每次唤醒都是一整轮 agent。见 _start_self_loop 的说明。
+# 每次自主唤醒都会运行完整 agent，产生模型费用。
 SELF_LOOP_JOB = "mc_body_self_loop"
 
-# 唤醒时喂给她的那条"给未来自己的指令"。
-#
-# 注意： 它是她的输入，会以 user 消息的身份进会话 —— 所以：
-#   · 前缀用 [mc:alert]，按 docs/12 §1.4 那条规范（从游戏来的数据必须自报家门）
-#   · 话要短、要中性，写清"该干什么"和"可以不干" ——
-#     不给她"必须做点什么"的压力，否则她会为了交差而瞎折腾（还白烧 token）。
 SELF_LOOP_NOTE = (
     "[mc:alert] 自主心跳：现在没人叫你。看一眼自己现在的处境"
     "（mc_state 看身体、mc_around 看周围），想接着做什么就去做；"
     "**没事可做就什么都别做，也别发消息** —— 沉默是允许的，不用每次都汇报。"
 )
 
-# Minecraft 的世界边界
 COORD_LIMIT = 30_000_000
 PLAYER_NAME_RE = re.compile(r"^[A-Za-z0-9_]{1,16}$")
 MAX_SAY_LEN = 200
 MAX_RAW_LEN = 200
 
 # ---- 重点： 抄 Numen 的纪律：Baritone 原始命令走白名单，不走黑名单 ------------
-#
-# 重要： 这是我们现在最大的安全敞口（2026-10-10 核实）：
-#    mc_baritone_raw 把模型给的字符串原样下发，客户端
-#    （bridge/client/mcbridge.js 的 action === 'baritone'）直接
-#    getCommandManager().execute(arg)，零检查。
-#     ->  模型出一条 build / clearArea 就能一次抹掉一片建筑。
-#
-# 注意： 白名单而不是黑名单 —— 黑名单死在"没想到"，白名单死在"不让你做"。
-#
-# 注意： mine 必须留着：它是她现在唯一的挖矿方式（我们还没 mc_mine）。
-#    挖矿那边的粒度保护在客户端：Baritone 的 blocksToDisallowBreaking
-#    （一次设置，护住箱子/熔炉这类"里面装着东西的"）—— 见 docs\24。
 BARITONE_VERBS = frozenset({
-    # 移动
     "goto", "follow", "come", "thisway", "explore", "path", "surface",
-    # 干活（mine 是唯一允许的"改世界"动词，理由见上）
     "mine", "farm",
-    # 控制
     "stop", "cancel", "pause", "resume", "proc", "axis", "version", "help",
 })
 
-# ---- 技能（Skill）正文读取 ---------------------------------------------------
-#
-# 注意： AstrBot 自己已经有完整的 skill 机制（astrbot/core/skills/skill_manager.py）：
-#    每轮把 ## Skills 索引（名字 + 描述 + SKILL.md 路径）拼进系统提示词，
-#    并且自动扫描 data/plugins/*/skills/<名>/SKILL.md —— 所以我们只要把技能
-#    放进插件目录下的 skills/ 就行，不用自己造一套。
-#
-# 重要： 但它有个洞：提示词里说的是"运行一条 shell 命令去读"（cat / type），
-#    而那个文件工具被 provider_settings.computer_use_runtime ∈ {local, sandbox} 门控
-#    （astrbot/core/tools/computer_tools/fs.py:69）—— 我们的配置是 "none"，
-#    => 她看得见技能索引，读不到技能正文。（mc_skill 补的就是这一环。）
-#
-# 注意： 为什么不直接把 computer_use_runtime 改成 local：那一开就是
-#    读/写/编辑/grep 整个本机文件系统。为了读一个 SKILL.md 不值得。
+# computer_use_runtime=none 时框架文件工具不可用，由 mc_skill 读取正文。
+# 不开 local 文件工具，避免为读技能开放整个文件系统。
 SKILLS_DIR = Path(__file__).resolve().parent / "skills"
 SKILL_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
-MAX_SKILL_CHARS = 24000   # SKILL.md 是给人读的说明书，超长的多半是写错了
+MAX_SKILL_CHARS = 24000   
 
 
 @register(
@@ -142,19 +90,16 @@ class McBodyPlugin(Star):
             self_name=str(self._cfg("character_name", "Nanako")),
             state_path=Path(__file__).resolve().parent / "data" / "uplink_state.json",
         )
-        # 状态日志 —— 白「记得自己刚才干了什么」的那本账（见 mcb/journal.py）。
-        # 注意： 存内存（用户 2026-10-09 拍板）：插件热重载会丢，任务本身也一样。
+        # 日志仅存内存，重载丢失。
         self.journal = Journal(capacity=int(self._cfg("journal_capacity", 400)))
 
-        # 地点簿 —— 「哪儿有什么、我在那儿干过什么」（见 mcb/places.py）。
-        # 注意： 这个写磁盘：跟日志不一样，地图丢了代价太大。
+        # 地点簿持久化，避免重载丢失地图。
         places_path = str(self._cfg("places_file", "") or "").strip()
         if not places_path:
             places_path = str(Path(__file__).resolve().parent / "data" / "places.json")
         self.places = PlaceBook(places_path)
 
-        # 眼睛 —— 截图  ->  识图转述成文字（见 mcb/sight.py）。
-        # 注意： 图片永远不进白的大脑：走"截图  ->  API  ->  文字  ->  上下文"（用户 2026-10-08 定的）。
+        # 图片只交视觉 provider，主会话只收转述文字。
         self.sight = Sight(
             ssh_host=str(self._cfg("client_ssh_host", "")),
             container=str(self._cfg("client_container", "mc-brain")),
@@ -164,29 +109,18 @@ class McBodyPlugin(Star):
             vision_prompt=str(self._cfg("vision_prompt", "")),
         )
 
-        # 任务层 —— 把多步行为串成一个目标（见 mcb/tasks.py）
         self.io = ContainerIO(self.bridge)
         self.tasks = TaskRunner(self.bridge, self.journal, io=self.io)
 
-        # 仲裁层 —— 谁在写 walk 通道（见 mcb/arbiter.py）。
-        # 注意： 从这里开始，任何模块都不许再直接调 mcb baritone / mcb stop。
-        #    反射要保命、任务在走路、用户喊她过来 —— 三方都只能"声明"，
-        #    由这层按优先级（反射 > 用户 > 任务）决定谁生效。
-        #    这条是"解耦功能配合不好"的根上解法（main/docs/16）。
+        # 所有 walk 写入必须经过仲裁，避免互相覆盖路线。
         self.arbiter = Arbiter(self._call)
         self.tasks.bind_arbiter(self.arbiter)
 
-        # 事件流 —— 「刚才都发生了什么」（挨打/死亡/进出服/背包变动）。
-        # 注意： 和 uplink.py 的聊天分工不同、两张表：那张管"人说的话"，
-        #    这张管"聊天以外的事"。合表就是同一件事记两遍（见 mcb/events.py 头部）。
         self.events = EventFeed(self.bridge, self.journal,
                                 on_permission=self._permission_denied,
                                 on_event=self._on_world_event,
                                 on_tick=self._maybe_wake_by_events)
 
-        # 熟度 —— 她什么时候该自己醒一轮（见 mcb/ripeness.py）。
-        # 用户 2026-10-11 定的方向：身体层自己动（闲逛）+ 筛选过的状态变化主动发。
-        # 总闸是"主人在线"—— 用户原话"进出服务器来裁定这个不停跑的进程该不该关掉"。
         self.ripeness = RipenessDesk(
             level=int(self._cfg("event_wake_level", 3)),
             owner_name=str(self._cfg("owner_player_name", "") or ""),
@@ -206,25 +140,17 @@ class McBodyPlugin(Star):
             scan_range=int(self._cfg("reflex_scan_range", 24)),
             stance=str(self._cfg("default_stance", "defend")),
             owner_name=str(self._cfg("owner_player_name", "")),
-            # 注意： 代码兜底默认值要和 _conf_schema.json 一致（现在是 auto）。
-            #    auto = 按主人远近自己选（24 格内往他那儿跑，否则慌不择路）。
-            #    一路演化的理由见 docs\17 §九 F：safe 在地下会挑到实心石头里的随机点，
-            #    而 Baritone 的 allowBreak 是开的  ->  她一路把地板凿穿（"抽风挖地板"）。
-            #    但用户也说了 "慌不择路 实际上怪可爱的" —— 所以不是删掉它，
-            #    而是只在主人离得远时才用。
+            # 默认值必须与 _conf_schema.json 一致。
             flee_toward=str(self._cfg("retreat_toward", "auto")),
-            # 战斗期间用快节拍 —— 用户 2026-10-11："打架的时候一秒是很长的。"
             combat_interval=float(self._cfg("reflex_combat_interval_seconds", 0.25)),
             notify=self._notify,
             journal=self.journal,
         )
-        # 反射要能抢占任务（保命 > 干活）。挂起不是停止 —— 事完会自己接着做。
+        # 保命抢占只挂起任务，不取消。
         self.reflex.bind_tasks(self.tasks)
-        # 反射也要走仲裁层（它的 walk 声明优先级最高）
         self.reflex.bind_arbiter(self.arbiter)
 
-        # 闲逛 —— 没人管她的时候她自己动一动（身体层，不花 token）。
-        # 注意： 它没有自己的循环，借反射那 1 秒一次的节拍走（见 mcb/idle.py 的模块注释）。
+        # 闲逛复用反射节拍和状态，不另起循环。
         self.idle = IdleGuard(
             self.bridge,
             self.arbiter,
@@ -236,8 +162,7 @@ class McBodyPlugin(Star):
         )
         self.reflex.bind_idle(self.idle)
 
-        # 主动清怪 —— 去找怪打（和"挨打就还手"那条反射分开，见 mcb/hunt.py 的模块注释）。
-        # 只在 mc_stance 切到 hunt 时工作；走 LEVEL_COMBAT，用户一开口就让路。
+        # 主动追怪走 LEVEL_COMBAT，不能压过用户指令。
         self.hunt = HuntGuard(
             self.bridge,
             self.arbiter,
@@ -245,36 +170,19 @@ class McBodyPlugin(Star):
             journal=self.journal,
         )
         self.reflex.bind_hunt(self.hunt)
-        # 有人跟她说话时：闲逛重算安静计时，熟度重算冷却。
-        # 走路类的指令不用接：它们会占住 walk 通道，闲逛自己让开；
-        # 而"刚聊过"这件事对熟度有意义 —— 刚说完话不该马上又自己醒。
         self.uplink.on_activity = self._on_user_activity
-        # 通知去重（见 _notify）
         self._last_notify_text = ""
         self._last_notify_at = 0.0
-        # 数她经历了多少次 LLM 请求 —— 用来"每 N 次附一次状态包"（见 inject_body_state）
         self._llm_calls = 0
-        # 游戏公屏的已读游标 —— 和 uplink 的 _last_seq 故意分开：
-        # 那个管"要不要唤醒她"，这个管"她看没看见"，共用一个会互相吃消息。
+        # 聊天已读与唤醒游标独立，避免互相吞消息。
         self._chat_seen_seq = 0
 
     async def _notify(self, facts: str) -> None:
-        """把一个处境事实推到白的会话里（她/用户能看见）。
-
-        注意： 只传事实，不许传句子（用户 2026-10-09 拍板）：
-        > "感知我是没法接受程序文本的。"
-        已完成： food=6/20 food_items=0 ／ 不成立或禁止： 我饿了，但身上没有食物。
-        —— 后者是程序替她写的台词。她想怎么讲是她的事，程序只负责把状态摆出来。
-
-        注意： 而且只给"需要用户知道、需要用户动手"的事用。
-        自动反射的状态翻转（进战/脱战/逃跑/卡住）一律只写状态日志，不许占聊天正文 ——
-        用户明确要求过："这种东西日志里面出现就好了"。
-        """
+        r"""只通知需用户介入的事实；自动反射只记日志。"""
         umo = str(self._cfg("white_session", "") or "")
         if not umo:
             return
 
-        # 去重保险：同一条消息 60 秒内只发一次。防止任何意料之外的重复刷屏。
         now = time.monotonic()
         if facts == self._last_notify_text and (now - self._last_notify_at) < 60:
             logger.info(f"[mc_body] 通知去重（60 秒内已发过同样的）：{facts}")
@@ -285,19 +193,11 @@ class McBodyPlugin(Star):
         from astrbot.core.message.components import Plain
         from astrbot.core.message.message_event_result import MessageChain
 
-        # 注意： 前缀必须是 [mc:...] —— 规范：凡是从 Minecraft 来的数据都带 [mc:*] 标签。
-        #    这样她（和模型）一眼能分清"游戏世界"和"现实对话"，不会把游戏里的下雨
-        #    当成用户现实里在下雨（2026-10-10 实际发生过，见 docs/17 P2）。
+        # Minecraft 数据必须带 [mc:*]，防止混入现实处境。
         await self.context.send_message(umo, MessageChain([Plain(f"[mc:alert] {facts}")]))
 
     async def _held_stack(self) -> tuple[str | None, int | None]:
-        """手上（快捷栏当前格）那个东西是「什么 + 几个」。读不到回 (None, None)。
-
-        返回的 id 是注册名（不是显示名）—— 权限层按注册名判危险物品，
-        显示名跟语言走、对 mod 物品还会返回本地化 key，不能用。
-
-        注意： 空手是 (None, 0)：那是"手上是空的"，不是"读不到"。读不到才是 (None, None)。
-        """
+        r"""注册名用于权限；空手为 (None, 0)，未知为 (None, None)。"""
         data, err = await self._call("mcb inventory")
         if err or not isinstance(data, dict):
             return None, None
@@ -310,7 +210,7 @@ class McBodyPlugin(Star):
             return None, None
         it = hotbar[idx]
         if not isinstance(it, dict):
-            # 注意： 空槽位是 null（不是缺字段）。见下面 _held_count 的说明。
+            # 空槽位是 null，不是缺字段。
             return None, 0
         item_id = str(it.get("id") or "") or None
         try:
@@ -319,27 +219,11 @@ class McBodyPlugin(Star):
             return item_id, None
 
     async def _held_count(self) -> int | None:
-        """手上（快捷栏当前格）那个东西有几个。读不到回 None，不假装是 0。
-
-        用途：mc_use_on 靠"手上的数量少没少"来判定"到底放没放成" ——
-        这是唯一能自动验证的实据（见那个工具里的说明）。
-
-        注意： 2026-10-10 订正（这就是 docs/18 A2 那个"held 对不上"的真因）：
-        老代码拿 data['held'] 去比 hotbar 项里的 slot 字段 ——
-        而那个字段在 hotbar 里压根不存在（服务端只给 main 的项加 slot），
-        于是循环永远匹配不上、恒返回 None  ->  mc_use_on 永远只会说"确认不了"。
-
-        真相：held 是快捷栏的序号（0~8），物品是 hotbar[held]。
-        实测 "held":2.0, "via":"inv.selected" —— 访问器一直是好的，是我们读错了。
-        """
+        r"""held 是快捷栏下标；未知数量返回 None，不冒充 0。"""
         return (await self._held_stack())[1]
 
     async def _menu_snapshot(self) -> dict | None:
-        """取一次"她当前开着的界面"。读不到返回 None（不是空 dict）。
-
-        注意： 索引类的东西（格号）用之前要核身份 —— 快照过期/界面被顶掉就会点错格
-        （docs\\04 坑 13）。
-        """
+        r"""格号依赖菜单身份；过期快照不可复用。"""
         data, err = await self._call("mcb state")
         if err or not isinstance(data, dict):
             return None
@@ -361,24 +245,21 @@ class McBodyPlugin(Star):
             await self.arbiter.reject_walk(token)
         self.journal.add("body", f"[mc:permission] 已终止 {claim.owner} 的对应意图：{detail}")
 
-    # ---- 熟度：她什么时候该自己醒（见 mcb/ripeness.py）------------------
 
     def _on_user_activity(self) -> None:
-        """有人在跟她说话 —— 闲逛重算安静计时，熟度重算冷却。"""
+        r"""重置闲逛安静计时和熟度冷却。"""
         self.idle.note_activity()
         self.ripeness.note_turn()
 
     def _on_world_event(self, raw: dict) -> None:
-        """事件流收到一条新事件 —— 交给熟度桌攒着。同步函数（调用方不 await）。"""
+        r"""同步回调，不可由调用方 await。"""
         if not self._cfg("enable_event_wake", True):
             return
         kind = str(raw.get("kind") or "")
         if not kind:
             return
         who = str(raw.get("who") or "")
-        # 注意： victim 才是"谁遭了这件事"（熟度判的就是它）。
-        #    hurt 的 who 是打人的那个（可能是僵尸），death 的 who 是凶手。
-        #    所以服务端显式带了 victim 字段；进出服那两条 who 就是那个人。
+        # hurt/death 的 victim 是受害者，who 是攻击者。
         victim = str(raw.get("victim") or "")
         if kind in ("join", "leave"):
             victim = victim or who
@@ -388,11 +269,10 @@ class McBodyPlugin(Star):
                           hp=raw.get("hp"))
 
     async def _maybe_wake_by_events(self) -> None:
-        """熟度的心跳：借事件流那个 2 秒一次的节拍走，不另起循环。"""
+        r"""复用事件轮询节拍，不另起循环。"""
         if not self._cfg("enable_event_wake", True):
             return
-        # 第二道闸：她的身体不在线就别叫醒 —— 那一轮 agent 白烧 token。
-        # 注意： 这一道和"主人在线"那道是两回事：主人可能在玩，而她客户端没开。
+        # 主人在线不代表身体在线；身体离线时不唤醒。
         if not self.reflex.online:
             return
         why = self.ripeness.why()
@@ -412,10 +292,7 @@ class McBodyPlugin(Star):
             logger.warning(f"[{PLUGIN_NAME}] 事件唤醒失败：{exc}")
 
     async def _claim_walk_user(self, cmd: str, note: str) -> tuple[dict, str | None]:
-        """用户级地声明 walk 通道。返回值和 _call 同形，方便原地替换。
-
-        注意： 别再直接 mcb baritone ... —— 那会绕过仲裁、把任务/反射的路线踩掉。
-        """
+        r"""用户路线必须经仲裁，不能直接覆盖任务或反射。"""
         await self.arbiter.claim_walk(LEVEL_USER, "llm", cmd, note)
         return {"ok": self.arbiter.last_error is None}, self.arbiter.last_error
 
@@ -466,14 +343,11 @@ class McBodyPlugin(Star):
         """
         if not self._cfg("enable_body_state", True):
             return
-        # 注意： 聊天是"新的就立刻给"，不受 every 节流（用户 2026-10-10）：
-        #    状态晚三轮无所谓（血还在掉），但有人跟你说话晚三轮就蠢了。
-        #    先看有没有新聊天，有就这一轮一定注。
+        # 新聊天不受状态包 every 节流，避免延迟对话。
         chat_lines, has_new_chat = await self._pull_chat()
 
         self._llm_calls += 1
         every = max(1, int(self._cfg("body_state_every", 3)))
-        # 第一次就给 —— 她一开始就该知道自己站在哪、什么状态
         due = (self._llm_calls == 1 or self._llm_calls % every == 0)
         if not due and not has_new_chat:
             return
@@ -487,10 +361,6 @@ class McBodyPlugin(Star):
                     text="[mc:body] offline\n" + render.describe_hold(data)
                 ))
                 return
-            # 注意： 聊天只在她"被唤醒的那一刻"由 uplink 注入是不够的 ——
-            #    实测（2026-10-10）她在 QQ 会说"我听不见游戏聊天"，
-            #    因为那条通路不在她的自我模型里。所以：聊天也当上下文数据包的一部分，
-            #    和 [body]/[log] 一起给，并配一段接线说明（见 render.WIRING_NOTE）。
             packet = render.state_packet(
                 data, self.reflex.stance, self.tasks.status(), self.journal, self.places,
                 chat_lines if has_new_chat else None,
@@ -508,12 +378,7 @@ class McBodyPlugin(Star):
             logger.warning(f"[{PLUGIN_NAME}] 状态注入失败（不影响对话）：{exc}")
 
     async def _pull_chat(self) -> tuple[list[dict], bool]:
-        """拉新的游戏公屏消息。返回 (新行, 有没有新的)。
-
-        注意： 用一个独立的游标 _chat_seen_seq，不复用 uplink 的 _last_seq ——
-        uplink 关心的是"要不要唤醒她"，我们关心的是"她看没看见"，
-        两者语义不同，共用一个游标会互相吃消息。
-        """
+        r"""独立已读游标，避免与唤醒游标互相吞消息。"""
         try:
             data, err = await self._call(f"mcb chat {self._chat_seen_seq}")
             if err:
@@ -531,7 +396,6 @@ class McBodyPlugin(Star):
             self._chat_seen_seq = newest
         return lines, True
 
-    # ---- 生命周期 -------------------------------------------------------
 
     async def initialize(self) -> None:
         if not self.bridge.password:
@@ -559,11 +423,9 @@ class McBodyPlugin(Star):
         else:
             logger.info(f"[{PLUGIN_NAME}] 防御反射已关闭（enable_reflex=false）")
 
-        # 事件流跟着反射一起开关 —— 两者都是"常驻在跑的后台感知"，没必要拆成两个开关
         if self._cfg("enable_reflex", True):
             self.events.start()
 
-        # 自主心跳 —— 默认关，因为它按轮烧 token（见 _start_self_loop）
         if self._cfg("enable_self_loop", False):
             await self._start_self_loop()
         else:
@@ -572,8 +434,7 @@ class McBodyPlugin(Star):
                 "她自己那个 future_task 工具仍然可用"
             )
 
-        # 熟度的总闸要有个初值 —— 之后由 join/leave 事件自己维护。
-        # 只在启动时问这一次；每次判熟都去问就是白花 RCON 往返。
+        # 启动时读取主人在线状态，之后由 join/leave 更新。
         owner = str(self._cfg("owner_player_name", "") or "").strip()
         if owner and self._cfg("enable_event_wake", True):
             data, err = await self._call(f"mcb where {owner}")
@@ -589,7 +450,7 @@ class McBodyPlugin(Star):
         )
 
     async def terminate(self) -> None:
-        # 在途游戏轮收尾前保留任务、反射和桥，避免工具在卸载一半的身体上继续执行。
+        # 在途轮收尾前保留身体组件，避免工具访问半卸载状态。
         await self.events.stop()
         await self.uplink.stop()
         await self._drop_self_loop()
@@ -598,22 +459,10 @@ class McBodyPlugin(Star):
         await self.bridge.close()
         logger.info(f"[{PLUGIN_NAME}] 已卸载，RCON 连接已关闭")
 
-    # ---- 自主心跳 --------------------------------------------------------
-    #
-    # 注意： 这个会花钱，默认关着。
-    #     每次唤醒 = 一整轮 agent（30 个工具描述 + 记忆注入 + 状态包），
-    #     一次几千到上万 token。每 20 分钟醒一次 ≈ 一天 72 轮。
-    #
-    # 机制用的是 AstrBot 原生的 CronJobManager 的 active_agent 任务
-    # （astrbot/core/cron/manager.py:172  ->  _woke_main_agent）——
-    # 它会重新构造事件跑满一轮 agent，并注入 SendMessageToUserTool 让她能开口。
-    # 别自己造轮子（asyncio 定时器伪造唤醒那条路，框架已经替我们做好了）。
-    #
-    # 注意： 另一条免费的路：她自己的 future_task 工具（AstrBot 默认就注入给她了）。
-    #     接线说明里已经交代过。先试那条 —— 她自己排的班比我们替她排的更合身。
+    # 自主心跳每次运行完整 agent，默认关闭。
 
     async def _drop_self_loop(self) -> None:
-        """删掉同名的自主心跳任务。加载和卸载都要调 —— 反复重载不能越积越多。"""
+        r"""加载与卸载均清理同名任务，避免重载叠加。"""
         mgr = getattr(self.context, "cron_manager", None)
         if mgr is None:
             return
@@ -626,7 +475,6 @@ class McBodyPlugin(Star):
             logger.info(f"[{PLUGIN_NAME}] 清理自主心跳时出错（可忽略）：{exc}")
 
     async def _start_self_loop(self) -> None:
-        """注册"没人叫她的时候自己醒来接着玩"的定时任务。失败不影响插件其它部分。"""
         umo = str(self._cfg("white_session", "") or "")
         if not umo:
             logger.warning(
@@ -643,21 +491,20 @@ class McBodyPlugin(Star):
 
         minutes = int(self._cfg("self_loop_minutes", 20) or 20)
         minutes = max(5, min(240, minutes))
-        await self._drop_self_loop()          # 注意： 先删同名的，别越积越多
+        await self._drop_self_loop()          # 重建前删除同名任务，防止重载叠加。
         try:
             await mgr.add_active_job(
                 name=SELF_LOOP_JOB,
                 cron_expression=f"*/{minutes} * * * *",
                 payload={"session": umo, "note": SELF_LOOP_NOTE, "origin": "plugin"},
                 description="自主心跳：没人叫她的时候自己醒来看看该做什么",
-                # 注意： 不带进 DB —— 插件每次加载自己重建，避免她删了插件还留着孤儿任务
+                # 不持久化定时任务，避免卸载留下孤儿。
                 persistent=False,
             )
             logger.info(f"[{PLUGIN_NAME}] 自主心跳已开：每 {minutes} 分钟唤醒一次")
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"[{PLUGIN_NAME}] 自主心跳注册失败：{exc}")
 
-    # ---- 配置与授权 -----------------------------------------------------
 
     def _cfg(self, key: str, default):
         value = self.config.get(key) if hasattr(self.config, "get") else None
@@ -670,14 +517,12 @@ class McBodyPlugin(Star):
         return {str(item).strip() for item in raw if str(item).strip()}
 
     def _wake_keywords(self) -> list[str]:
-        """游戏里出现这些词才算"被点名"，才唤醒白。"""
         raw = self._cfg("wake_keywords", ["Nanako", "白"]) or []
         if isinstance(raw, str):
             raw = raw.replace(",", " ").split()
         return [str(item).strip() for item in raw if str(item).strip()]
 
     def _authorize(self, event: AstrMessageEvent) -> str | None:
-        """返回拒绝理由；None 表示放行。"""
         sender = str(event.get_sender_id())
         allowed = self._allowed_ids()
         if not allowed:
@@ -696,12 +541,6 @@ class McBodyPlugin(Star):
         return None
 
     def _guard(self, event: AstrMessageEvent, *, observe: bool = False) -> str | None:
-        """工具的统一前置检查。返回拒绝理由；None = 放行。
-
-        注意： 每个工具都必须走这里，别自己抄一遍授权逻辑 ——
-        曾经 18 个工具抄了 18 遍，改一个公共行为要动 18 处。
-        要加"逐工具开关"之类的公共检查，只改这一个地方。
-        """
         deny = self._authorize(event)
         if deny:
             return deny
@@ -715,18 +554,10 @@ class McBodyPlugin(Star):
         await self.tasks.stop(quiet=True)
         await self.arbiter.clear_user_and_task()
 
-    # ---- 权限门（这个动作能不能改世界）----------------------------------
-    #
-    # 注意： 和 _guard 是并列的两道门，别合并（docs\22 §1 第 9 行）：
-    #     _guard 管"谁有资格下命令"，这道门管"这个动作能不能改世界"。
-    #     裁决逻辑全在 mcb/permission.py，这里只做"取事实 + 调裁决 + 收场"。
+    # 发送者授权与动作权限是两道独立门。
 
     def _owner_rules(self) -> permission.RuleSet:
-        """主人自己写的那一层规则。没配/读不动就是空层（不抛）。
-
-        注意： 规则写错会抛 RuleError —— 那是配置问题，要吵出来，不能静默吞掉
-        （一条永远不会命中的规则比一个报错更糟）。所以这里只吞"文件不存在"。
-        """
+        r"""缺失可忽略；错误规则必须抛出，不能静默失效。"""
         path = str(self._cfg("permission_rules_file", "") or "").strip()
         if not path:
             return permission.EMPTY
@@ -744,13 +575,7 @@ class McBodyPlugin(Star):
         action: permission.Action,
         facts: permission.Facts | None = None,
     ) -> tuple[permission.Verdict, permission.Facts]:
-        """裁决一个动作。返回 (裁决, 用到的事实)。
-
-        facts 已经拿到就传进来（例如攻击：事实来自 mcb attackTarget，不是 mcb placed）；
-        没传就按 action.pos 去问服务端这一格的放置记录。
-
-        事实读不到时按"问"处理，绝不按"放行" —— 缺失不等于假。
-        """
+        r"""缺失事实按 ask，不按 allow。"""
         mode = permission.Mode.by_name(self._cfg("permission_mode", permission.Mode.ASK))
         if mode == permission.Mode.BYPASS:
             return permission.ALLOWED, facts if facts is not None else permission.Facts()
@@ -776,11 +601,7 @@ class McBodyPlugin(Star):
         what: str,
         facts: permission.Facts | None = None,
     ) -> str | None:
-        """要改世界的工具都先过这里。放行回 None，不放行回一条给她的失败回执。
-
-        去问（ask）这一版降级成"停手 + 在公屏说一句"，不做答复回环（docs\22 §6 第 5 步）——
-        光这一步就消灭了"她不问一声就把主人的东西拆了/倒了岩浆"。
-        """
+        r"""ask 暂降级为停止并通知，无答复回环。"""
         verdict, facts = await self._permit(action, facts)
         if verdict.allowed:
             return None
@@ -806,16 +627,14 @@ class McBodyPlugin(Star):
         )
 
     async def _say_in_game(self, text: str) -> None:
-        """在公屏说一句。失败不影响调用方 —— 这是附带的通知，不是主流程。"""
         try:
             await self._call(f"mcb say {text}")
         except Exception as exc:  # noqa: BLE001
             logger.info(f"[{PLUGIN_NAME}] 公屏说一句失败（可忽略）：{exc}")
 
-    # ---- 与桥对话 -------------------------------------------------------
 
     async def _call(self, command: str) -> tuple[dict | None, str | None]:
-        """发一条桥命令。返回 (data, 错误文案)，两者恰有一个非 None。"""
+        r"""data 与错误恰有一个非 None。"""
         try:
             reply = await self.bridge.call(command)
         except BridgeError as exc:
@@ -825,11 +644,9 @@ class McBodyPlugin(Star):
         data = reply.get("data")
         return (data if isinstance(data, dict) else {}), None
 
-    # ---- 参数校验（工具边界）---------------------------------------------
 
     @staticmethod
     def _clean_text(raw: str, limit: int = MAX_SAY_LEN) -> str | None:
-        """剥掉换行（防注入）并限长。空则返回 None。"""
         if raw is None:
             return None
         text = str(raw).replace("\r", " ").replace("\n", " ").strip()
@@ -859,7 +676,6 @@ class McBodyPlugin(Star):
             return None
         return tx, ty, tz
 
-    # ---- 工具 -----------------------------------------------------------
 
     @filter.llm_tool(name="mc_state")
     async def mc_state(self, event: AstrMessageEvent):
@@ -928,13 +744,10 @@ class McBodyPlugin(Star):
 
         want = str(near or "").strip()
         if want:
-            # 1 先查地点簿 —— "家""田"这种名字比方块名好用得多
             hit = self.places.match(want)
             if hit is not None:
                 name, place = hit
                 tx, tz = int(float(place["x"])), int(float(place["z"]))
-                # 注意： 顺手做一次指纹自检 —— 去一个很久没去的地方，
-                #    最该知道的就是"那地方还在不在"。一次 RCON 往返，很便宜。
                 #    抄 mcpfabric memory.ts 的 valid/changed/gone。
                 status = self.places.check(
                     name, await self._block_at(place.get("x"), place.get("y"), place.get("z"))
@@ -952,7 +765,6 @@ class McBodyPlugin(Star):
                         + "。过会儿用 mc_state 看坐标确认到没到。"
                         + ("\n" + warn if warn else ""))
 
-            # 2 不是地点名  ->  当方块注册名在附近扫
             block_id = want if ":" in want else f"minecraft:{want}"
             pos = await mcb_containers.find_block(self.bridge, block_id)
             if pos is None:
@@ -1030,8 +842,7 @@ class McBodyPlugin(Star):
             if not data.get("online"):
                 return "她不在线，拿不到坐标。"
             px, py, pz = data.get("x") or 0, data.get("y") or 0, data.get("z") or 0
-            # 顺手把脚下方块的指纹也记上 —— 以后就能知道"这地方变了没"。
-            # 注意： 读脚底下一格（y-1），不是脚下那格 —— 站的地方永远是空气，没有信息量。
+            # 指纹读 y-1；玩家所在格通常是空气。
             fp = await self._block_at(px, float(py) - 1, pz)
             got = self.places.remember(
                 name, px, py, pz,
@@ -1047,7 +858,7 @@ class McBodyPlugin(Star):
         return f"不认得 action={action!r}。只认 remember / list / check / forget。"
 
     async def _block_at(self, x, y, z) -> str | None:
-        """读某个坐标上的方块 id。读不到回 None（不是空串 —— 空串会被当成"没了"）。"""
+        r"""未知返回 None，空串会被当成方块消失。"""
         try:
             tx, ty, tz = int(float(x)), int(float(y)), int(float(z))
         except (TypeError, ValueError):
@@ -1062,11 +873,7 @@ class McBodyPlugin(Star):
         return str(got) if got else None
 
     async def _check_places(self, name: str = "") -> str:
-        """比对地点簿里的指纹 —— 那地方还是原来的样子吗。
-
-        注意： 每个地方要一次 RCON 往返，所以封顶（12 个）。不做事前缓存：
-        这个功能的意义就是"现在去看一眼"，缓存等于自欺。
-        """
+        r"""每地点一次 RCON，限量且不缓存。"""
         rows = self.places.list()
         if not rows:
             return "地点簿是空的 —— 还没记过任何地方。"
@@ -1130,12 +937,10 @@ class McBodyPlugin(Star):
         if (deny := self._guard(event, observe=True)):
             return deny
         stopped = await self.tasks.stop()
-        # 注意： 不是无脑 mcb stop —— 那会把反射的逃跑路线也撤了（保命优先）。
-        #    仲裁层的语义：撤掉用户级和任务级的声明，反射级的不动。
-        #    （mc_arbiter 那条描述里也这么说；见 mcb/arbiter.py）
+        # 只撤用户和任务声明，不能取消保命路线。
         await self.arbiter.clear_user_and_task()
         err = self.arbiter.last_error
-        # 顺手松开"使用键" —— 万一吃东西时出了岔子，按键卡住会让她一直重复动作
+        # 同时释放使用键，防止异常后持续使用。
         await self._call("mcb release")
         if err:
             return render.reword(err, "没能让她停下", kind=render.Kind.BRIDGE,
@@ -1165,7 +970,6 @@ class McBodyPlugin(Star):
         clean = clean.lstrip("#").strip()
         if not clean:
             return "命令是空的。"
-        # 注意： 白名单（见 BARITONE_VERBS 的注释）—— 别改成黑名单。
         verb = clean.split()[0].lower()
         if verb not in BARITONE_VERBS:
             return (
@@ -1216,7 +1020,6 @@ class McBodyPlugin(Star):
             text = text[:MAX_SKILL_CHARS] + f"\n\n…（只显示了前 {MAX_SKILL_CHARS} 字）"
         return f"技能「{key}」的正文：\n\n{text}"
 
-    # ---- 背包与交互（生存必需）-------------------------------------------
 
     @filter.llm_tool(name="mc_inventory")
     async def mc_inventory(self, event: AstrMessageEvent):
@@ -1317,25 +1120,16 @@ class McBodyPlugin(Star):
         if coords is None:
             return f"坐标不合法：({x}, {y}, {z})。"
         tx, ty, tz = coords
-        # 注意： 先拍一张"手上的东西"的快照 —— 放方块/用物品成功了的话，
-        #    手上的数量会少。这是唯一能自动判定"到底放没放成"的实据。
-        #
-        #    踩过（2026-10-10，用户在公屏让她放熔炉）：工具只回了一句
-        #    "已对着 (…) 右键…过一会儿用 mc_inventory 看手上东西少没少"，
-        #    她没看，转头就在公屏上说"熔炉放地上啦！" —— 其实熔炉还在包里。
-        #    教训：把验证甩给一个不会去验证的人，等于没有验证。
-        #    （和 docs\11 那条"成功判据用世界真的变了，不用命令发出去了"是同一条。）
+        # 动作前后比数量，不能把下发当成放置成功。
         before_item, before = await self._held_stack()
-        # 权限门（docs\22 §6 第 4 步：先只接 PLACE 一个动词，别贪多）。
-        # 理由是这一格真的可能改世界：手上是岩浆桶/打火石/TNT 时，右键就是泼出去、点着。
-        # 注意： 判的是"手上的东西"，所以必须在动作之前读一次手。
+        # 动作前读取手持物，危险物品不能绕过权限门。
         what = f"对着 ({tx},{ty},{tz}) 放置"
         if (refusal := await self._permit_or_refuse(
             permission.Action(permission.Kind.PLACE, pos=(tx, ty, tz), item=before_item),
             what,
         )):
             return refusal
-        # 走 useOnAt（直接给坐标构造命中），不依赖准星射线 —— 实测射线经常 MISS
+        # 直接构造坐标命中，避免准星射线 MISS。
         _, err = await self._call(f"mcb useOnAt {tx} {ty} {tz}")
         if err:
             return render.reword(
@@ -1344,13 +1138,13 @@ class McBodyPlugin(Star):
                 hint=f"先 `mc_goto x={tx} z={tz}` 走到 4 格以内，再重试这条",
             )
         if keep_open:
-            await asyncio.sleep(0.6)   # 等界面开起来
+            await asyncio.sleep(0.6)   
             data, merr = await self._call("mcb state")
             if merr:
                 return render.reword(merr, f"已对着 ({tx},{ty},{tz}) 右键，但读不到界面",
                                      kind=render.Kind.BRIDGE, hint="过几秒再用 mc_menu 看一次")
             return "已对着 ({tx},{ty},{tz}) 右键，界面留着没关。\n" + render.describe_menu(data)
-        # 不操作界面  ->  关掉，免得她动不了
+        # 不用界面时关闭，否则无法移动。
         await self._call("mcb closeGui")
         after = await self._held_count()
         if before is None or after is None:
@@ -1424,10 +1218,7 @@ class McBodyPlugin(Star):
                 hint="不确定就用默认的 mode=1，别自己填数字",
             )
         before = await self._menu_snapshot()
-        # 权限门：从容器里拿东西要先过闸（take(*) 走 ask，用户 2026-10-11 早先定的）。
-        # 注意： 判"这一下是不是在拿"要用到"她手上空不空"，所以得先读一次手。
-        #    读不到就按"空手"算 —— 这一门是保护性的，宁可多问一次，
-        #    也别让一次读不到变成"她默默把主人的东西拿走了"。
+        # 读取手持物失败时按空手判，保守拦截取物。
         _, held_n = await self._held_stack()
         hand_empty = True if held_n is None else (held_n == 0)
         if mcb_containers.takes_from_container(before, n, m, hand_empty):
@@ -1443,7 +1234,6 @@ class McBodyPlugin(Star):
             return render.reword(err, "点格子失败", kind=render.Kind.REFUSED,
                                 hint="先用 mc_menu 看一次界面 id，确认还是同一个容器再重点")
         await asyncio.sleep(0.4)
-        # 重点： 当场对账 —— 点之前那张快照和点之后比（docs\25 §三 1.8）
         after = await self._menu_snapshot()
         return render.describe_click_result(n, m, before, after)
 
@@ -1543,10 +1333,7 @@ class McBodyPlugin(Star):
         "mine <block_id>"."""
         if (deny := self._guard(event)):
             return deny
-        # 权限门（docs\22 §4）：准星制的 mc_attack 可能打到主人驯的宠物，所以先问服务端
-        # "准星指着的那只是谁"，再过闸。
-        # 注意： 自动反击（reflex.py 的 attackAt）按设计不过闸 —— 挨打还手是保命，
-        #    物理优先级高于权限，那一条走的是另一条路。
+        # 自动反击走独立保命路径，不经过工具权限门。
         data, err = await self._call("mcb attackTarget")
         if err or not isinstance(data, dict):
             return render.reword(err, "看不准星指着什么，这一下没打出去",
@@ -1653,7 +1440,6 @@ class McBodyPlugin(Star):
             return str(exc)
         return f"已脱战，{what}。她不会再自己冲回去打。"
 
-    # ---- 任务层（多步行为）-----------------------------------------------
 
     @filter.llm_tool(name="mc_task")
     async def mc_task(self, event: AstrMessageEvent, task: str, at: str = "",
@@ -1712,7 +1498,7 @@ class McBodyPlugin(Star):
             params.update(rounds=rounds, spacing=spacing, dir=heading)
             if no_break:
                 params["no_break"] = True
-        # at = "x z"。解析失败就忽略 —— 任务自己会退化成"就地干"。
+        # at 解析失败时任务退化为就地执行。
         parts = str(at or "").replace(",", " ").split()
         if len(parts) >= 2:
             px, pz = self._clean_coord(parts[0]), self._clean_coord(parts[1])
@@ -1785,27 +1571,20 @@ class McBodyPlugin(Star):
         return "最近发生的事：\n" + self.events.render(n)
 
     async def _around_t2(self, data: dict, force: bool = False) -> dict:
-        """mc_around 的第二层：T2 跨 tick 全分辨率扫描。
-
-        它是个后台任务（服务端每 tick 推进一小块，约 6ms）：第一次调用开一个，
-        之后每次来看进度，扫完就读结果。所以"叫一次拿不全"是正常的 —— 再叫一次。
-
-        注意： 这一层失败不影响 T1 —— 它只是"更细的一层"，拿不到就算了，
-        绝不能让整个 mc_around 报错。
-        """
+        r"""跨 tick 扫描需稍后取结果；失败不影响 T1。"""
         status, err = await self._call("mcb t2 status")
         if err or not isinstance(status, dict):
             return {"job": "error", "err": err or "拿不到状态"}
         job = status.get("job")
 
-        # 位置挪远了就重扫 —— 缓存是以某个点为中心的，人走了就没意义
+        # 扫描中心移动过远时重建缓存。
         if job == "done" and not force:
             tried = status.get("center") or []
             here = data.get("center") or []
             if len(tried) == 3 and len(here) == 3:
                 d2 = sum((float(tried[i]) - float(here[i])) ** 2 for i in range(3))
                 if d2 > 64 * 64:
-                    job = "none"          # 装成"没扫过"，下面会重开一个
+                    job = "none"          
 
         if job == "none" or force:
             started, err2 = await self._call("mcb t2 start 6")
@@ -2021,7 +1800,6 @@ class McBodyPlugin(Star):
                                 hint="过几秒重试")
         return render.describe_look(data, self.places)
 
-    # ---- 调试入口 -------------------------------------------------------
 
     @filter.command("mcbody")
     async def cmd_mcbody(self, event: AstrMessageEvent):

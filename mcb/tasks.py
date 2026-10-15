@@ -1,56 +1,14 @@
-"""任务层 —— 把多步行为串成一个目标。
-
-## 为什么要有这一层
-
-单步能力（走、挖、合、点格子）都有了，缺的是把多步串成一个目标：
-「挖 5 个铁矿  ->  烧成锭  ->  做把镐」。
-
-## 两类任务，一个外壳
-
-用户 2026-10-09 的判断：不该拿递归规划器去做种田。对 —— 要分两类：
-
-  · 规划型：有形式化的图（配方 DAG） ->  craft.py 的递归规划器
-  · 流程型：固定步骤，没有图（种田 / 插火把 / 睡觉） ->  本文件的步骤表
-
-两类共用这一层外壳：执行器 + 中断 + 感知。加新任务 = 加一张表，
-跟 containers.py 的「加新容器 = 加一行表」一个思路。
-
-## 抄的是车万女仆（TLM）的分层，不是它的代码
+r"""## 抄的是车万女仆（TLM）的分层，不是它的代码
 
 TLM 的任务不能照抄代码 —— IMaidTask.createBrainTasks(EntityMaid) 要一个
 EntityMaid 对象，返回的 BehaviorControl 喂给原版 Brain 系统、跑在服务端实体
 tick 循环里。白是真实客户端玩家，喂不进去（这一点已扒 jar 核实）。
 
-能抄、也值得抄的是它的架构：
-
-    IMaidTask.getMaidActionSummary()        <-  让 AI 知道自己在干什么
-    IMaidTask.enablePanic / enableEating    <-  每个任务的「允不允许被打断」
-    MaidContexts$CurrentTaskContext         <-  当前任务作为上下文注入 LLM
-    SwitchWorkTaskTool                      <-  LLM 的唯一出口：切模式
-
 我们也只给 LLM 两个出口：mc_task <名字> / mc_task stop。干活全在程序侧。
 （TLM 那套结果码 Already on task / missing item / unknown task_id 也照抄了语义。）
 
-## 中断是一等公民，不是异常
-
-三级优先级（高  ->  低）：
-
-    反射（保命）  >  用户指令  >  当前任务
-
 被打断 ≠ 被丢弃。 反射抢占时任务挂起，反射过去自己回来接着做
-（女仆的 MaidPanicTask 也是这个语义）。用户叫停才是真停。
-
-## 注意： 步骤必须可重入
-
-抢占发生在步骤中途时，恢复后从这一步的开头重来（步骤是协程，接不到中间）。
-所以每个步骤都要能重复执行而不出错：
-「走到 X」重复下发无害 已完成：；「拿起一个面包」就该写成「确保手上有面包」不成立或禁止： -> 已完成：。
-
-## 注意： 抢占的一个已知缺口
-
-反射的 mcb stop 会让「正在走路」的步骤看到「没在移动」从而误判成走到了。
-所以步骤别只信 ctx.wait_path() 的返回值，该用坐标/数量复核就用。
-"""
+（女仆的 MaidPanicTask 也是这个语义）。用户叫停才是真停。"""
 
 from __future__ import annotations
 
@@ -66,7 +24,6 @@ from .arbiter import LEVEL_TASK, TASK_TTL
 from .containers import ContainerIO, find_block, wait_baritone, wear
 from . import render
 
-# 任务协程的任务名 —— 用来识别并掐掉重载留下的孤儿任务（同 reflex.py）
 _TASK_NAME = "mc_body_work"
 
 
@@ -74,7 +31,6 @@ class Paused(Exception):
     """被更高优先级的事抢占了 —— 让路，等会儿从本步开头重来。"""
 
 
-# ===== 步骤 =================================================================
 
 StepFn = Callable[["TaskContext"], Awaitable["str | None"]]
 
@@ -91,47 +47,34 @@ class Step:
 class Task:
     id: str
     name: str
-    summary: str          # 给模型看的一句话 —— 描述写得含糊模型就会用错
+    summary: str          
     steps: list[Step] = field(default_factory=list)
     # 重点： 受理前检查（抄 Numen Task.prepare / TaskDispatch.setTask）。
-    #
-    #    契约和 Step.run 一样：返回 None = 可以开工；返回字符串 = 失败原因。
-    #    注意： 它在 create_task 之前跑，判不过就"不换进槽" ——
-    #    手上的旧活一点不受影响。
-    #
-    #    原来没有这一层，TaskRunner.start 是"先 stop() 掐掉旧活、再看新活行不行" ——
-    #    新活一失败她就闲着，而旧活已经没了。
     precheck: StepFn | None = None
 
 
-# ===== 上下文 ===============================================================
 
 def _rid(item: object) -> str:
-    """取注册名。绝不回退到显示名 —— 显示名跟语言走，匹配必错（docs/04 坑 10o）。"""
     return str((item or {}).get("id") or "") if isinstance(item, dict) else ""
 
 
 class TaskContext:
-    """步骤能用的一切：读状态、发命令、等、被抢占。"""
 
     def __init__(self, runner: "TaskRunner", params: dict) -> None:
         self._runner = runner
         self.bridge = runner.bridge
         self.io: ContainerIO = runner.io
         self.params = params or {}
-        self.data: dict = {}          # 步骤之间传数据（"刚才那根火把在哪一格"）
+        self.data: dict = {}          
 
-    # ---- 抢占 -----------------------------------------------------------
 
     async def checkpoint(self) -> None:
-        """被抢占就在这里抛 Paused。长循环里必须反复调它，否则抢占不生效。"""
+        r"""长循环必须调用，否则无法响应抢占。"""
         await self._runner.checkpoint()
 
     def note(self, text: str) -> None:
-        """往状态日志里记一条（白自己看得见）。"""
         self._runner.note(text)
 
-    # ---- 桥 -------------------------------------------------------------
 
     async def call(self, command: str) -> dict | None:
         if self._runner.arbiter is not None and command.startswith("mcb baritone "):
@@ -148,13 +91,11 @@ class TaskContext:
     async def state(self) -> dict:
         return await self._runner.state()
 
-    # ---- 常用动作 -------------------------------------------------------
 
     async def inventory(self) -> dict:
         return await self.call("mcb inventory") or {}
 
     async def count_item(self, item_id: str) -> int:
-        """身上（含快捷栏 / 背包 / 副手）有几个这种物品。"""
         data = await self.inventory()
         total = 0
         for key in ("hotbar", "main"):
@@ -167,14 +108,7 @@ class TaskContext:
         return total
 
     async def ensure_held(self, item_id: str) -> int | None:
-        """确保手上拿着这种物品，返回快捷栏格号；做不到返回 None。
-
-        注意： 写成「确保」而不是「拿起一个」是因为步骤必须可重入：被抢占后
-        这一步会从头再跑一遍，重复执行不能出岔子。
-
-        真正的活交给 containers.wear（手/副手/护甲共用一份实现）——
-        别在这儿抄第二遍。
-        """
+        r"""步骤抢占后从头重入，持物操作必须幂等。"""
         err = await wear(self.io, item_id, "hand")
         if err is not None:
             return None
@@ -185,24 +119,12 @@ class TaskContext:
         return None
 
     async def wait_path(self, timeout: float = 60.0, target=None) -> str:
-        """等 Baritone 走完。返回 "arrived" / "timeout"。
-
-        注意： 别天真地写成"不在走 = 到了"（2026-10-09 实战踩到）：
-        刚 goto 完时 Baritone 的 isPathing() 还是 false —— 那种写法会
-        立刻判定到达。实测从 (-10,88) 去 (-45,66) 只花 9 秒就报"到了"，
-        而人一步没动，后面全在错误的位置上干。
-
-        真正的逻辑在 containers.wait_baritone（open_block 也用它）——
-        那里处理了"先看起步再看停下"和去抖。别在这儿抄第二遍。
-        """
+        r"""等待起步和停止由 containers.wait_baritone 统一确认。"""
         return await wait_baritone(
             self.bridge, timeout=timeout, target=target, checkpoint=self.checkpoint
         )
 
     async def goto(self, x: float, z: float, timeout: float = 60.0) -> str:
-        # 注意： 走仲裁层，别直接 mcb baritone —— 反射要保命时优先级比任务高，
-        #    由仲裁决定谁生效。顶掉时任务被挂起、声明不删，
-        #    所以脱战之后这条路线会自己恢复（这正是"挂起不是取消"的落点）。
         arb = self._runner.arbiter
         if arb is not None:
             await arb.claim_walk(LEVEL_TASK, "task",
@@ -215,15 +137,7 @@ class TaskContext:
         return await self.wait_path(timeout, target=(float(x), float(z)))
 
     async def place_torch_here(self, item_id: str) -> bool:
-        """在她旁边的地面上插一根火把。插上了返回 True。
-
-        注意： 成功判据是"身上少了一个"，不是"命令发出去了"。
-        useOnAt 是发出去就算成功，服务端可能因为够不着 / 那格不是实心 /
-        已经有东西而拒掉 —— 唯一可靠的反馈是背包里的数量真的变了。
-
-        useOnAt 固定用上表面（见客户端脚本），所以对着 (x, y-1, z) 右键，
-        火把就落在 (x, y, z)。依次试四个相邻方向，第一个成了就收工。
-        """
+        r"""以库存实际减少确认成功，不以 useOnAt 下发为准。"""
         st = await self.state()
         if not st.get("online"):
             return False
@@ -242,11 +156,9 @@ class TaskContext:
         return False
 
 
-# ===== 任务表 ===============================================================
 
 TASKS: dict[str, Task] = {}
 
-# 认得的火把。灵魂火把也算 —— 照明效果一样。
 TORCH_IDS = ("minecraft:torch", "minecraft:soul_torch")
 
 
@@ -256,10 +168,7 @@ def _register(task: Task) -> Task:
 
 
 async def _precheck_online(ctx: TaskContext) -> str | None:
-    """所有任务共用的一条：身体不在，什么任务都开不了工。
-
-    注意： 放"受理前"而不是第 0 步 —— 她不在线时旧任务不该被掐掉。
-    """
+    r"""受理前检查，失败不能取消旧任务。"""
     st = await ctx.state()
     if not st.get("online"):
         return "她的身体不在服务器上（客户端没连）—— 等上线再派活"
@@ -267,7 +176,7 @@ async def _precheck_online(ctx: TaskContext) -> str | None:
 
 
 async def _precheck_have_torch(ctx: TaskContext) -> str | None:
-    """受理前检查 —— 缺东西要立刻说，且不打断手上的活。"""
+    r"""缺料拒绝新任务，不中断旧任务。"""
     for tid in TORCH_IDS:
         if await ctx.count_item(tid) > 0:
             ctx.data["torch"] = tid
@@ -290,7 +199,6 @@ async def _step_hold_torch(ctx: TaskContext) -> str | None:
 
 
 async def _step_light_along(ctx: TaskContext) -> str | None:
-    """按指定方向与间距尝试放置火把，次数包含被阻挡的位置。"""
     rounds = max(1, int(ctx.params.get("rounds") or 6))
     spacing = max(3, int(ctx.params.get("spacing") or 8))
     heading = str(ctx.params.get("dir") or "east").lower()
@@ -318,7 +226,7 @@ async def _step_light_along(ctx: TaskContext) -> str | None:
         except (KeyError, TypeError, ValueError):
             return "读不到位置，已停止照明"
         await ctx.checkpoint()
-        # 放置可能已产生副作用，先占用本次额度；抢占后不重试同一处。
+        # 放置可能已产生副作用，先占额度，抢占后不重试同一处。
         progress["attempted"] += 1
         if progress["attempted"] < rounds:
             progress["target"] = (nx, nz)
@@ -345,13 +253,7 @@ _register(Task(
 ))
 
 
-# ---- 种田 ------------------------------------------------------------------
-#
-# 注意： 这一条不靠我们实现什么，靠 Baritone 的 farm ——
-#    它会自己收割成熟的作物、把种子种回去、必要时用锄头翻地。
-#    我们只负责"走到田边 + 开干 + 判断收工"。（这正是 docs/11 说的"胶水要薄"。）
 
-# 能拿来定位"哪有田"的方块。注意： 顺序 = 优先级：先找熟透的作物，再找耕地。
 FIELD_BLOCKS = (
     "minecraft:wheat",
     "minecraft:carrots",
@@ -362,19 +264,13 @@ FIELD_BLOCKS = (
     "minecraft:farmland",
 )
 
-# 注意： 没有"收工判据"这个东西 —— 收作物是破坏方块，期间 isPathing() 常常为 false，
-#    拿"没在走"当收工信号会刚开干就收工（踩过）。所以只能按时间跑。
+# farm 破坏方块时 isPathing 可为 false，不能据此判收工。
 FARM_POLL = 5.0
-FARM_DEFAULT_MINUTES = 3.0    # 默认跑多久
+FARM_DEFAULT_MINUTES = 3.0    
 
 
 async def _step_find_field(ctx: TaskContext) -> str | None:
-    """走到田边。找不到不算失败 —— 她可能本来就站在田里。
-
-    两种入口：
-      · 给了坐标（mc_task farm at="-50 100"） ->  先去那儿，再在周围找作物
-      · 没给  ->  就地找（服务端扫描上限 16 格，田远了就看不到）
-    """
+    r"""找不到田不直接失败，角色可能已在田里。"""
     tx, tz = ctx.params.get("x"), ctx.params.get("z")
     if isinstance(tx, (int, float)) and isinstance(tz, (int, float)):
         ctx.note(f"先走到指定位置 {int(tx)},{int(tz)}")
@@ -393,7 +289,6 @@ async def _step_find_field(ctx: TaskContext) -> str | None:
 
 
 async def _step_check_farm_tools(ctx: TaskContext) -> str | None:
-    """软检查：报告身上有没有锄头/种子。缺了也不失败 —— 只收割也能干活。"""
     data = await ctx.inventory()
     ids = {
         str(it.get("id")) for it in (data.get("hotbar") or []) + (data.get("main") or [])
@@ -413,16 +308,7 @@ async def _step_check_farm_tools(ctx: TaskContext) -> str | None:
 
 
 async def _step_run_farm(ctx: TaskContext) -> str | None:
-    """开干 + 跑满时间 + 报收成。
-
-    注意： 不能靠"Baritone 没在走"判收工（2026-10-09 踩到）：
-    收作物靠破坏方块，那期间 isPathing() 常常是 false ——
-    第一版用"安静 15 秒"当收工信号，结果刚开干 15 秒就收工了。
-
-    只好按时间跑。 想知道"真的干完没"，得让客户端上报
-    当前跑的是哪个 Baritone 进程（getCurrentProcess()）——
-    那要改客户端脚本 + 重启客户端，先记在 docs/12。
-    """
+    r"""farm 中 isPathing 可为 false，只能按时间运行。"""
     minutes = float(ctx.params.get("minutes") or FARM_DEFAULT_MINUTES)
     limit = max(30.0, minutes * 60)
     before = await _inventory_counts(ctx)
@@ -468,12 +354,6 @@ async def _inventory_counts(ctx: TaskContext) -> dict[str, int]:
 
 
 def _diff_counts(before: dict[str, int], after: dict[str, int]) -> tuple[dict, dict]:
-    """比对前后背包。返回 (多了什么, 少了什么) —— 这就是"收成"的实据。
-
-    注意： lost 那边必须用 v 减去 after。第一版写成了
-    before.get(k,0) - v（也就是自己减自己），恒等于 0 ——
-    日志里就会看到「用掉 wheat_seeds×0」这种见了鬼的行。
-    """
     gained = {k: v - before.get(k, 0) for k, v in after.items() if v > before.get(k, 0)}
     lost = {k: v - after.get(k, 0) for k, v in before.items() if v > after.get(k, 0)}
     return gained, lost
@@ -492,10 +372,8 @@ _register(Task(
 ))
 
 
-# ===== 执行器 ===============================================================
 
 class TaskRunner:
-    """跑一个任务，管中断，往日志里记账。一个实例只跑一个任务。"""
 
     def __init__(self, bridge, journal, *, io: ContainerIO | None = None) -> None:
         self.bridge = bridge
@@ -506,20 +384,16 @@ class TaskRunner:
         self._job: Task | None = None
         self._ctx: TaskContext | None = None
         self._index = 0
-        self._paused = ""            # 非空 = 被抢占的理由
-        self._outcome: dict = {}     # 上一次的结局
-        # 仲裁层（见 mcb/arbiter.py）。没绑也能跑 —— 那就退回直接下发，
-        # 免得单测/降级路径被这条依赖卡住。
+        self._paused = ""            
+        self._outcome: dict = {}     
+        # 未绑定仲裁时保留直接下发的降级路径。
         self.arbiter = None
 
     def bind_arbiter(self, arbiter) -> None:
-        """把仲裁层接上。main.py 在 __init__ 里调。"""
         self.arbiter = arbiter
 
-    # ---- 抢占（反射层调）------------------------------------------------
 
     def suspend(self, reason: str) -> None:
-        """挂起当前任务。反射保命时调这个 —— 不是停，是让路。"""
         if self._job is None or self._task is None or self._task.done():
             return
         if self._paused == reason:
@@ -529,7 +403,6 @@ class TaskRunner:
         self.note(f"挂起（{self._paused}）")
 
     def resume(self) -> None:
-        """接着做。已经不在挂起状态就什么都不做。"""
         if not self._paused:
             return
         logger.info(f"[mc_body] ▶ 任务恢复（之前因为 {self._paused}）")
@@ -544,14 +417,13 @@ class TaskRunner:
     def busy(self) -> bool:
         return self._job is not None and self._task is not None and not self._task.done()
 
-    # ---- 给工具和感知用的 -----------------------------------------------
 
     def catalog(self) -> list[dict]:
-        """可选的任务清单（给工具描述用 —— 抄 TLM 的 getTaskIdParameterDesc）。"""
+        r"""可选的任务清单（给工具描述用 —— 抄 TLM 的 getTaskIdParameterDesc）。"""
         return [{"id": t.id, "name": t.name, "summary": t.summary} for t in TASKS.values()]
 
     def status(self) -> dict:
-        """当前在干嘛。这是"她知道自己正在干什么"的数据来源。"""
+        r"""当前在干嘛。这是"她知道自己正在干什么"的数据来源。"""
         if self.busy and self._job is not None:
             total = len(self._job.steps)
             idx = max(1, min(self._index, total))
@@ -566,10 +438,8 @@ class TaskRunner:
             }
         return {"running": False, "last": self._outcome}
 
-    # ---- 开关 -----------------------------------------------------------
 
     async def start(self, task_id: str, **params) -> str:
-        """切到某个任务。返回一句人话（工具直接回给模型）。"""
         task = TASKS.get(str(task_id or "").strip())
         if task is None:
             known = "、".join(f"{t.id}（{t.name}）" for t in TASKS.values()) or "（一个都没有）"
@@ -583,8 +453,7 @@ class TaskRunner:
             # 抄 TLM 的 Already on task %s
             return f"已经在做「{task.name}」了 —— 没换。"
 
-        # 重点： 受理前先判，判不过不换进槽（docs\25 §三 1.3）。
-        #    注意： 顺序要紧：先判、后停旧活。反过来的话，新活一失败她就两手空空。
+        # 先检查新任务再停旧任务，失败不能丢掉旧活。
         ctx = TaskContext(self, params)
         if task.precheck is not None:
             try:
@@ -614,7 +483,6 @@ class TaskRunner:
         return f"「{task.name}」开始了。想知道进度用 mc_state 看「正在做的事」。"
 
     async def stop(self, *, quiet: bool = False) -> str:
-        """真停 —— 不是挂起，是丢弃。"""
         task = self._task
         self._task = None
         self._job = None
@@ -627,8 +495,7 @@ class TaskRunner:
             await task
         except (asyncio.CancelledError, Exception):  # noqa: BLE001
             pass
-        # 注意： 真停 = 撤掉自己在 walk 通道的声明 —— 悬着的话，
-        #    下次反射释放时会把这条早就不要了的路线又恢复出来。
+        # 取消任务必须撤销 walk 声明，防止后续误恢复。
         if self.arbiter is not None:
             await self.arbiter.release_walk("task")
         if not quiet:
@@ -642,24 +509,18 @@ class TaskRunner:
         self._outcome["kind"] = render.Kind.DENIED
         self.journal.add("task", f"「{name}」因权限拒绝终止：{detail}")
 
-    # ---- 内部 -----------------------------------------------------------
 
     async def checkpoint(self) -> None:
         if self._paused:
             raise Paused
         # 注意： 另一个挂起来源：walk 通道被别人（反射/用户）抢走了。
-        #    这时"没在移动"是别人造成的，不是"走到了" ——
-        #    不判的话 wait_path 会把"反射保命时把她叫停"误判成到达。
-        #    （这条坑一直记在本文件顶部第 51 行，从来没有真正的解法。）
         arb = self.arbiter
         if arb is not None:
             top = arb.walk_holder()
             if top is not None and top.owner != "task":
                 raise Paused
-            # 任务还在跑 = 它还活着 —— 顺手把自己的声明续上（第 2 批 2.5）。
+            # checkpoint 续期任务声明，任务消失后由 TTL 释放。
             # 注意： 这不是"释放"的来源，是"我还想要"的来源：
-            #    任务真死了（抛异常 / 被 cancel）就没人再调 checkpoint，
-            #    TASK_TTL 到点那条声明自己让位 —— 不用指望哪个调用点记得 release。
             await arb.touch_walk("task", TASK_TTL)
 
     def note(self, text: str) -> None:
@@ -686,7 +547,6 @@ class TaskRunner:
         self._paused = ""
 
     async def _gate(self) -> None:
-        """挂起时卡在这。每个步骤之前都过一遍。"""
         while self._paused or (self.arbiter is not None
                                and self.arbiter.walk_holder() is not None
                                and self.arbiter.walk_holder().owner != "task"):
@@ -704,7 +564,6 @@ class TaskRunner:
                     try:
                         err = await step.run(ctx)
                     except Paused:
-                        # 被抢占了。不是失败 —— 等恢复了从这一步重来。
                         self.note(f"被抢占，稍后从「{step.name}」重来")
                         continue
                     break
