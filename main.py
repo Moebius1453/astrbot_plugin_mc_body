@@ -695,14 +695,25 @@ class McBodyPlugin(Star):
             )
         return None
 
-    def _guard(self, event: AstrMessageEvent) -> str | None:
+    def _guard(self, event: AstrMessageEvent, *, observe: bool = False) -> str | None:
         """工具的统一前置检查。返回拒绝理由；None = 放行。
 
         注意： 每个工具都必须走这里，别自己抄一遍授权逻辑 ——
         曾经 18 个工具抄了 18 遍，改一个公共行为要动 18 处。
         要加"逐工具开关"之类的公共检查，只改这一个地方。
         """
-        return self._authorize(event)
+        deny = self._authorize(event)
+        if deny:
+            return deny
+        if not observe and getattr(event, "_mcb_craft_failed", False):
+            return "本轮合成已失败，后续动作已锁定；只可查询或停止，等待用户下一条指令，不自行走近或重试。"
+        return None
+
+    async def _halt_failed_craft(self, event: AstrMessageEvent) -> None:
+        if event is not None:
+            event._mcb_craft_failed = True
+        await self.tasks.stop(quiet=True)
+        await self.arbiter.clear_user_and_task()
 
     # ---- 权限门（这个动作能不能改世界）----------------------------------
     #
@@ -860,7 +871,7 @@ class McBodyPlugin(Star):
         After any ACTION tool, wait a moment and use this to confirm the result: those tools can
         only report "dispatched", never "it worked".
         "offline" means the character is not connected to the server -- no action is possible."""
-        if (deny := self._guard(event)):
+        if (deny := self._guard(event, observe=True)):
             return deny
         data, err = await self._call("mcb state")
         if err:
@@ -1116,7 +1127,7 @@ class McBodyPlugin(Star):
         WARNING: the task is DISCARDED (cancelled, not paused). If you want her to "do something
         else first and come back to it later", just give her the new instruction -- suspension is
         handled by the reflex layer, not by this."""
-        if (deny := self._guard(event)):
+        if (deny := self._guard(event, observe=True)):
             return deny
         stopped = await self.tasks.stop()
         # 注意： 不是无脑 mcb stop —— 那会把反射的逃跑路线也撤了（保命优先）。
@@ -1211,7 +1222,7 @@ class McBodyPlugin(Star):
     async def mc_inventory(self, event: AstrMessageEvent):
         """Look at your inventory: what you have, which hotbar slot is in hand,
         and your hunger. Check it before taking / eating / crafting anything."""
-        if (deny := self._guard(event)):
+        if (deny := self._guard(event, observe=True)):
             return deny
         data, err = await self._call("mcb inventory")
         if err:
@@ -1468,8 +1479,10 @@ class McBodyPlugin(Star):
         try:
             plan = await crafter.plan(name, n)
         except BridgeError as exc:
+            await self._halt_failed_craft(event)
             return f"算配方的时候没连上桥：{exc}"
         if not plan.ok:
+            await self._halt_failed_craft(event)
             self.journal.add("craft", f"做 {name}×{n} 做不了：{plan.describe().splitlines()[0]}")
             return "做不了：\n" + plan.describe()
         if not plan.steps:
@@ -1478,8 +1491,14 @@ class McBodyPlugin(Star):
         try:
             result = await runner.run(plan)
         except BridgeError as exc:
+            await self._halt_failed_craft(event)
             self.journal.add("error", f"做 {name} 时桥断了")
             return f"做的过程中桥断了：{exc}"
+        except Exception:
+            await self._halt_failed_craft(event)
+            raise
+        if not runner.completed:
+            await self._halt_failed_craft(event)
         self.journal.add("craft", f"做 {name}×{n} —— {result.splitlines()[0]}")
         return result
 
@@ -1707,7 +1726,7 @@ class McBodyPlugin(Star):
         
         WARNING: this is a CANCEL, not a pause -- progress is lost. To "do something else first and
         come back to it later" do NOT use this; just give the new instruction."""
-        if (deny := self._guard(event)):
+        if (deny := self._guard(event, observe=True)):
             return deny
         return await self.tasks.stop()
 

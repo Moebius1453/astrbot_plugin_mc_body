@@ -287,6 +287,7 @@ class CraftRunner:
         self.bridge = bridge
         self.arbiter = arbiter
         self.io = ContainerIO(bridge, delay=delay)
+        self.completed = False
 
     async def _open_table(self) -> tuple[bool, str]:
         return await open_block(self.bridge, "minecraft:crafting_table",
@@ -376,9 +377,11 @@ class CraftRunner:
         return out
 
     async def run(self, plan: Plan) -> str:
+        self.completed = False
         if not plan.ok:
             return plan.describe()
         if not plan.steps:
+            self.completed = True
             return "不用合成，手上已经够了。"
 
         needs_table = any(s.recipe.get("needsTable") for s in plan.steps)
@@ -406,6 +409,8 @@ class CraftRunner:
                     out.append(f"⚠️ {msg}（想做 {step.times} 次，只成了 {n} 次）")
                     break
                 out.append(f"✅ {msg}")
+            else:
+                self.completed = True
         finally:
             await self.bridge.call("mcb closeGui")   # 界面开着她就动不了
         return "合成结果：" + chr(10) + chr(10).join(out)
