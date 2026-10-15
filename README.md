@@ -130,7 +130,7 @@ RCON 使用明文协议，不要暴露到公网或不可信网络。不要向模
 
 感谢 [Numen（言出法随）](https://github.com/Dwinovo/minecraft-numen) 及其贡献者的设计与源码灵感架构设计参考。具体来源及复用性质见[第三方来源说明](THIRD_PARTY_NOTICES.md)。
 
-感谢 AstrBot、KubeJS 和 Baritone 提供的框架与工具，以及 mineflayer、mcpfabric 等项目的灵感设计参考。
+感谢 AstrBot、KubeJS 和 Baritone 制作的框架与工具，以及 mineflayer、mcpfabric 等项目的灵感设计参考。
 
 ## 许可
 
