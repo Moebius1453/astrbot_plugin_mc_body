@@ -1210,27 +1210,26 @@ class McBodyPlugin(Star):
             return render.fail(render.Kind.BAD_ARGUMENT, "button 参数不合法",
                                usage="mode=4 时 0=丢一个，1=丢整叠；其他模式只能为 0")
         before = await self._menu_snapshot()
+        if (not isinstance(before, dict) or not isinstance(before.get("generation"), int)
+                or not isinstance(before.get("sample"), int)):
+            return render.fail(render.Kind.REFUSED, "缺少菜单保护信息，未执行点击",
+                               hint="需要配套客户端桥；更新并重启客户端后重新查看 mc_menu")
+        click_guard = {"id": before.get("id"), "generation": before["generation"]}
         if m == 4:
-            if not isinstance(before, dict) or mcb_containers.slot_side(before, n) != "mine":
+            roles = str(before.get("roles") or "")
+            if not (0 <= n < len(roles) and roles[n] == "Y"):
                 return render.fail(render.Kind.REFUSED, "只能丢弃自己的库存物品",
                                    hint="先用 mc_menu 确认自己的库存槽，不要丢容器或合成槽物品")
+            if before.get("cursorEmpty") is not True:
+                return render.fail(render.Kind.REFUSED, "光标非空或状态未知，未执行丢物",
+                                   hint="先把光标物品放回自己的库存，再查看 mc_menu")
             source = next((it for it in before.get("items", [])
                            if isinstance(it, dict) and it.get("i") == n), None)
-            if before.get("def"):
-                inventory, ierr = await self._call("mcb inventory")
-                if ierr or not isinstance(inventory, dict):
-                    return render.fail(render.Kind.BRIDGE, "读不到丢弃前的库存，未执行")
-                if 36 <= n <= 44:
-                    entries, index = inventory.get("hotbar") or [], n - 36
-                    source = entries[index] if index < len(entries) else None
-                elif 9 <= n <= 35:
-                    source = next((it for it in inventory.get("main", [])
-                                   if isinstance(it, dict) and it.get("slot") == n), None)
-                else:
-                    return render.fail(render.Kind.REFUSED, "丢物仅支持背包与快捷栏槽")
-            if not isinstance(source, dict) or not source.get("c"):
+            if not isinstance(source, dict) or not source.get("id") or not source.get("c"):
                 return render.fail(render.Kind.REFUSED, "目标槽为空或未读到物品，未执行")
-            _, err = await self._call(f"mcb clickSlot {n} {b} 4")
+            click_guard.update(item=source["id"], count=source["c"])
+            guard_arg = json.dumps(click_guard, ensure_ascii=True, separators=(",", ":"))
+            _, err = await self._call(f"mcb clickSlot {n} {b} 4 {guard_arg}")
             if err:
                 return render.reword(err, "丢物结果未知，不要自动重试",
                                      kind=render.Kind.BRIDGE, hint="先检查背包和地面物品")
@@ -1248,12 +1247,22 @@ class McBodyPlugin(Star):
             )
             if refusal:
                 return refusal
-        _, err = await self._call(f"mcb clickSlot {n} 0 {m}")
+        guard_arg = json.dumps(click_guard, ensure_ascii=True, separators=(",", ":"))
+        _, err = await self._call(f"mcb clickSlot {n} 0 {m} {guard_arg}")
         if err:
-            return render.reword(err, "点格子失败", kind=render.Kind.REFUSED,
-                                hint="先用 mc_menu 看一次界面 id，确认还是同一个容器再重点")
-        await asyncio.sleep(0.4)
-        after = await self._menu_snapshot()
+            return render.reword(err, "点击结果未知，不要自动重试", kind=render.Kind.BRIDGE,
+                                hint="先检查当前菜单和库存")
+        after = None
+        for _ in range(5):
+            await asyncio.sleep(0.3)
+            candidate = await self._menu_snapshot()
+            if isinstance(candidate, dict) and (
+                candidate.get("generation") != before["generation"]
+                or (isinstance(candidate.get("sample"), int)
+                    and candidate["sample"] > before["sample"])
+            ):
+                after = candidate
+                break
         return render.describe_click_result(n, m, before, after)
 
     @filter.llm_tool(name="mc_craft")

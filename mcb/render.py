@@ -73,13 +73,10 @@ def describe_click_result(slot, mode, before, after) -> str:
     # 菜单身份变化后不能沿用旧格号。
     b_id = before.get("id") if isinstance(before, dict) else None
     a_id = after.get("id")
-    if b_id is not None and a_id is not None and b_id != a_id:
-        return (
-            f"⚠️ **没点成**：点之前是界面 id={b_id}，点之后变成了 id={a_id} —— "
-            "中途被别的容器顶掉了，这一下点在别的界面上了。\n"
-            "error: refused —— 界面 id 变了\n"
-            f"hint: 用 `mc_menu` 重新看一次现在的界面，再决定点哪一格"
-        )
+    if b_id is not None and a_id is not None and (
+        b_id != a_id or before.get("generation") != after.get("generation")
+    ):
+        return "点击结果未确认：菜单身份已变化。请重新检查菜单和库存，不要自动重发点击。"
 
     b = _menu_items(before)
     if b is None:
@@ -100,12 +97,9 @@ def describe_click_result(slot, mode, before, after) -> str:
             changed.append(f"第 {idx} 号格：{was[0]}×{was[1]} → 空了")
 
     if not changed:
-        return (
-            f"⚠️ **没生效**：点了第 {slot} 号格（mode={mode}），但界面**一个格子都没变**。\n"
-            "error: refused —— 服务端可能把这一下退回了（界面 id 对不上 / 那一格放不下）\n"
-            "hint: 先用 `mc_menu` 看一次当前界面 id，确认还是同一个容器再重点一次"
-        )
-    head = f"✅ 点了第 {slot} 号格（mode={mode}），**界面确实变了**："
+        return (f"点击结果未确认：第 {slot} 号格（mode={mode}）未观察到槽位变化。"
+                "可能尚未同步或操作被拒绝；先检查菜单和库存，不要自动重发。")
+    head = f"第 {slot} 号格点击后（mode={mode}），观察到以下槽位变化，尚不能据此确认指定操作完成："
     return head + "".join(f"\n  · {c}" for c in changed[:8])
 
 
@@ -119,10 +113,10 @@ def describe_menu(data: dict) -> str:
     slots = menu.get("slots")
     if menu.get("def"):
         head = f"她手上没有开着的容器，**只有默认的背包界面**（共 {slots} 格）。"
-        head += "\n⚠️ 默认界面里我只上报 0~4 号格（合成用的）。**背包里别的东西在哪一格，用 `mc_inventory` 反推**："
-        head += "\n  · 快捷栏第 n 格（0~8）→ 界面第 **36+n** 号格"
-        head += "\n  · 背包第 n 格（0~26）→ 界面第 **9+n** 号格"
-        head += "\n  · 合成产物在 **0** 号格，2×2 材料格是 **1~4** 号"
+        head += "\n默认背包菜单槽号与库存槽号不同："
+        head += "\n  · 快捷栏第 n 格（0~8）对应菜单第 36+n 格"
+        head += "\n  · 背包库存槽号9~35对应同号菜单格"
+        head += "\n  · 合成产物在第0格，2×2材料在第1~4格"
     else:
         head = f"她正开着**一个容器界面**（id={mid}，共 {slots} 格）。"
 

@@ -510,6 +510,10 @@ function mcbNum(v) {
 }
 
 
+var mcbMenuRef = null
+var mcbMenuGeneration = 0
+var mcbMenuSample = 0
+
 function mcbSnapshot() {
   var snap = {}
 
@@ -580,7 +584,7 @@ function mcbSnapshot() {
   } catch (e6) {
   }
 
-  // 默认菜单仅报合成格，避免每次发送整个背包。
+  // 保护性点击需要完整槽位和菜单实例标识。
   try {
     if (mc !== null && mc.player !== null) {
       var menu = mc.player.containerMenu
@@ -593,7 +597,7 @@ function mcbSnapshot() {
         var itemRegistry = Java.loadClass('net.minecraft.core.registries.BuiltInRegistries').ITEM
         try {
           var lo = 0
-          var hi = isDefault ? 5 : mSlots
+          var hi = mSlots
           for (var si = lo; si < hi; si++) {
             var sl = menu.slots.get(si)
             var st = sl.getItem()
@@ -617,8 +621,11 @@ function mcbSnapshot() {
           mroles = rbuf.join('')
         } catch (eRole) { mroles = '' }
         // 菜单先序列化 JSON，避免 CompoundTag 嵌套列表转换歧义。
+        if (menu !== mcbMenuRef) { mcbMenuRef = menu; mcbMenuGeneration++ }
+        mcbMenuSample++
         snap.menu = JSON.stringify({ id: mId, slots: mSlots, def: isDefault, cls: mcls,
-                                     items: cells, roles: mroles })
+                                     items: cells, roles: mroles, generation: mcbMenuGeneration,
+                                     sample: mcbMenuSample, cursorEmpty: !!menu.getCarried().isEmpty() })
       }
     }
   } catch (eMenu) { }
@@ -1332,6 +1339,29 @@ function mcbHandle(action, arg) {
     if (cSlot < 0 || (nSlots >= 0 && cSlot >= nSlots)) {
       console.error('[mcbridge] clickSlot: 格子号 ' + cSlot + ' 越界（当前界面只有 ' + nSlots + ' 格）')
       return
+    }
+
+    var clickMenu = mcC.player.containerMenu
+    var guard = null
+    if (ps.length > 3) {
+      try { guard = JSON.parse(ps.slice(3).join(' ')) }
+      catch (eGuard) { console.error('[mcbridge] clickSlot: invalid guard'); return }
+      if (clickMenu !== mcbMenuRef || guard.generation !== mcbMenuGeneration || guard.id !== cid) {
+        console.error('[mcbridge] clickSlot: menu changed'); return
+      }
+    }
+    if (cMode === 4) {
+      if (guard === null || (cBtn !== 0 && cBtn !== 1)) return
+      try {
+        var dropSlot = clickMenu.slots.get(cSlot)
+        var dropStack = dropSlot.getItem()
+        var dropId = String(Java.loadClass('net.minecraft.core.registries.BuiltInRegistries').ITEM.getKey(dropStack.getItem()))
+        if (!clickMenu.getCarried().isEmpty() || mcbSlotRole(dropSlot, mcC.player) !== 'Y' ||
+            dropId !== guard.item || Number(dropStack.getCount()) !== guard.count ||
+            !dropSlot.mayPickup(mcC.player)) {
+          console.error('[mcbridge] clickSlot: drop precondition changed'); return
+        }
+      } catch (eDropGuard) { console.error('[mcbridge] clickSlot: cannot verify drop'); return }
     }
 
     // 点格子朝向复用最近 useOnAt 位置，缺失时不转。
