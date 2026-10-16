@@ -3,6 +3,7 @@ r"""动作下发不等于完成；授权默认拒绝。"""
 from __future__ import annotations
 
 import asyncio
+import json
 import math
 import re
 import time
@@ -1210,8 +1211,8 @@ class McBodyPlugin(Star):
             return render.fail(render.Kind.BAD_ARGUMENT, "button 参数不合法",
                                usage="mode=4 时 0=丢一个，1=丢整叠；其他模式只能为 0")
         before = await self._menu_snapshot()
-        if (not isinstance(before, dict) or not isinstance(before.get("generation"), int)
-                or not isinstance(before.get("sample"), int)):
+        if (not isinstance(before, dict) or not isinstance(before.get("generation"), (int, float))
+                or not isinstance(before.get("sample"), (int, float))):
             return render.fail(render.Kind.REFUSED, "缺少菜单保护信息，未执行点击",
                                hint="需要配套客户端桥；更新并重启客户端后重新查看 mc_menu")
         click_guard = {"id": before.get("id"), "generation": before["generation"]}
@@ -1258,7 +1259,7 @@ class McBodyPlugin(Star):
             candidate = await self._menu_snapshot()
             if isinstance(candidate, dict) and (
                 candidate.get("generation") != before["generation"]
-                or (isinstance(candidate.get("sample"), int)
+                or (isinstance(candidate.get("sample"), (int, float))
                     and candidate["sample"] > before["sample"])
             ):
                 after = candidate
