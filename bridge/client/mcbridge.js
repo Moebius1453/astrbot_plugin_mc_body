@@ -1,4 +1,6 @@
-// 命中候选与槽位分类存在 Numen 实现对应；来源与许可待核项见仓库根 THIRD_PARTY_NOTICES.md。
+// mcbPickHit、mcbFacePoint、mcbSlotRole 根据 Numen Look/GuiOps 改写，适配 KubeJS/Rhino；上游 LGPL-3.0-only。
+// 本地 Git 首次记录：命中候选 2026-10-11，槽位分类 2026-10-11；来源通知更新：2026-10-16。
+// 具体来源、修改和许可边界见 ../../THIRD_PARTY_NOTICES.md；许可全文见 ../../licenses/Numen-LGPL-3.0.txt 和 ../../licenses/GPL-3.0.txt。
 // 交互走 mc.gameMode，由原版维护窗口、stateId 和 sequence。
 // player.gameMode 在此映射为 null，使用 mc.gameMode。
 // Rhino 禁用 cls 变量名、函数内 const/let 和 Java getClass 反射。

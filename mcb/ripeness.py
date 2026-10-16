@@ -1,5 +1,7 @@
 r"""主人在线才允许事件唤醒；主人低血量受伤和死亡为急件，自身受伤交给反射，其余事件排队。"""
-# 熟度策略对应 Numen EventQueue；来源与许可待核项见仓库根 THIRD_PARTY_NOTICES.md。
+# 熟度策略根据 Numen EventQueue 改写，增加在线与冷却门控；上游 LGPL-3.0-only。
+# 本地 Git 首次记录及事件判断调整：2026-10-11；来源通知更新：2026-10-16。
+# 具体来源、修改和许可边界见 ../THIRD_PARTY_NOTICES.md；许可全文见 ../licenses/Numen-LGPL-3.0.txt 和 ../licenses/GPL-3.0.txt。
 
 from __future__ import annotations
 

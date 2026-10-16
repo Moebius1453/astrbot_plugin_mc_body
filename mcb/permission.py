@@ -1,5 +1,7 @@
 r"""工具派发前统一裁决；逐格破坏另由服务端 BlockEvents.broken 检查。"""
-# 部分权限解析、裁决、默认规则及说明对应 Numen；来源与许可待核项见仓库根 THIRD_PARTY_NOTICES.md。
+# 部分解析、裁决、默认表及 RuleSet 文字根据 Numen Rule/Gate/RuleSet 改写；上游 LGPL-3.0-only。
+# 本地 Git 首次记录及规则调整：2026-10-11；来源通知更新：2026-10-16。
+# 具体来源、修改和许可边界见 ../THIRD_PARTY_NOTICES.md；许可全文见 ../licenses/Numen-LGPL-3.0.txt 和 ../licenses/GPL-3.0.txt。
 
 from __future__ import annotations
 

@@ -1,5 +1,7 @@
 r"""环形缓冲以单调 seq 增量拉取，支持断线重放与去重。"""
-# 事件声明结构对应 Numen EventTypes；来源与许可待核项见仓库根 THIRD_PARTY_NOTICES.md。
+# Joins、KindSpec 声明结构根据 Numen EventTypes 改写为 Python；上游 LGPL-3.0-only。
+# 本地 Git 首次记录：2026-10-10；来源通知更新：2026-10-16。
+# 具体来源、修改和许可边界见 ../THIRD_PARTY_NOTICES.md；许可全文见 ../licenses/Numen-LGPL-3.0.txt 和 ../licenses/GPL-3.0.txt。
 
 from __future__ import annotations
 
