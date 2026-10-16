@@ -134,4 +134,4 @@ RCON 使用明文协议，不要暴露到公网或不可信网络。不要向模
 
 ## 许可
 
-仓库许可证见 [GNU AGPLv3](LICENSE)，来源分类与许可待核项见[第三方来源说明](THIRD_PARTY_NOTICES.md)。第三方内容适用其各自的许可条件；本项目的许可证不授予对外部依赖或第三方内容的额外权利。
+`mcb/permission.py`、`mcb/events.py`、`mcb/ripeness.py` 和 `bridge/client/mcbridge.js` 按 GPL-3.0-only 分发，其余原创部分维持现有 [GNU AGPLv3](LICENSE)。Numen 上游为 LGPL-3.0-only；本副本依 GPLv3 第7节移除相关内容的 LGPL 附加许可，并依 GPLv3 第13节与 AGPLv3 第13节组合。来源分类、许可全文及范围见[第三方来源说明](THIRD_PARTY_NOTICES.md)。其他第三方内容适用各自许可。

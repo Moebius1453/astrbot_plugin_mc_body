@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-only
 r"""工具派发前统一裁决；逐格破坏另由服务端 BlockEvents.broken 检查。"""
 # 部分解析、裁决、默认表及 RuleSet 文字根据 Numen Rule/Gate/RuleSet 改写；上游 LGPL-3.0-only。
 # 本地 Git 首次记录及规则调整：2026-10-11；来源通知更新：2026-10-16。

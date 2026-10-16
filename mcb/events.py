@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-only
 r"""环形缓冲以单调 seq 增量拉取，支持断线重放与去重。"""
 # Joins、KindSpec 声明结构根据 Numen EventTypes 改写为 Python；上游 LGPL-3.0-only。
 # 本地 Git 首次记录：2026-10-10；来源通知更新：2026-10-16。

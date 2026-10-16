@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-only
 // mcbPickHit、mcbFacePoint、mcbSlotRole 根据 Numen Look/GuiOps 改写，适配 KubeJS/Rhino；上游 LGPL-3.0-only。
 // 本地 Git 首次记录：命中候选 2026-10-11，槽位分类 2026-10-11；来源通知更新：2026-10-16。
 // 具体来源、修改和许可边界见 ../../THIRD_PARTY_NOTICES.md；许可全文见 ../../licenses/Numen-LGPL-3.0.txt 和 ../../licenses/GPL-3.0.txt。

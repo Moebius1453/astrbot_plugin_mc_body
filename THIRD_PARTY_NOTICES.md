@@ -1,6 +1,6 @@
 # 第三方来源与许可
 
-本项目使用 AstrBot、KubeJS 和 Baritone，并参考以下项目的设计与源码。仓库许可证见 [LICENSE](LICENSE)。
+本项目使用 AstrBot、KubeJS 和 Baritone，并参考以下项目的设计与源码。许可范围见下文，根 [LICENSE](LICENSE) 保持为 AGPLv3。
 
 ## 设计与接口参考
 
@@ -25,7 +25,7 @@
 | mcb/ripeness.py | agent/src/main/java/com/dwinovo/numen/api/agent/inbox/EventQueue.java | 熟度阈值、等待公式与触发顺序；改为 Python，增加在线及冷却门控 |
 | bridge/client/mcbridge.js：mcbPickHit、mcbFacePoint、mcbSlotRole | numen-api/common/src/main/java/com/dwinovo/numen/api/entity/Look.java；numen/common/src/main/java/com/dwinovo/numen/tools/GuiOps.java | 命中候选点与槽位分类；适配 KubeJS/Rhino，并调整面排序 |
 
-本地 Git 首次记录上述改写的日期（北京时间）：事件声明为 2026-10-10；权限规则、命中候选、槽位分类及熟度策略为 2026-10-11。权限规则在 2026-10-11 继续调整，熟度策略同日调整事件判断与优先级；2026-10-15 至 2026-10-16 整理来源说明，2026-10-16 补充本通知及文件级修改日期。这些日期不代表上游创作时间或实际取用时刻。
+本地 Git 首次记录上述改写的日期（北京时间）：事件声明为 2026-10-10；权限规则、命中候选、槽位分类及熟度策略为 2026-10-11。权限规则在 2026-10-11 继续调整，熟度策略同日调整事件判断与优先级；2026-10-15 至 2026-10-16 整理来源说明，2026-10-16 补充本通知、文件级修改日期及下述 GPL-3.0-only 分发声明。这些日期不代表上游创作时间或实际取用时刻。
 
 ## 许可文本
 
@@ -36,4 +36,15 @@
 
 Numen 对照版本：[`2df6979ec33ae45edd623c512ee6644dd94ef11a`](https://github.com/Dwinovo/minecraft-numen/tree/2df6979ec33ae45edd623c512ee6644dd94ef11a)，仅用于源码定位，不是已确认的采用版本。其他参考项目的具体版本、许可及表达复用范围仍待核实。
 
-Numen 来源内容适用 LGPL-3.0-only，包含 GPLv3 条款及 LGPLv3 附加许可；根 AGPLv3 不替代这些条款。上述改写部分及其与本项目的分发授权范围尚未定稿，不能仅凭根 LICENSE 将其按 AGPLv3 单独重新许可。
+## 本副本的许可范围
+
+以下四个文件整体按 GPL-3.0-only 分发，包括作者有权授权并已按此许可提供的原创贡献：
+
+- `mcb/permission.py`
+- `mcb/events.py`
+- `mcb/ripeness.py`
+- `bridge/client/mcbridge.js`
+
+Numen 上游许可为 LGPL-3.0-only，包含 GPLv3 条款及 LGPLv3 附加许可。本分发副本依 GPLv3 第7节移除上述文件中 Numen 来源内容的 LGPL 附加许可；上游许可本身不变，原有来源通知及许可全文保留。
+
+其余原创部分维持现有 AGPLv3 许可。GPLv3 第13节与 AGPLv3 第13节允许这两类作品组合；GPL 部分仍适用 GPLv3，AGPLv3 第13节的网络交互要求适用于组合体。根 LICENSE 不替代上述文件的 GPL-3.0-only 声明，其他第三方内容仍适用各自许可。
