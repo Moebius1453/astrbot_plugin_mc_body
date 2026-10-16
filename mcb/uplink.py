@@ -76,6 +76,7 @@ class ChatUplink:
         umo: str,
         poll_interval: float = 1.5,
         wake_keywords: list[str] | None = None,
+        require_wake_keyword: bool = True,
         ambient_limit: int = 20,
         self_name: str = "Nanako",
         max_steps: int = 30,
@@ -85,6 +86,7 @@ class ChatUplink:
         self.context = context
         self.umo = umo
         self.poll_interval = max(0.5, float(poll_interval))
+        self.require_wake_keyword = require_wake_keyword
         self.wake_keywords = [str(k).strip() for k in (wake_keywords or []) if str(k).strip()]
         self.ambient_limit = max(0, int(ambient_limit))
         self.self_name = self_name
@@ -161,7 +163,7 @@ class ChatUplink:
     def start(self) -> None:
         if self._task is not None:
             return
-        if not self.wake_keywords:
+        if self.require_wake_keyword and not self.wake_keywords:
             logger.warning(
                 "[mc_body] 未配置唤醒词 —— 游戏里说话永远不会唤醒白。"
                 "请在插件配置的 wake_keywords 里填上（例如 Nanako、白）。"
@@ -170,7 +172,7 @@ class ChatUplink:
         self._task = asyncio.create_task(self._loop(), name="mc_body_uplink")
         logger.info(
             f"[mc_body] 聊天上行已启动：每 {self.poll_interval:g} 秒拉一次，"
-            f"唤醒词 {self.wake_keywords}，会话 {self.umo}"
+            f"需要唤醒词 {self.require_wake_keyword}，唤醒词 {self.wake_keywords}，会话 {self.umo}"
         )
 
     async def stop(self) -> None:
@@ -268,8 +270,10 @@ class ChatUplink:
 
 
     def _is_wake(self, text: str) -> bool:
-        low = text.lower()
-        return any(kw.lower() in low for kw in self.wake_keywords) if low else False
+        low = text.strip().lower()
+        if not low:
+            return False
+        return not self.require_wake_keyword or any(kw.lower() in low for kw in self.wake_keywords)
 
 
     def _kick_wakes(self) -> None:

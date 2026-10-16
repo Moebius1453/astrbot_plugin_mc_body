@@ -86,6 +86,7 @@ class McBodyPlugin(Star):
             umo=str(self._cfg("white_session", "") or ""),
             poll_interval=float(self._cfg("poll_interval_seconds", 2)),
             wake_keywords=self._wake_keywords(),
+            require_wake_keyword=bool(self._cfg("require_wake_keyword", True)),
             ambient_limit=int(self._cfg("ambient_context_lines", 20)),
             self_name=str(self._cfg("character_name", "Nanako")),
             state_path=Path(__file__).resolve().parent / "data" / "uplink_state.json",
@@ -1159,17 +1160,22 @@ class McBodyPlugin(Star):
         return render.describe_menu(data)
 
     @filter.llm_tool(name="mc_click")
-    async def mc_click(self, event: AstrMessageEvent, slot: int, mode: int = 1):
+    async def mc_click(self, event: AstrMessageEvent, slot: int, mode: int = 1,
+                       button: int = 0):
         """Click slot number N of the currently open screen -- this is how you take
         things out of a chest and how crafting happens. Use mc_menu first to see the slot numbers.
         
         - mode=1 (default) shift quick-move: chest slot -> backpack, or CRAFT RESULT -> craft immediately
         - mode=0 plain left click (pick up / put down); mode=6 double-click to gather the same kind
-        
+        - mode=4 drops items on the ground: button=0 drops ONE, button=1 drops the WHOLE STACK.
+          Empty the cursor first. Use only your own inventory slots; never drop container contents.
+          Dropping is not delivery to another player. Do not retry an uncertain result automatically.
+
         Args:
             slot(number): Slot number (look it up with mc_menu; NOT a backpack slot).
-            mode(number): 1=shift quick-move (default, most common); 0=plain left click;
-                6=double-click gather."""
+            mode(number): 1=shift quick-move (default); 0=plain click; 4=drop; 6=gather.
+            button(number): For mode=4 only: 0=one item (default), 1=whole stack.
+                Other modes require 0."""
         if (deny := self._guard(event)):
             return deny
         try:
@@ -1196,7 +1202,41 @@ class McBodyPlugin(Star):
                 usage="mode=1 是 shift 整体移动（最常用）；0 是普通左键；6 是双击聚拢",
                 hint="不确定就用默认的 mode=1，别自己填数字",
             )
+        try:
+            b = int(button)
+        except (TypeError, ValueError):
+            b = -1
+        if b not in (0, 1) or (m != 4 and b != 0):
+            return render.fail(render.Kind.BAD_ARGUMENT, "button 参数不合法",
+                               usage="mode=4 时 0=丢一个，1=丢整叠；其他模式只能为 0")
         before = await self._menu_snapshot()
+        if m == 4:
+            if not isinstance(before, dict) or mcb_containers.slot_side(before, n) != "mine":
+                return render.fail(render.Kind.REFUSED, "只能丢弃自己的库存物品",
+                                   hint="先用 mc_menu 确认自己的库存槽，不要丢容器或合成槽物品")
+            source = next((it for it in before.get("items", [])
+                           if isinstance(it, dict) and it.get("i") == n), None)
+            if before.get("def"):
+                inventory, ierr = await self._call("mcb inventory")
+                if ierr or not isinstance(inventory, dict):
+                    return render.fail(render.Kind.BRIDGE, "读不到丢弃前的库存，未执行")
+                if 36 <= n <= 44:
+                    entries, index = inventory.get("hotbar") or [], n - 36
+                    source = entries[index] if index < len(entries) else None
+                elif 9 <= n <= 35:
+                    source = next((it for it in inventory.get("main", [])
+                                   if isinstance(it, dict) and it.get("slot") == n), None)
+                else:
+                    return render.fail(render.Kind.REFUSED, "丢物仅支持背包与快捷栏槽")
+            if not isinstance(source, dict) or not source.get("c"):
+                return render.fail(render.Kind.REFUSED, "目标槽为空或未读到物品，未执行")
+            _, err = await self._call(f"mcb clickSlot {n} {b} 4")
+            if err:
+                return render.reword(err, "丢物结果未知，不要自动重试",
+                                     kind=render.Kind.BRIDGE, hint="先检查背包和地面物品")
+            return (f"已下发第 {n} 格的丢物操作（{'整叠' if b else '一个'}）。"
+                    "尚未确认客户端执行、库存减少或地面掉落；不要报告已交付，也不要自动重发。"
+                    "请用 mc_inventory 检查数量，并核实地面物品；角色可能重新捡起。")
         # 读取手持物失败时按空手判，保守拦截取物。
         _, held_n = await self._held_stack()
         hand_empty = True if held_n is None else (held_n == 0)
