@@ -11,7 +11,7 @@ from pathlib import Path
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.star import Context, Star, register
+from astrbot.api.star import Context, Star, StarTools, register
 
 from .mcb.rcon import BridgeError, RconBridge
 from .mcb.arbiter import LEVEL_REFLEX, LEVEL_TASK, LEVEL_USER, Arbiter
@@ -75,6 +75,11 @@ class McBodyPlugin(Star):
     def __init__(self, context: Context, config: dict | None = None) -> None:
         super().__init__(context)
         self.config = config or {}
+        self.data_dir = StarTools.get_data_dir("astrbot_plugin_mc_body")
+        legacy_dir = Path(__file__).resolve().parent / "data"
+        for filename in ("uplink_state.json", "places.json"):
+            if (legacy_dir / filename).exists() and not (self.data_dir / filename).exists():
+                raise ValueError(f"请先备份并迁移旧数据 {legacy_dir / filename} 到 {self.data_dir / filename}，不自动覆盖或重置")
         self.bridge = RconBridge(
             host=str(self._cfg("rcon_host", "127.0.0.1")),
             port=int(self._cfg("rcon_port", 25575)),
@@ -90,15 +95,16 @@ class McBodyPlugin(Star):
             require_wake_keyword=bool(self._cfg("require_wake_keyword", True)),
             ambient_limit=int(self._cfg("ambient_context_lines", 20)),
             self_name=str(self._cfg("character_name", "Nanako")),
-            state_path=Path(__file__).resolve().parent / "data" / "uplink_state.json",
+            state_path=self.data_dir / "uplink_state.json",
         )
         # 日志仅存内存，重载丢失。
         self.journal = Journal(capacity=int(self._cfg("journal_capacity", 400)))
 
         # 地点簿持久化，避免重载丢失地图。
-        places_path = str(self._cfg("places_file", "") or "").strip()
-        if not places_path:
-            places_path = str(Path(__file__).resolve().parent / "data" / "places.json")
+        places_file = str(self._cfg("places_file", "") or "").strip()
+        places_path = (self.data_dir / (places_file or "places.json")).resolve()
+        if not places_path.is_relative_to(self.data_dir.resolve()):
+            raise ValueError("places_file必须位于插件数据目录内；请先备份并迁移旧地点簿")
         self.places = PlaceBook(places_path)
 
         # 图片只交视觉 provider，主会话只收转述文字。

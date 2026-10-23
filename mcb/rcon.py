@@ -4,14 +4,10 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
-import logging
 import struct
 import uuid
 
-try:  
-    from astrbot.api import logger
-except ImportError:  # pragma: no cover - 只在脱离 AstrBot 时走到
-    logger = logging.getLogger(__name__)
+from astrbot.api import logger
 
 ENVELOPE_PREFIX = "MCB "
 

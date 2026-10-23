@@ -231,8 +231,8 @@
   },
   "places_file": {
     "type": "string",
-    "description": "地点簿存哪（留空用默认）",
-    "hint": "白「哪儿是什么」的记忆。**这个写磁盘** —— 跟状态日志不一样，地图丢了代价太大。留空 = 插件目录下的 data/places.json。",
+    "description": "地点簿文件（留空用默认）",
+    "hint": "保存在 data/plugin_data/astrbot_plugin_mc_body/ 下。留空使用 places.json，也可填写该目录内的相对路径。旧版自定义路径需先备份并迁移，不能指向插件数据目录之外。",
     "default": ""
   },
   "enable_body_state": {

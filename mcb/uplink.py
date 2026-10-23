@@ -533,25 +533,22 @@ class ChatUplink:
         return (getattr(final, "completion_text", "") or "").strip()
 
     async def _load_stored(self, conv) -> list:
-        r"""ConversationV2.content 才是 list；legacy history 为 JSON 字符串，禁止 list()。"""
+        r"""写回前重新读取完整历史；读取失败时禁止以空历史覆盖。"""
         cid = getattr(conv, "cid", None)
-        if cid:
-            try:
-                v2 = await self.context.conversation_manager.db.get_conversation_by_id(cid)
-                if v2 is not None:
-                    return list(v2.content or [])
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(f"[mc_body] 读会话原始 content 失败，退回 legacy 字段：{exc}")
-
-        # legacy history 是 JSON 文本，只能 json.loads，不能 list()。
-        raw = getattr(conv, "history", None)
-        if isinstance(raw, str):
-            try:
-                parsed = json.loads(raw) if raw.strip() else []
-            except ValueError:
-                return []
-            return parsed if isinstance(parsed, list) else []
-        return list(raw) if isinstance(raw, list) else []
+        if not cid:
+            raise ValueError("会话ID缺失，拒绝写回历史")
+        stored = await self.context.conversation_manager.get_conversation(
+            self.umo, cid, create_if_not_exists=False
+        )
+        if stored is None:
+            raise ValueError("会话不存在，拒绝写回历史")
+        raw = getattr(stored, "history", None)
+        if not isinstance(raw, str):
+            raise TypeError("会话history不是JSON字符串，拒绝写回历史")
+        parsed = json.loads(raw)
+        if not isinstance(parsed, list) or any(not isinstance(m, dict) for m in parsed):
+            raise TypeError("会话历史不是list[dict]，拒绝写回历史")
+        return parsed
 
     async def _save_turn(self, req, runner, *, turn_start=None) -> None:
         r"""update_conversation 是替换语义，须先核类型再合并，并检查只增不减及异常膨胀；不等同于 JSONL 追加。"""
