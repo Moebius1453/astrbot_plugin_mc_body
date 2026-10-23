@@ -6,3 +6,11 @@ version: 0.40.0 # 版本号
 author: Moebius1453 # 作者
 repo: https://github.com/Moebius1453/astrbot_plugin_mc_body # 仓库地址
 astrbot_version: ">=4.27,<5" # 依赖的 AstrBot 版本范围
+support_platforms: # 已实测的平台适配器；其他平台需自行验证
+  - aiocqhttp
+tags: # 插件市场标签
+  - minecraft
+  - 我的世界
+  - 游戏
+  - agent
+  - baritone
